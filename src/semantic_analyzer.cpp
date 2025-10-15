@@ -233,17 +233,6 @@ void SemanticAnalyzer::processFunction(Node* node) {
             // THEN: Extract the actual return type
             returnType = extractTypeFromDeclSpecifiers(child);
             
-            // VALIDATE: Static function must have type specifier
-            if (hasStatic && !hasTypeSpec) {
-                addError("'static' function requires explicit return type specifier");
-            }
-            
-            // VALIDATE: If we found static but no return type could be extracted
-            if (hasStatic && returnType.empty()) {
-                addError("'static' function requires explicit return type specifier");
-                returnType = "int";  // Assume int for recovery
-            }
-            
             // Check type specifiers (but don't call checkTypeSpecifier on every child)
             for (auto specChild : child->children) {
                 if (specChild->name == "TYPE_SPECIFIER") {
@@ -260,18 +249,31 @@ void SemanticAnalyzer::processFunction(Node* node) {
         }
     }
 currentFunctionName = funcName;
-currentFunctionReturnType = returnType;
 
     if (funcName.empty()) {
         addError("Function name missing");
         return;
     }
 
-    // If no return type specified and not static
-    if (returnType.empty() && !hasStatic) {
-        addError("Function '" + funcName + "' declared without return type specifier");
-        returnType = "int";  // Assume int for recovery
+    // VALIDATE: Static function must have type specifier
+    if (hasStatic && !hasTypeSpec) {
+        addError("Function '" + funcName + "' with 'static' storage class requires explicit return type specifier");
+        returnType = "int";  // Default for error recovery
     }
+
+    // If no return type specified at all (and not static error case)
+    if (returnType.empty()) {
+        if (!hasStatic) {
+            // Non-static function without type - assume int with warning
+            addError("Function '" + funcName + "' declared without return type specifier");
+            returnType = "int";
+        } else {
+            // This case already handled above, but for safety
+            returnType = "int";
+        }
+    }
+
+    currentFunctionReturnType = returnType;
 
     // Extract parameter types
     paramTypes = extractFunctionParameters(funcDeclNode);
@@ -349,25 +351,19 @@ void SemanticAnalyzer::processVariable(Node* node) {
     string varType;
     bool hasStatic = false;
     bool hasTypeSpec = false;
+    bool hasStorageError = false;
     
     // Extract type
     for (auto child : node->children) {
         if (child->name == "DECL_SPECIFIERS") {
             // FIRST: Check for static keyword and type specifier presence
             checkStaticKeyword(child, hasStatic, hasTypeSpec);
+            if (hasStorageError) {
+                return;  // Don't process this declaration further
+            }
             
             // THEN: Extract the actual type
             varType = extractTypeFromDeclSpecifiers(child);
-            
-            // VALIDATE: Static must have a type specifier
-            if (hasStatic && !hasTypeSpec) {
-                addError("'static' storage class requires explicit type specifier");
-            }
-            
-            // VALIDATE: If static was found but no type extracted
-            if (hasStatic && varType.empty()) {
-                addError("'static' storage class requires explicit type specifier");
-            }
             
             // Check type specifiers
             for (auto specChild : child->children) {
@@ -400,6 +396,13 @@ void SemanticAnalyzer::processVariable(Node* node) {
                     }
                     
                     if (!varName.empty()) {
+
+                        // VALIDATE: Static must have type specifier
+                        if (hasStatic && !hasTypeSpec) {
+                            addError("Variable '" + varName + "' with 'static' storage class requires explicit type specifier");
+                            continue;  // Skip adding to symbol table
+                        }
+                        
                         // If varType is still empty and we have static, that's an error
                         if (hasStatic && varType.empty()) {
                             addError("Variable '" + varName + "' with 'static' storage class must have explicit type specifier");
@@ -2019,52 +2022,88 @@ string SemanticAnalyzer::resolveTypedef(const string& type) {
 }
 
 
-// STATIC KEYWORD VALIDATION (FIXED)
 void SemanticAnalyzer::checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec) {
     if (!declSpecNode) return;
     
     hasStatic = false;
     hasTypeSpec = false;
+    int staticCount = 0;
+    vector<string> storageClasses;
     
-    for (auto child : declSpecNode->children) {
-        // Check for static keyword
-        if (child->name == "STORAGE_CLASS_SPECIFIER") {
-            if (child->lexeme == "static") {
+    // Recursively collect storage classes and type specifiers
+    function<void(Node*)> collectInfo = [&](Node* node) {
+        if (!node) return;
+        
+        for (auto child : node->children) {
+            // Check for both STORAGE_CLASS_SPECIFIER wrapper and direct STATIC nodes
+            if (child->name == "STORAGE_CLASS_SPECIFIER") {
+                string storageClass = child->lexeme;
+                storageClasses.push_back(storageClass);
+                
+                if (storageClass == "static") {
+                    staticCount++;
+                    hasStatic = true;
+                }
+            }
+            else if (child->name == "STATIC") {
+                // Direct STATIC node (as seen in your AST)
+                storageClasses.push_back("static");
+                staticCount++;
                 hasStatic = true;
-                cout << "DEBUG: Found 'static' keyword\n";
             }
-        }
-        
-        // Check for type specifier
-        else if (child->name == "TYPE_SPECIFIER") {
-            if (!child->lexeme.empty()) {
+            else if (child->name == "AUTO") {
+                storageClasses.push_back("auto");
+            }
+            else if (child->name == "TYPEDEF") {
+                storageClasses.push_back("typedef");
+            }
+            else if (child->name == "TYPE_SPECIFIER") {
+                if (!child->lexeme.empty()) {
+                    hasTypeSpec = true;
+                }
+            }
+            else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
                 hasTypeSpec = true;
-                cout << "DEBUG: Found type specifier: " << child->lexeme << "\n";
+            }
+            else if (child->name == "ENUM_SPECIFIER") {
+                hasTypeSpec = true;
+            }
+            else if (child->name == "DECL_SPECIFIERS") {
+                collectInfo(child);  // Recurse into nested DECL_SPECIFIERS
             }
         }
-        else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
-            hasTypeSpec = true;
-            cout << "DEBUG: Found struct/union type specifier\n";
-        }
-        else if (child->name == "ENUM_SPECIFIER") {
-            hasTypeSpec = true;
-            cout << "DEBUG: Found enum type specifier\n";
-        }
-        
-        // Recursively check nested DECL_SPECIFIERS
-        else if (child->name == "DECL_SPECIFIERS") {
-            bool nestedStatic = false;
-            bool nestedTypeSpec = false;
-            checkStaticKeyword(child, nestedStatic, nestedTypeSpec);
-            if (nestedStatic) hasStatic = true;
-            if (nestedTypeSpec) hasTypeSpec = true;
-        }
+    };
+    
+    collectInfo(declSpecNode);
+    cout << "DEBUG: staticCount = " << staticCount << ", hasStatic = " << hasStatic << "\n";
+
+    // ✅ CHECK #1: Duplicate static (HIGHEST PRIORITY)
+    if (staticCount > 1) {
+        addError("Duplicate 'static' storage class specifier");
+        return;  // Return immediately
     }
     
-    cout << "DEBUG: checkStaticKeyword result - hasStatic: " << hasStatic 
-         << ", hasTypeSpec: " << hasTypeSpec << "\n";
+    // ✅ CHECK #2: Conflicting storage classes
+    if (storageClasses.size() > 1) {
+        set<string> uniqueClasses(storageClasses.begin(), storageClasses.end());
+        
+        // Only check if we have different storage classes
+        if (uniqueClasses.size() > 1) {
+            // Check all combinations of conflicts
+            if (uniqueClasses.count("static") && uniqueClasses.count("auto")) {
+                addError("Cannot combine 'static' and 'auto' storage classes");
+                
+            }
+            else if (uniqueClasses.count("static") && uniqueClasses.count("typedef")) {
+                addError("Cannot combine 'static' and 'typedef' storage classes");
+                
+            }
+            else if (uniqueClasses.count("auto") && uniqueClasses.count("typedef")) {
+                addError("Cannot combine 'auto' and 'typedef' storage classes");
+            }
+        }
+    }
 }
-
 
 void SemanticAnalyzer::checkTypeSpecifier(Node* typeSpecNode) {
     if (!typeSpecNode || typeSpecNode->name != "TYPE_SPECIFIER") return;
