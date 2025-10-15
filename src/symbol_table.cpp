@@ -34,7 +34,7 @@ void SymbolTable::exitScope() {
 bool SymbolTable::addSymbol(const string& name, const string& type, Node* node, 
                             bool isFunction, const vector<string>& params,
                             bool isArray, const vector<int>& arrayDims, 
-                            int pointerDepth, bool isStruct, bool isEnum , bool isTypedef,    string aliasedType) {
+                            int pointerDepth, bool isStruct, bool isEnum, bool isUnion, bool isTypedef,    string aliasedType) {
     auto& current = scopes.back();
 
     if (current.find(name) != current.end()) {
@@ -47,8 +47,7 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
         }
         return false;
     }
- (void)isTypedef;
-    (void)aliasedType;
+
     Symbol sym(name, type, node, isFunction);
     sym.paramTypes = params;
     sym.isArray = isArray;
@@ -56,6 +55,9 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
     sym.pointerDepth = pointerDepth;
     sym.isStruct = isStruct;
     sym.isEnum = isEnum;
+     sym.isUnion = isUnion;
+      sym.isTypedef=isTypedef;
+   sym.aliasedType=aliasedType;
     current[name] = sym;
     return true;
 }
@@ -103,6 +105,22 @@ void SymbolTable::printAllScopes() const {
         const Scopeh& s = *it;
         std::cout << "Scope Level " << s.level << ":\n";
         for (const auto &p : s.symbols) {
+        
+        // Suppose p.second.type is something like "int***"
+std::string type = p.second.type;
+
+// 1️⃣ Count trailing '*'
+size_t starCount = 0;
+for (size_t i = type.size(); i > 0; --i) {
+    if (type[i - 1] == '*')
+        starCount++;
+    else
+        break;
+}
+
+// 2️⃣ Remove those stars to get the base type
+std::string baseType = type.substr(0, type.size() - starCount);
+
             std::cout << "  " << p.second.name << " [" << p.second.type;
               // Print struct members if it's a struct type
             if (p.second.isStruct && !p.second.structMembers.empty()) {
