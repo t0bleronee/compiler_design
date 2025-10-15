@@ -44,6 +44,8 @@ private:
     void checkFunctionCall(Node* node);
     bool isDeclarationContext(Node* node);
     void checkReturnStatement(Node* node);
+    void checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec);
+    void checkTypeSpecifier(Node* typeSpecNode);
 void analyzeDeclarator(Node* node, std::string& name, int& pointerDepth, bool& isArray, std::vector<int>& arrayDims);
 std::vector<int> extractArrayDimensions(Node* arrayNode, std::string& varName);
 int evaluateConstantExpression(Node* node);
