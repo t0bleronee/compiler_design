@@ -27,9 +27,9 @@ public:
     // After pointerDepth, add:
 bool isStruct;
 bool isEnum;
+bool isUnion;  
 
-
-bool isTypedef = false;        // NEW: Is this a typedef alias?
+bool isTypedef = false;        
    std:: string aliasedType ; 
     
     
@@ -38,11 +38,11 @@ std::map<std::string, int> enumValues;             // enumerator name -> value
 
     
    Symbol() : name(""), type(""), node(nullptr), isFunction(false), 
-           isArray(false), pointerDepth(0), isStruct(false), isEnum(false) ,isTypedef (false), aliasedType("") {}
+           isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) ,isTypedef (false), aliasedType("") {}
            
 Symbol(std::string n, std::string t, Node* nd, bool func=false)
     : name(n), type(t), node(nd), isFunction(func), 
-      isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isTypedef (false), aliasedType("") {}
+      isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) , isTypedef (false), aliasedType("") {}
 };
 
 struct Scopeh {
@@ -64,9 +64,9 @@ public:
     bool addSymbol(const std::string& name, const std::string& type, Node* node, 
                bool isFunction=false, const std::vector<std::string>& params = {},
                bool isArray=false, const std::vector<int>& arrayDims = {}, 
-               int pointerDepth=0, bool isStruct=false, bool isEnum=false, bool isTypedef = false, std::string aliasedType = "");
-    Symbol* lookup(const std::string& name);        // Lookup in all scopes
-    Symbol* lookupCurrentScope(const std::string& name); // Lookup only current scope
+               int pointerDepth=0, bool isStruct=false, bool isEnum=false, bool isUnion=false , bool isTypedef = false, std::string aliasedType = "");
+    Symbol* lookup(const std::string& name);      
+    Symbol* lookupCurrentScope(const std::string& name); 
     void addError(const std::string& error);
     void printErrors() const;
     bool hasErrors() const { return !errors.empty(); }
@@ -81,4 +81,3 @@ bool isEmptyScopes() const {
 };
 
 #endif
-
