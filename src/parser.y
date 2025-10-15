@@ -10,6 +10,7 @@
 #include <iostream>
 #include "errors.h"
 #include <unordered_set>
+#include <functional>
 using namespace std;
 
 extern int yylex();
@@ -20,7 +21,95 @@ extern int col_num;
 void yyerror(const char* msg);
 
 
+extern std::unordered_set<std::string> typedef_names;
+
+
+
 Node* root = nullptr;
+
+
+// Helper function to extract identifier name from declarator tree
+std::string getDeclaratorName(Node* node) {
+    if (!node) return "";
+    
+    // Check if this is an IDENTIFIER node
+    if (node->name == "IDENTIFIER") {
+        return node->lexeme;  // Use lexeme field, not value
+    }
+    
+    // Recurse through children to find IDENTIFIER
+    for (auto child : node->children) {
+        std::string name = getDeclaratorName(child);
+        if (!name.empty()) return name;
+    }
+    
+    return "";
+}
+
+// Check if declaration_specifiers contains TYPEDEF (non-recursive, only direct children)
+bool hasTypedefSpecifier(Node* declSpec) {
+    if (!declSpec) {
+        printf("DEBUG hasTypedefSpecifier: NULL node\n");
+        return false;
+    }
+    
+    
+    // Check if this node itself is TYPEDEF
+    if (declSpec->name == "TYPEDEF") {
+        printf("DEBUG hasTypedefSpecifier: Found TYPEDEF at root\n");
+        return true;
+    }
+    
+    // Only check DIRECT children, don't recurse further
+    for (size_t i = 0; i < declSpec->children.size(); i++) {
+        Node* child = declSpec->children[i];
+        
+        if (child && child->name == "TYPEDEF") {
+            printf("DEBUG hasTypedefSpecifier: Found TYPEDEF in child[%zu]\n", i);
+            return true;
+        }
+        
+        // Check if child points back to parent (circular reference detection)
+        if (child == declSpec) {
+            printf("ERROR: Circular reference detected! child[%zu] points to parent!\n", i);
+        }
+    }
+    
+    printf("DEBUG hasTypedefSpecifier: No TYPEDEF found\n");
+    return false;
+}
+
+// Register typedef names from init_declarator_list
+void registerTypedefNames(Node* declSpec, Node* initDeclList) {
+    // Check if this is a typedef declaration
+    if (!hasTypedefSpecifier(declSpec) || !initDeclList) {
+        return;
+    }
+    
+    // Safety check: ensure initDeclList has children
+    if (initDeclList->children.empty()) {
+        return;
+    }
+    
+    // Process each declarator in the init_declarator_list
+    for (auto assignExpr : initDeclList->children) {
+        if (!assignExpr) continue;  // Safety check for null pointer
+        
+        if (assignExpr->name == "ASSIGN_EXPR" && !assignExpr->children.empty()) {
+            // First child is the declarator (LHS of assignment)
+            Node* declarator = assignExpr->children[0];
+            
+            if (!declarator) continue;  // Safety check
+            
+            std::string typeName = getDeclaratorName(declarator);
+            
+            if (!typeName.empty()) {
+                typedef_names.insert(typeName);
+                printf("TYPEDEF REGISTERED: '%s'\n", typeName.c_str());
+            }
+        }
+    }
+}
 
 %}
 
@@ -43,7 +132,7 @@ Node* root = nullptr;
 %token<node> OVERRIDE PRIVATE PUBLIC PROTECTED RETURN SHORT SIGNED SIZEOF STATIC STRUCT SWITCH SCANF PRINTF
 %token<node> TEMPLATE THIS THROW TRY TYPEDEF TYPEID TYPENAME UNION
 %token<node> UNSIGNED USING VECTOR VIRTUAL VOID WHILE
-%token<node> TYPE_NAME
+%token<strval> TYPE_NAME
 
 // Operators
 %token<node> AND OR NOT XOR BITAND BITOR COMPL
@@ -292,6 +381,10 @@ declaration
             $$ = new Node("DECLARATION");
             $$->addChild($1);   // type specifiers
             $$->addChild($2);   // declarators
+            registerTypedefNames($1, $2);
+     
+        
+           
         }
     ;
     
@@ -375,7 +468,9 @@ type_specifier
     | BOOL      { $$ = new Node("TYPE_SPECIFIER", "bool"); }
     | struct_or_union_specifier { $$ = $1; }
     | enum_specifier            { $$ = $1; }
-    | TYPE_NAME                 { $$ = $1; }
+    | TYPE_NAME                 {  $$ = new Node("TYPE_NAME", std::string($1)); 
+        free($1);  }
+    
     ;
 
 
@@ -671,19 +766,11 @@ initializer
     : assignment_expression { $$ = $1; }   // single assignment, no wrapper
     | LBRACE RBRACE { $$ = new Node("INIT_LIST_EMPTY"); }
     | LBRACE initializer_list RBRACE { 
-        // Flatten single-element lists
-        if ($2->type == "INIT_LIST" && $2->children.size() == 1)
-            $$ = $2->children[0];
-        else
-            $$ = $2;  // keep multi-element INIT_LIST
-    }
+    $$ = $2;  // Always return the INIT_LIST node (no flattening)
+}
     | LBRACE initializer_list COMMA RBRACE { 
-        // Same as above
-        if ($2->type == "INIT_LIST" && $2->children.size() == 1)
-            $$ = $2->children[0];
-        else
-            $$ = $2;
-    }
+    $$ = $2;  // Same fix - no flattening
+}
 ;
 
 
@@ -871,10 +958,10 @@ iteration_statement
         $$->addChild($3); // range
         $$->addChild($5); // body
     }
-    | UNTIL LPAREN expression RPAREN DO compound_statement DONE SEMICOLON {
+    | UNTIL LPAREN expression RPAREN compound_statement {
         $$ = new Node("UNTIL_STMT");
         $$->addChild($3); // condition
-        $$->addChild($6); // body
+        $$->addChild($5); // body
     }
     ;
 
@@ -979,162 +1066,107 @@ conditional_expression
 logical_or_expression
     : logical_and_expression { $$ = $1; }
     | logical_or_expression OR_OP logical_and_expression {
-        if ($1->type == "LOGICAL_OR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("LOGICAL_OR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+    $$ = new Node("LOGICAL_OR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 logical_and_expression
     : inclusive_or_expression { $$ = $1; }
     | logical_and_expression AND_OP inclusive_or_expression {
-        if ($1->type == "LOGICAL_AND") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("LOGICAL_AND");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+    $$ = new Node("LOGICAL_AND");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 inclusive_or_expression
     : exclusive_or_expression { $$ = $1; }
     | inclusive_or_expression PIPE exclusive_or_expression {
-        if ($1->type == "BIT_OR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("BIT_OR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+    $$ = new Node("BIT_OR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 exclusive_or_expression
     : and_expression { $$ = $1; }
-    | exclusive_or_expression CARET and_expression {
-        if ($1->type == "BIT_XOR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("BIT_XOR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+   | exclusive_or_expression CARET and_expression {
+    $$ = new Node("BIT_XOR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 and_expression
     : equality_expression { $$ = $1; }
-    | and_expression AMP equality_expression {
-        if ($1->type == "BIT_AND") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("BIT_AND");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+   | and_expression AMP equality_expression {
+    $$ = new Node("BIT_AND");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 equality_expression
     : relational_expression { $$ = $1; }
     | equality_expression EQ_OP relational_expression {
-        if ($1->type == "EQ_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("EQ_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
+    if ($1->type == "EQ_EXPR") {
+        $1->addChild($3);
+        $$ = $1;
+    } else {
+        $$ = new Node("EQ_EXPR");
+        $$->addChild($1);
+        $$->addChild($3);
     }
-    | equality_expression NE_OP relational_expression {
-        if ($1->type == "NEQ_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("NEQ_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
+}
+| equality_expression NE_OP relational_expression {
+    if ($1->type == "NEQ_EXPR") {
+        $1->addChild($3);
+        $$ = $1;
+    } else {
+        $$ = new Node("NEQ_EXPR");
+        $$->addChild($1);
+        $$->addChild($3);
     }
+}
     ;
 
 relational_expression
     : shift_expression { $$ = $1; }
-    | relational_expression LT shift_expression {
-        if ($1->type == "LT_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("LT_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
-    | relational_expression GT shift_expression {
-        if ($1->type == "GT_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("GT_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
-    | relational_expression LE_OP shift_expression {
-        if ($1->type == "LE_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("LE_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
-    | relational_expression GE_OP shift_expression {
-        if ($1->type == "GE_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("GE_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+  | relational_expression LT shift_expression {
+    $$ = new Node("LT_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
+| relational_expression GT shift_expression {
+    $$ = new Node("GT_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
+| relational_expression LE_OP shift_expression {
+    $$ = new Node("LE_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
+| relational_expression GE_OP shift_expression {
+    $$ = new Node("GE_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 shift_expression
     : additive_expression { $$ = $1; }
-    | shift_expression LEFT_OP additive_expression {
-        if ($1->type == "LSHIFT_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("LSHIFT_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
-    | shift_expression RIGHT_OP additive_expression {
-        if ($1->type == "RSHIFT_EXPR") {
-            $1->addChild($3);
-            $$ = $1;
-        } else {
-            $$ = new Node("RSHIFT_EXPR");
-            $$->addChild($1);
-            $$->addChild($3);
-        }
-    }
+   | shift_expression LEFT_OP additive_expression {
+    $$ = new Node("LSHIFT_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
+| shift_expression RIGHT_OP additive_expression {
+    $$ = new Node("RSHIFT_EXPR");
+    $$->addChild($1);
+    $$->addChild($3);
+}
     ;
 
 additive_expression
@@ -1322,13 +1354,11 @@ variable_list
       
     }
     | variable_list COMMA AMP IDENTIFIER { 
-        Node* tmp = new Node("VAR_LIST");
-        tmp->addChild($1);  // $1 already a Node
-        Node* idNode = new Node("IDENTIFIER", std::string($4));
-        free($4);           // only free if Node copied
-        tmp->addChild(idNode);
-        $$ = tmp;
-    }
+    $$ = $1;  // Use existing list
+    Node* idNode = new Node("IDENTIFIER", std::string($4));
+    free($4);
+    $$->addChild(idNode);
+}
 ;
 
 
