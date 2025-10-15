@@ -221,11 +221,35 @@ void SemanticAnalyzer::processFunction(Node* node) {
     string returnType;
     vector<string> paramTypes;
     Node* funcDeclNode = nullptr;
+    bool hasStatic = false;
+    bool hasTypeSpec = false;
 
     // Extract function info from FUNCTION_DEFINITION children
     for (auto child : node->children) {
         if (child->name == "DECL_SPECIFIERS") {
+            // FIRST: Check for static keyword and type specifier presence
+            checkStaticKeyword(child, hasStatic, hasTypeSpec);
+            
+            // THEN: Extract the actual return type
             returnType = extractTypeFromDeclSpecifiers(child);
+            
+            // VALIDATE: Static function must have type specifier
+            if (hasStatic && !hasTypeSpec) {
+                addError("'static' function requires explicit return type specifier");
+            }
+            
+            // VALIDATE: If we found static but no return type could be extracted
+            if (hasStatic && returnType.empty()) {
+                addError("'static' function requires explicit return type specifier");
+                returnType = "int";  // Assume int for recovery
+            }
+            
+            // Check type specifiers (but don't call checkTypeSpecifier on every child)
+            for (auto specChild : child->children) {
+                if (specChild->name == "TYPE_SPECIFIER") {
+                    checkTypeSpecifier(specChild);
+                }
+            }
         }
         else if (child->name == "FUNCTION_DECL") {
             funcDeclNode = child;
@@ -241,6 +265,12 @@ currentFunctionReturnType = returnType;
     if (funcName.empty()) {
         addError("Function name missing");
         return;
+    }
+
+    // If no return type specified and not static
+    if (returnType.empty() && !hasStatic) {
+        addError("Function '" + funcName + "' declared without return type specifier");
+        returnType = "int";  // Assume int for recovery
     }
 
     // Extract parameter types
@@ -317,11 +347,34 @@ void SemanticAnalyzer::processVariable(Node* node) {
     if (!node) return;
 
     string varType;
+    bool hasStatic = false;
+    bool hasTypeSpec = false;
     
     // Extract type
     for (auto child : node->children) {
         if (child->name == "DECL_SPECIFIERS") {
+            // FIRST: Check for static keyword and type specifier presence
+            checkStaticKeyword(child, hasStatic, hasTypeSpec);
+            
+            // THEN: Extract the actual type
             varType = extractTypeFromDeclSpecifiers(child);
+            
+            // VALIDATE: Static must have a type specifier
+            if (hasStatic && !hasTypeSpec) {
+                addError("'static' storage class requires explicit type specifier");
+            }
+            
+            // VALIDATE: If static was found but no type extracted
+            if (hasStatic && varType.empty()) {
+                addError("'static' storage class requires explicit type specifier");
+            }
+            
+            // Check type specifiers
+            for (auto specChild : child->children) {
+                if (specChild->name == "TYPE_SPECIFIER") {
+                    checkTypeSpecifier(specChild);
+                }
+            }
         }
         else if (child->name == "INIT_DECL_LIST") {
             for (auto declChild : child->children) {
@@ -347,6 +400,17 @@ void SemanticAnalyzer::processVariable(Node* node) {
                     }
                     
                     if (!varName.empty()) {
+                        // If varType is still empty and we have static, that's an error
+                        if (hasStatic && varType.empty()) {
+                            addError("Variable '" + varName + "' with 'static' storage class must have explicit type specifier");
+                            continue;  // Skip adding to symbol table
+                        }
+                        
+                        // If no type at all (not even static), default to int with warning
+                        if (varType.empty() && !hasStatic) {
+                            addError("Variable '" + varName + "' declared without type specifier");
+                            varType = "int";  // Assume int for recovery
+                        }
                         cout << "DEBUG: Adding variable " << varName << " [" << varType;
                         
                         // Print pointer depth
@@ -1952,4 +2016,79 @@ string SemanticAnalyzer::resolveTypedef(const string& type) {
     }
     
     return type;  // Not a typedef, return as-is
+}
+
+
+// STATIC KEYWORD VALIDATION (FIXED)
+void SemanticAnalyzer::checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec) {
+    if (!declSpecNode) return;
+    
+    hasStatic = false;
+    hasTypeSpec = false;
+    
+    for (auto child : declSpecNode->children) {
+        // Check for static keyword
+        if (child->name == "STORAGE_CLASS_SPECIFIER") {
+            if (child->lexeme == "static") {
+                hasStatic = true;
+                cout << "DEBUG: Found 'static' keyword\n";
+            }
+        }
+        
+        // Check for type specifier
+        else if (child->name == "TYPE_SPECIFIER") {
+            if (!child->lexeme.empty()) {
+                hasTypeSpec = true;
+                cout << "DEBUG: Found type specifier: " << child->lexeme << "\n";
+            }
+        }
+        else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
+            hasTypeSpec = true;
+            cout << "DEBUG: Found struct/union type specifier\n";
+        }
+        else if (child->name == "ENUM_SPECIFIER") {
+            hasTypeSpec = true;
+            cout << "DEBUG: Found enum type specifier\n";
+        }
+        
+        // Recursively check nested DECL_SPECIFIERS
+        else if (child->name == "DECL_SPECIFIERS") {
+            bool nestedStatic = false;
+            bool nestedTypeSpec = false;
+            checkStaticKeyword(child, nestedStatic, nestedTypeSpec);
+            if (nestedStatic) hasStatic = true;
+            if (nestedTypeSpec) hasTypeSpec = true;
+        }
+    }
+    
+    cout << "DEBUG: checkStaticKeyword result - hasStatic: " << hasStatic 
+         << ", hasTypeSpec: " << hasTypeSpec << "\n";
+}
+
+
+void SemanticAnalyzer::checkTypeSpecifier(Node* typeSpecNode) {
+    if (!typeSpecNode || typeSpecNode->name != "TYPE_SPECIFIER") return;
+    
+    string typeName = typeSpecNode->lexeme;
+    
+    // Skip built-in types
+    if (typeName == "int" || typeName == "float" || typeName == "double" || 
+        typeName == "char" || typeName == "void" || typeName == "short" || 
+        typeName == "long" || typeName == "signed" || typeName == "unsigned" ||
+        typeName == "bool") {
+        return;  // Valid built-in type
+    }
+    
+    // Check if it's a valid typedef, struct, or enum
+    Symbol* typeSym = symbolTable.lookup(typeName);
+    
+    if (!typeSym) {
+        addError("Unknown type '" + typeName + "'");
+        return;
+    }
+    
+    // Verify it's actually a type (typedef, struct, or enum)
+    if (!typeSym->isTypedef && !typeSym->isStruct && !typeSym->isEnum) {
+        addError("'" + typeName + "' does not name a type");
+    }
 }
