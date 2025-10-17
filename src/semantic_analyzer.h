@@ -6,6 +6,8 @@
 #include <vector>
 #include <string>
 #include<algorithm>
+#include <map>
+
 
 class SemanticAnalyzer {
 private:
@@ -15,6 +17,9 @@ private:
     std::string currentFunctionName; 
     int loopDepth;       
     int switchDepth;      
+    std::map<std::string, Node*> currentFunctionLabels;  
+    std::vector<std::pair<std::string, Node*>> pendingGotoStatements; 
+
 
 public:
     SemanticAnalyzer(SymbolTable& symTab);
@@ -44,8 +49,6 @@ private:
     void checkFunctionCall(Node* node);
     bool isDeclarationContext(Node* node);
     void checkReturnStatement(Node* node);
-    void checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec);
-    void checkTypeSpecifier(Node* typeSpecNode);
 void analyzeDeclarator(Node* node, std::string& name, int& pointerDepth, bool& isArray, std::vector<int>& arrayDims);
 std::vector<int> extractArrayDimensions(Node* arrayNode, std::string& varName);
 int evaluateConstantExpression(Node* node);
@@ -84,7 +87,19 @@ bool allPathsReturn(Node* node);
 
 void processTypedef(Node* node);
 std::string resolveTypedef(const std::string& type);  
+
+// In private section, add:
+bool isConstantIndex(Node* indexNode, int& value);
+
+std::string getBaseTypeFromPointer(const std::string& type);
+void checkConditionExpression(Node* node);
+
+void processLabel(Node* node);
+void processGoto(Node* node);
+void verifyGotoLabels();
+
+
 };
 
-#endif
 
+#endif
