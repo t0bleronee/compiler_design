@@ -3,7 +3,6 @@
 
 using namespace std;
 
-
 SemanticAnalyzer::SemanticAnalyzer(SymbolTable& symTab) 
     : symbolTable(symTab), currentFunctionReturnType(""), currentFunctionName(""), loopDepth(0), switchDepth(0) {
     currentFunctionLabels.clear();
@@ -167,18 +166,26 @@ else if (node->name == "RETURN_STMT") {
     checkReturnStatement(node);
 }
 
-// Track loop depth and check conditions
+
 else if (node->name == "WHILE_STMT" || node->name == "DO_WHILE_STMT" || 
          node->name == "FOR_STMT_2" || node->name == "FOR_STMT_3" || 
          node->name == "FOR_RANGE_STMT" || node->name == "UNTIL_STMT") {
     loopDepth++;
     
-    // Check the condition expression
+    // Check the condition expression for all loop types
     if (node->name == "WHILE_STMT" && !node->children.empty()) {
-        checkConditionExpression(node->children[0]);
-    } else if (node->name == "DO_WHILE_STMT" && node->children.size() > 1) {
-        checkConditionExpression(node->children[1]);
+        checkConditionExpression(node->children[0]);  // while(condition)
+    } 
+    else if (node->name == "DO_WHILE_STMT" && node->children.size() > 1) {
+        checkConditionExpression(node->children[1]);  // do...while(condition)
     }
+    else if (node->name == "FOR_STMT_2" && node->children.size() > 1) {
+        checkConditionExpression(node->children[1]);  // for(init; condition; )
+    }
+    else if (node->name == "FOR_STMT_3" && node->children.size() > 1) {
+        checkConditionExpression(node->children[1]);  // for(init; condition; update)
+    }
+    // UNTIL_STMT condition is also checkable if you want
     
     for (auto child : node->children) {
         traverseAST(child);
@@ -187,7 +194,11 @@ else if (node->name == "WHILE_STMT" || node->name == "DO_WHILE_STMT" ||
     return;  
 }
 
+
 else if (node->name == "SWITCH_STMT") {
+    // Check switch expression type BEFORE traversing children
+    checkSwitchStatement(node);
+    
     switchDepth++;
     for (auto child : node->children) {
         traverseAST(child);
@@ -2443,4 +2454,52 @@ else {
             cout << "DEBUG: Verified goto to label '" << labelName << "' in function '" << currentFunctionName << "'\n";
         }
     }
+}
+
+
+void SemanticAnalyzer::checkSwitchStatement(Node* node) {
+    if (!node || node->children.empty()) return;
+    
+    // The first child of SWITCH_STMT should be the switch expression
+    Node* switchExpr = node->children[0];
+    string exprType = getExpressionType(switchExpr);
+    
+    if (exprType.empty()) return; // Skip if type couldn't be determined
+    
+    // Check if the expression type is an integer type
+    if (!isIntegerType(exprType)) {
+        addError("Switch quantity not an integer (got '" + exprType + "')");
+    }
+    
+    // Also check that case labels are integer constants
+    checkCaseLabels(node);
+}
+
+void SemanticAnalyzer::checkCaseLabels(Node* switchNode) {
+    if (!switchNode) return;
+    
+    for (auto child : switchNode->children) {
+        if (child->name == "CASE_ELEMENT") {
+            // CASE_ELEMENT should have: [0] = case expression, [1] = statement
+            if (!child->children.empty()) {
+                Node* caseExpr = child->children[0];
+                
+                // Check if case expression is a constant integer
+                if (!isConstantIntegerExpression(caseExpr)) {
+                    addError("Case label must be a constant integer expression");
+                }
+            }
+        }
+    }
+}
+
+bool SemanticAnalyzer::isConstantIntegerExpression(Node* node) {
+    if (!node) return false;
+    
+    // Check if it's a simple integer constant
+    if (node->name == "INTEGER_CONSTANT") return true;
+    
+    // Check if it's a constant expression that evaluates to integer
+    int value = evaluateConstantExpression(node);
+    return value != -1; // -1 indicates non-constant or evaluation failure
 }
