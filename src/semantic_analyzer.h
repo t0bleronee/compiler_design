@@ -98,7 +98,9 @@ void processLabel(Node* node);
 void processGoto(Node* node);
 void verifyGotoLabels();
 
-
+void checkSwitchStatement(Node* node);
+void checkCaseLabels(Node* switchNode);
+bool isConstantIntegerExpression(Node* node);
 };
 
 
