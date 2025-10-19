@@ -11,7 +11,6 @@ LEXFLAGS =
 # Directories
 SRC_DIR = src
 BUILD_DIR = build
-OUTPUT_DIR = outputs
 
 # Target executable
 TARGET = compiler
@@ -19,7 +18,7 @@ TARGET = compiler
 # Source files
 YACC_SRC = $(SRC_DIR)/parser.y
 LEX_SRC  = $(SRC_DIR)/lexer.l
-CPP_SRC  = $(SRC_DIR)/errors.cpp $(SRC_DIR)/symbol_table.cpp $(SRC_DIR)/ast.cpp $(SRC_DIR)/semantic_analyzer.cpp
+CPP_SRC  = $(SRC_DIR)/errors.cpp $(SRC_DIR)/symbol_table.cpp $(SRC_DIR)/ast.cpp $(SRC_DIR)/semantic_analyzer.cpp $(SRC_DIR)/ir_generator.cpp
 
 # Generated files
 YACC_C = $(BUILD_DIR)/parser.tab.c
@@ -34,14 +33,12 @@ all: $(TARGET)
 
 # Build the compiler
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lfl
-
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 # Generate parser from yacc file
 $(YACC_C) $(YACC_H): $(YACC_SRC)
 	mkdir -p $(BUILD_DIR)
 	$(YACC) $(YACCFLAGS) --defines=$(YACC_H) -o $(YACC_C) $<
-	
 
 # Generate lexer from lex file
 $(LEX_C): $(LEX_SRC) $(YACC_H)
@@ -55,29 +52,36 @@ $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.c
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-	
-# Run compiler on all testcases and save outputs
-testcases: $(TARGET)
-	mkdir -p $(OUTPUT_DIR)
-	for file in testcases/*; do \
-	    base=$$(basename $$file); \
-	    echo "Running test: $$file"; \
-	    ./$(TARGET) < $$file > $(OUTPUT_DIR)/$$base.txt; \
-	done
-	
-# Test with sample programs
+
+# Test with a simple program
 test: $(TARGET)
 	@echo "Testing simple program..."
 	@echo 'int main() { return 0; }' | ./$(TARGET)
-	@echo ""
-	@echo "Testing with sample.cpp if it exists..."
-	@if [ -f sample.cpp ]; then ./$(TARGET) sample.cpp; fi
+
+# Run all test cases
+test-all: $(TARGET)
+	@echo "Running all test cases..."
+	@for file in testcases/*; do \
+		if [ -f "$$file" ]; then \
+			echo "Testing: $$file"; \
+			./$(TARGET) "$$file" || echo "Failed: $$file"; \
+		fi; \
+	done
 
 # Clean generated files
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET) parser.output
+	rm -rf ir_outputs logs output.3ac ast.dot ast.png *.log
 
-distclean: clean
-	rm -f ~ .bak core
+# Install dependencies (for Ubuntu/Debian)
+install-deps:
+	@echo "Installing dependencies..."
+	@sudo apt-get update
+	@sudo apt-get install -y build-essential bison flex
 
-.PHONY: all test clean distclean
+# Install dependencies (for macOS)
+install-deps-mac:
+	@echo "Installing dependencies..."
+	@brew install bison flex
+
+.PHONY: all test test-all clean install-deps install-deps-mac
