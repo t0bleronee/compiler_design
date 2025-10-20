@@ -7,6 +7,13 @@
 #include <string>
 #include <iostream>
 
+struct CaseInfo {
+    std::string value;      // Case constant value
+    std::string label;      // Label for this case
+    bool isDefault;         // Is this the default case?
+    Node* node;             // AST node for this case
+};
+
 // TAC Operation Codes
 enum class TACOp {
     // Arithmetic
@@ -69,6 +76,8 @@ private:
     
     // Current function context
     std::string currentFunction;
+    std::string currentBreakLabel;
+    std::string currentContinueLabel;
 
 public:
     IRGenerator(SymbolTable& symTab);
@@ -83,6 +92,10 @@ public:
 private:
     void generateParameterHandling(Node* paramList);
     std::string findParameterName(Node* paramDecl);
+    
+    // Logical operators with short-circuit
+    std::string generateLogicalAnd(Node* node);
+    std::string generateLogicalOr(Node* node);
     
     // AST traversal helpers
     void traverseAST(Node* node);
@@ -110,12 +123,30 @@ private:
     void generateWhileStatement(Node* node);
     void generateReturnStatement(Node* node);
     
+    // New in Version 2: Advanced control flow
+    void generateForStatement(Node* node);
+    void generateDoWhileStatement(Node* node);
+    void generateSwitchStatement(Node* node);
+    void generateBreakStatement(Node* node);
+    void generateContinueStatement(Node* node);
+    
+    // New in Version 2: Advanced expressions
+    std::string generatePreIncrement(Node* node);
+    std::string generatePreDecrement(Node* node);
+    std::string generatePostIncrement(Node* node);
+    std::string generatePostDecrement(Node* node);
+    std::string generateCompoundAssignment(Node* node);
+    std::string generateTernaryOperator(Node* node);
+    
     // Utility
     TACOp getBinaryOp(const std::string& nodeName);
     TACOp getUnaryOp(const std::string& nodeName);
     
     // Helper for extracting names from declarators
     std::string getDeclaratorName(Node* node);
+    
+    // New in Version 2: Statement list handling
+    void generateStatementList(Node* node);
 };
 
 #endif // IR_GENERATOR_H
