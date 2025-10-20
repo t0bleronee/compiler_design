@@ -1,4 +1,5 @@
 #include "ast.h"
+#include "symbol_table.h"
 #include <iostream>
 #include <fstream>
 using namespace std;
@@ -76,4 +77,3 @@ std::string setAbstractDeclaratorType(Node* node, const std::string &type) {
     if (node) node->setType(type);
     return type;
 }
-
