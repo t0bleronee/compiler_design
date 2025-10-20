@@ -7,6 +7,7 @@
 #include <stack>
 #include <iostream>
 #include "ast.h"   // Your Node definition
+#include <memory>
 
 
 
@@ -47,15 +48,15 @@ Symbol(std::string n, std::string t, Node* nd, bool func=false)
 
 struct Scopeh {
     int level;
-    std::map<std::string, Symbol> symbols;
+    std::map<std::string, Symbol*> symbols;
 };
 // Symbol table class
 class SymbolTable {
 private:
-    std::vector<std::map<std::string, Symbol>> scopes;  // Stack of scopes
+    std::vector<std::map<std::string, Symbol*>> scopes;  // Stack of scopes
     std::vector<std::string> errors;                  // Semantic errors
      std::vector<Scopeh> scopeHistory;
-   
+     std::vector<std::unique_ptr<Symbol>> allSymbols;
 
 public:
     SymbolTable();                       
@@ -65,7 +66,8 @@ public:
                bool isFunction=false, const std::vector<std::string>& params = {},
                bool isArray=false, const std::vector<int>& arrayDims = {}, 
                int pointerDepth=0, bool isStruct=false, bool isEnum=false, bool isUnion=false , bool isTypedef = false, std::string aliasedType = "");
-    Symbol* lookup(const std::string& name);      
+    Symbol* lookup(const std::string& name);   
+     Symbol* lookuph(const std::string& name);   
     Symbol* lookupCurrentScope(const std::string& name); 
     void addError(const std::string& error);
     void printErrors() const;
