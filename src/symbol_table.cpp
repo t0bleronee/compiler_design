@@ -10,7 +10,7 @@ enterScope();
 
 
 void SymbolTable::enterScope() {
-    scopes.push_back(std::map<std::string, Symbol>());
+    scopes.push_back(std::map<std::string, Symbol*>());
     std::cout << "DEBUG enterScope: active scopes = " << scopes.size() << "\n";
 }
 
@@ -30,37 +30,48 @@ void SymbolTable::exitScope() {
                   << scopes.size() << ", history = " << scopeHistory.size() << "\n";
     }
 }
-
 bool SymbolTable::addSymbol(const string& name, const string& type, Node* node, 
                             bool isFunction, const vector<string>& params,
                             bool isArray, const vector<int>& arrayDims, 
-                            int pointerDepth, bool isStruct, bool isEnum, bool isUnion, bool isTypedef,    string aliasedType) {
+                            int pointerDepth, bool isStruct, bool isEnum, 
+                            bool isUnion, bool isTypedef, string aliasedType) {
     auto& current = scopes.back();
-
+    
+    // Check if already exists
     if (current.find(name) != current.end()) {
         if (isFunction) {
-            Symbol& existing = current[name];
-            if (existing.paramTypes == params) {
+            Symbol* existing = current[name];
+            if (existing->paramTypes == params) {
                 return false;
             }
             return false;
         }
         return false;
     }
-
-    Symbol sym(name, type, node, isFunction);
-    sym.paramTypes = params;
-    sym.isArray = isArray;
-    sym.arrayDimensions = arrayDims;
-    sym.pointerDepth = pointerDepth;
-    sym.isStruct = isStruct;
-    sym.isEnum = isEnum;
-     sym.isUnion = isUnion;
-      sym.isTypedef=isTypedef;
-   sym.aliasedType=aliasedType;
-    current[name] = sym;
+    
+  unique_ptr<Symbol> sym(new Symbol(name, type, node, isFunction));
+    sym->paramTypes = params;
+    sym->isArray = isArray;
+    sym->arrayDimensions = arrayDims;
+    sym->pointerDepth = pointerDepth;
+    sym->isStruct = isStruct;
+    sym->isEnum = isEnum;
+    sym->isUnion = isUnion;
+    sym->isTypedef = isTypedef;
+    sym->aliasedType = aliasedType;
+    
+    // ✅ Get the pointer BEFORE moving
+    Symbol* symPtr = sym.get();
+    
+    // ✅ Store in permanent storage
+    allSymbols.push_back(move(sym));
+    
+    // ✅ Store pointer in current scope
+    current[name] = symPtr;
+    
     return true;
 }
+
 // Lookup symbol in all scopes (from inner to outer)
 
 Symbol* SymbolTable::lookup(const std::string& name) {
@@ -68,17 +79,29 @@ Symbol* SymbolTable::lookup(const std::string& name) {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
         auto found = it->find(name);
         if (found != it->end()) {
-            return &found->second; // ✅ return actual symbol pointer
+            return found->second; // ✅ return actual symbol pointer
         }
     }
     return nullptr;
 }
 
+Symbol* SymbolTable::lookuph(const std::string& name) {
+    // Traverse from innermost (back) to outermost (front)
+    for (auto it = scopeHistory.rbegin(); it != scopeHistory.rend(); ++it) {
+        auto found = it->symbols.find(name);  // ✅ access the map inside Scopeh
+        if (found != it->symbols.end()) {     // ✅ compare with map's end()
+            return found->second;            // return pointer to Symbol
+        }
+    }
+    return nullptr; // not found
+}
+
+
 Symbol* SymbolTable::lookupCurrentScope(const std::string& name) {
     if (scopes.empty()) return nullptr;
     auto& current = scopes.back(); // was top()
     auto it = current.find(name);
-    if (it != current.end()) return &it->second;
+    if (it != current.end()) return it->second;
     return nullptr;
 }
 
@@ -107,7 +130,7 @@ void SymbolTable::printAllScopes() const {
         for (const auto &p : s.symbols) {
         
         // Suppose p.second.type is something like "int***"
-std::string type = p.second.type;
+std::string type = p.second->type;
 
 // 1️⃣ Count trailing '*'
 size_t starCount = 0;
@@ -121,32 +144,32 @@ for (size_t i = type.size(); i > 0; --i) {
 // 2️⃣ Remove those stars to get the base type
 std::string baseType = type.substr(0, type.size() - starCount);
 
-            std::cout << "  " << p.second.name << " [" << p.second.type;
+            std::cout << "  " << p.second->name << " [" << p.second->type;
               // Print struct members if it's a struct type
-            if (p.second.isStruct && !p.second.structMembers.empty()) {
+            if (p.second->isStruct && !p.second->structMembers.empty()) {
                 std::cout << " { ";
-                for (const auto& member : p.second.structMembers) {
+                for (const auto& member : p.second->structMembers) {
                     std::cout << member.first << ":" << member.second << " ";
                 }
                 std::cout << "}";
             }
             
             // Print enum values if it's an enum type
-            if (p.second.isEnum && !p.second.enumValues.empty()) {
+            if (p.second->isEnum && !p.second->enumValues.empty()) {
                 std::cout << " { ";
-                for (const auto& value : p.second.enumValues) {
+                for (const auto& value : p.second->enumValues) {
                     std::cout << value.first << "=" << value.second << " ";
                 }
                 std::cout << "}";
             }
             // Print pointer depth
-            for (int i = 0; i < p.second.pointerDepth; i++) {
+            for (int i = 0; i < p.second->pointerDepth; i++) {
                 std::cout << "*";
             }
             
             // Print array dimensions
-            if (p.second.isArray) {
-                for (int dim : p.second.arrayDimensions) {
+            if (p.second->isArray) {
+                for (int dim : p.second->arrayDimensions) {
                     std::cout << "[";
                     if (dim != -1) {
                         std::cout << dim;
@@ -158,13 +181,13 @@ std::string baseType = type.substr(0, type.size() - starCount);
             std::cout << "]";
             
             // Print function info
-            if (p.second.isFunction) {
+            if (p.second->isFunction) {
                 std::cout << " (function)";
-                if (!p.second.paramTypes.empty()) {
+                if (!p.second->paramTypes.empty()) {
                     std::cout << " params:(";
-                    for (size_t i = 0; i < p.second.paramTypes.size(); i++) {
-                        std::cout << p.second.paramTypes[i];
-                        if (i < p.second.paramTypes.size() - 1) std::cout << ", ";
+                    for (size_t i = 0; i < p.second->paramTypes.size(); i++) {
+                        std::cout << p.second->paramTypes[i];
+                        if (i < p.second->paramTypes.size() - 1) std::cout << ", ";
                     }
                     std::cout << ")";
                 }
