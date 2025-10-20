@@ -1,70 +1,121 @@
 #ifndef IR_GENERATOR_H
 #define IR_GENERATOR_H
 
-#include <string>
-#include <vector>
-#include <map>
-#include <fstream>
 #include "ast.h"
 #include "symbol_table.h"
+#include <vector>
+#include <string>
+#include <iostream>
 
-// Simple 3-address code IR generator with backpatching support
+// TAC Operation Codes
+enum class TACOp {
+    // Arithmetic
+    ADD, SUB, MUL, DIV, MOD,
+    NEG, // Unary minus
+    
+    // Comparisons  
+    EQ, NE, LT, LE, GT, GE,
+    
+    // Logical
+    AND, OR, NOT,
+    
+    // Bitwise
+    BIT_AND, BIT_OR, BIT_XOR, SHL, SHR, BIT_NOT,
+  
+    // Memory operations
+    ASSIGN,       // t1 = x
+    LOAD,         // t1 = *p  
+    STORE,        // *p = t1
+    ADDRESS,      // t1 = &x
+    
+    // Control flow
+    GOTO,         // goto L1
+    IF_GOTO,      // if t1 goto L1
+    IF_FALSE_GOTO, // if_false t1 goto L1
+    LABEL,        // L1:
+    
+    // Function operations
+    CALL,         // t1 = call func
+    RETURN,       // return t1
+    PARAM,        // param t1
+    
+    // Special
+    CONST         // t1 = CONST 5
+};
+
+// TAC Instruction
+struct TACInstruction {
+    TACOp opcode;
+    std::string result;
+    std::string operand1;
+    std::string operand2;
+    
+    TACInstruction(TACOp op, const std::string& res = "", 
+                   const std::string& op1 = "", const std::string& op2 = "")
+        : opcode(op), result(res), operand1(op1), operand2(op2) {}
+    
+    void print(std::ostream& out = std::cout) const;
+    std::string toString() const;
+};
+
 class IRGenerator {
-public:
-    IRGenerator(SymbolTable& symtab);
-    void generate(Node* root);
-    void printToStdout() const;
-    bool writeToFile(const std::string& path) const;
-
 private:
-    SymbolTable& symtab;
-    std::vector<std::string> code;
+    std::vector<TACInstruction> instructions;
+    SymbolTable& symbolTable;
+    
+    // Temporary and label counters
     int tempCounter;
     int labelCounter;
-
-    std::string newTemp();
-    std::string newLabel();
-    int emit(const std::string& instr);
-
-    // Traversal / generation
-    struct ExprResult {
-        std::string place;            // temporary or variable name
-        bool isBoolean = false;       // true if expression yields true/false lists
-        std::vector<int> truelist;    // instruction indices to patch when true
-        std::vector<int> falselist;   // instruction indices to patch when false
-    };
-
-    // genExpr returns ExprResult (with place for non-boolean exprs,
-    // and truelist/falselist for boolean ones).
-    ExprResult genExpr(Node* node);
-
-    // genStmt returns a nextlist: list of instruction indices that should be
-    // patched to the next instruction after this statement.
-    using PatchList = std::vector<int>;
-    PatchList genStmt(Node* node);
-    void genFunction(Node* node);
-
-    // Backpatching helpers
-    PatchList makelist(int instrIndex);
-    PatchList merge(const PatchList &a, const PatchList &b);
-    void backpatch(const PatchList &list, const std::string &label);
     
-    // Convert a boolean ExprResult (truelist/falselist) into a temporary with 0/1
-    std::string boolToTemp(ExprResult &e);
+    // Current function context
+    std::string currentFunction;
+
+public:
+    IRGenerator(SymbolTable& symTab);
     
-    // Stack for break/continue labels
-    struct LoopContext {
-        std::string breakLabel;
-        std::string continueLabel;
-    };
-    std::vector<LoopContext> loopStack;
+    // Main generation function
+    bool generateIR(Node* ast);
     
-    void pushLoop(const std::string& breakLbl, const std::string& continueLbl);
-    void popLoop();
-    LoopContext* currentLoop();
+    // Output
+    void printIR(std::ostream& out = std::cout) const;
+    void writeToFile(const std::string& filename) const;
     
-    // Array initialization helper
-    void genArrayInitialization(const std::string& arrayName, Node* initList, int baseOffset);
+private:
+    void generateParameterHandling(Node* paramList);
+    std::string findParameterName(Node* paramDecl);
+    
+    // AST traversal helpers
+    void traverseAST(Node* node);
+    bool hasStructBody(Node* node);
+    std::string findIdentifier(Node* node);
+
+    // Helper functions
+    std::string createTemp();
+    std::string createLabel(const std::string& prefix = "L");
+
+    // Generation methods for different AST nodes
+    std::string generateExpression(Node* node);
+    void generateStatement(Node* node);
+    void generateDeclaration(Node* node);
+    void generateFunction(Node* node);
+    
+    // Specific expression generators
+    std::string generateBinaryExpr(Node* node, TACOp op);
+    std::string generateUnaryExpr(Node* node, TACOp op);
+    std::string generateAssignment(Node* node);
+    std::string generateFunctionCall(Node* node);
+    
+    // Control flow generators
+    void generateIfStatement(Node* node);
+    void generateWhileStatement(Node* node);
+    void generateReturnStatement(Node* node);
+    
+    // Utility
+    TACOp getBinaryOp(const std::string& nodeName);
+    TACOp getUnaryOp(const std::string& nodeName);
+    
+    // Helper for extracting names from declarators
+    std::string getDeclaratorName(Node* node);
 };
 
 #endif // IR_GENERATOR_H
