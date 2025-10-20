@@ -1,11 +1,10 @@
 #ifndef AST_H
 #define AST_H
-
 #include <string>
 #include <vector>
 #include <fstream>
 #include <iostream>
-
+class Symbol; 
 class Node {
 public:
     std::string name;
@@ -14,10 +13,11 @@ public:
     std::vector<Node*> children;
     Node* parent;
     bool processed = false;
+     Symbol* symbol;
     // Constructors
     //Node(const std::string &name) : name(name) {}
     Node(const std::string &name_, const std::string &lexeme_ = "")
-        : name(name_), lexeme(lexeme_) , parent(nullptr) {}
+        : name(name_), lexeme(lexeme_) , parent(nullptr) ,symbol(nullptr){}
    
     void addChild(Node* child);
     void addChild(const std::string &childName);
@@ -43,4 +43,3 @@ std::string setAbstractDirectDeclaratorType(Node* node, const std::string &type)
 std::string setAbstractDeclaratorType(Node* node, const std::string &type);
 
 #endif // AST_H
-
