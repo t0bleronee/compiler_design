@@ -101,6 +101,20 @@ void verifyGotoLabels();
 void checkSwitchStatement(Node* node);
 void checkCaseLabels(Node* switchNode);
 bool isConstantIntegerExpression(Node* node);
+
+void checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec);
+void checkTypeSpecifier(Node* typeSpecNode);
+
+bool isFunctionPrototype(Node* declNode);
+bool hasFunctionDeclarator(Node* node);
+void processFunctionPrototype(Node* declNode);
+Node* findFunctionDeclarator(Node* node);
+
+Node* findIdentifierInArray(Node* arrayNode);
+
+Node* findIdentifierInDeclarator(Node* declaratorNode);
+void extractStructMembers(Node* declNode, std::map<std::string, std::string>& members, std::map<std::string, Node*>& memberNodes);  // Updated signature
+
 };
 
 
