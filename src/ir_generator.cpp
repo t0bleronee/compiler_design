@@ -4,7 +4,7 @@
 
 using namespace std;
 
-// TACInstruction methods
+// TACInstruction methods (same as Version 1)
 void TACInstruction::print(ostream& out) const {
     out << toString() << endl;
 }
@@ -122,7 +122,8 @@ string TACInstruction::toString() const {
 
 // IRGenerator implementation
 IRGenerator::IRGenerator(SymbolTable& symTab) 
-    : symbolTable(symTab), tempCounter(0), labelCounter(0), currentFunction("") {}
+    : symbolTable(symTab), tempCounter(0), labelCounter(0), 
+      currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
 
 bool IRGenerator::generateIR(Node* ast) {
     if (!ast) return false;
@@ -221,6 +222,8 @@ void IRGenerator::traverseAST(Node* node) {
     }
 }
 
+
+// Update generateStatement to handle new statement types
 void IRGenerator::generateStatement(Node* node) {
     if (!node) return;
     
@@ -256,6 +259,22 @@ void IRGenerator::generateStatement(Node* node) {
     }
     else if (node->name == "WHILE_STMT") {
         generateWhileStatement(node);
+    }
+    // NEW: Advanced control flow statements
+    else if (node->name == "FOR_STMT_2" || node->name == "FOR_STMT_3") {
+        generateForStatement(node);
+    }
+    else if (node->name == "DO_WHILE_STMT") {
+        generateDoWhileStatement(node);
+    }
+    else if (node->name == "SWITCH_STMT") {
+        generateSwitchStatement(node);
+    }
+    else if (node->name == "BREAK_STMT") {
+        generateBreakStatement(node);
+    }
+    else if (node->name == "CONTINUE_STMT") {
+        generateContinueStatement(node);
     }
     else if (node->name == "RETURN_STMT") {
         generateReturnStatement(node);
@@ -326,6 +345,8 @@ void IRGenerator::writeToFile(const string& filename) const {
     }
 }
 
+
+// Update generateExpression to handle new expression types
 string IRGenerator::generateExpression(Node* node) {
     if (!node) return "";
     
@@ -360,11 +381,46 @@ string IRGenerator::generateExpression(Node* node) {
              node->name == "RSHIFT_EXPR") {
         return generateBinaryExpr(node, getBinaryOp(node->name));
     }
+    // NEW: Logical operators with short-circuit
+    else if (node->name == "LOGICAL_AND") {
+        return generateLogicalAnd(node);
+    }
+    else if (node->name == "LOGICAL_OR") {
+        return generateLogicalOr(node);
+    }
+    // NEW: Compound assignment
+    else if (node->name == "COMPOUND_ASSIGN") {
+        return generateCompoundAssignment(node);
+    }
     else if (node->name == "ASSIGN_EXPR") {
+        // Check if it's a compound assignment
+        if (node->children.size() >= 3 && node->children[1]->name == "OP") {
+            string op = node->children[1]->lexeme;
+            if (op != "=") {
+                return generateCompoundAssignment(node);
+            }
+        }
         return generateAssignment(node);
     }
     else if (node->name == "FUNC_CALL") {
         return generateFunctionCall(node);
+    }
+    // NEW: Increment/decrement operators
+    else if (node->name == "PRE_INC") {
+        return generatePreIncrement(node);
+    }
+    else if (node->name == "PRE_DEC") {
+        return generatePreDecrement(node);
+    }
+    else if (node->name == "POST_INC") {
+        return generatePostIncrement(node);
+    }
+    else if (node->name == "POST_DEC") {
+        return generatePostDecrement(node);
+    }
+    // NEW: Ternary operator
+    else if (node->name == "TERNARY_EXPR" || node->name == "COND_EXPR") {
+        return generateTernaryOperator(node);
     }
     else if (node->name == "UNARY_OP") {
         if (node->children.size() >= 2) {
@@ -658,7 +714,7 @@ void IRGenerator::generateIfStatement(Node* node) {
         }
     }
 }
-
+// Update the while statement to use break/continue labels
 void IRGenerator::generateWhileStatement(Node* node) {
     if (!node || node->children.size() < 2) return;
     
@@ -668,7 +724,15 @@ void IRGenerator::generateWhileStatement(Node* node) {
     string conditionLabel = createLabel("while_cond");
     string endLabel = createLabel("while_end");
     
-    // Jump to condition check
+    // Save previous labels
+    string prevBreakLabel = currentBreakLabel;
+    string prevContinueLabel = currentContinueLabel;
+    
+    // Set current labels for break/continue
+    currentBreakLabel = endLabel;
+    currentContinueLabel = conditionLabel;
+    
+    // Start of loop - jump to condition check
     instructions.emplace_back(TACOp::GOTO, conditionLabel);
     
     // Loop body label
@@ -686,7 +750,13 @@ void IRGenerator::generateWhileStatement(Node* node) {
     
     // End of loop
     instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    // Restore previous labels
+    currentBreakLabel = prevBreakLabel;
+    currentContinueLabel = prevContinueLabel;
 }
+
+
 
 void IRGenerator::generateReturnStatement(Node* node) {
     cout << "DEBUG: Generating return statement" << endl;
@@ -712,4 +782,478 @@ string IRGenerator::getDeclaratorName(Node* node) {
     }
     
     return "";
+}
+// All the existing methods from Version 1 remain the same until we add new ones...
+
+// === NEW IN VERSION 2: Advanced Control Flow ===
+
+void IRGenerator::generateForStatement(Node* node) {
+    if (!node || node->children.size() < 3) return;
+    
+    cout << "DEBUG: Generating for statement" << endl;
+    
+    string startLabel = createLabel("for_start");
+    string condLabel = createLabel("for_cond");
+    string updateLabel = createLabel("for_update");
+    string endLabel = createLabel("for_end");
+    
+    // Save previous labels
+    string prevBreakLabel = currentBreakLabel;
+    string prevContinueLabel = currentContinueLabel;
+    
+    // Set current labels
+    currentBreakLabel = endLabel;
+    currentContinueLabel = updateLabel;
+    
+    // Generate initialization (child 0)
+    if (node->children[0]->name != "EMPTY") {
+        generateStatement(node->children[0]);
+    }
+    
+    // Jump to condition
+    instructions.emplace_back(TACOp::GOTO, condLabel);
+    
+    // Loop body label
+    instructions.emplace_back(TACOp::LABEL, startLabel);
+    
+    // Generate loop body
+    int bodyIndex = (node->children.size() == 4) ? 3 : 2;
+    if (bodyIndex < node->children.size()) {
+        generateStatement(node->children[bodyIndex]);
+    }
+    
+    // Update label
+    instructions.emplace_back(TACOp::LABEL, updateLabel);
+    
+    // Generate update expression
+    if (node->children.size() == 4 && node->children[2]->name != "EMPTY") {
+        generateExpression(node->children[2]);
+    }
+    
+    // Condition label
+    instructions.emplace_back(TACOp::LABEL, condLabel);
+    
+    // Generate condition
+    if (node->children[1]->name != "EMPTY") {
+        string condTemp = generateExpression(node->children[1]);
+        instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
+    } else {
+        instructions.emplace_back(TACOp::GOTO, startLabel);
+    }
+    
+    // End label
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    // Restore previous labels
+    currentBreakLabel = prevBreakLabel;
+    currentContinueLabel = prevContinueLabel;
+}
+
+void IRGenerator::generateDoWhileStatement(Node* node) {
+    if (!node || node->children.size() < 2) return;
+    
+    cout << "DEBUG: Generating do-while statement" << endl;
+    
+    string startLabel = createLabel("do_start");
+    string endLabel = createLabel("do_end");
+    
+    // Loop body label
+    instructions.emplace_back(TACOp::LABEL, startLabel);
+    
+    // Generate loop body (child 0)
+    generateStatement(node->children[0]);
+    
+    // Generate condition (child 1)
+    string condTemp = generateExpression(node->children[1]);
+    
+    // If condition is true, jump back to start
+    instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
+    
+    // End label
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+}
+
+void IRGenerator::generateSwitchStatement(Node* node) {
+    if (!node || node->children.size() < 2) return;
+    
+    cout << "DEBUG: Generating switch statement" << endl;
+    
+    Node* switchExpr = node->children[0];
+    Node* caseList = node->children[1];
+    
+    // Generate switch expression (unwrap EXPR_LIST if needed)
+    string switchTemp;
+    if (switchExpr->name == "EXPR_LIST" && !switchExpr->children.empty()) {
+        switchTemp = generateExpression(switchExpr->children[0]);
+    } else {
+        switchTemp = generateExpression(switchExpr);
+    }
+    
+    string endLabel = createLabel("switch_end");
+    
+    // Store the end label for break statements
+    string prevBreakLabel = currentBreakLabel;
+    currentBreakLabel = endLabel;
+    
+    // Collect all case information
+    vector<CaseInfo> cases;
+    
+    // Process CASE_LIST
+    if (caseList->name == "CASE_LIST") {
+        for (auto caseNode : caseList->children) {
+            if (caseNode->name == "CASE_ELEMENT") {
+                // CASE_ELEMENT has: INTEGER_CONSTANT, STATEMENT_LIST
+                if (!caseNode->children.empty()) {
+                    CaseInfo info;
+                    info.value = caseNode->children[0]->lexeme;  // Get case value
+                    info.label = createLabel("case");
+                    info.isDefault = false;
+                    info.node = caseNode;
+                    cases.push_back(info);
+                }
+            }
+            else if (caseNode->name == "DEFAULT_ELEMENT") {
+                // DEFAULT_ELEMENT has: STATEMENT_LIST
+                CaseInfo info;
+                info.value = "";
+                info.label = createLabel("default");
+                info.isDefault = true;
+                info.node = caseNode;
+                cases.push_back(info);
+            }
+        }
+    }
+    
+    // Generate comparison code for each case
+    for (const auto& caseInfo : cases) {
+        if (caseInfo.isDefault) continue;  // Skip default in comparisons
+        
+        string condTemp = createTemp();
+        string caseValueTemp = createTemp();
+        
+        // Load case constant
+        instructions.emplace_back(TACOp::CONST, caseValueTemp, caseInfo.value);
+        
+        // Compare: condTemp = (switchTemp == caseValue)
+        instructions.emplace_back(TACOp::EQ, condTemp, switchTemp, caseValueTemp);
+        instructions.emplace_back(TACOp::IF_GOTO, caseInfo.label, condTemp);
+    }
+    
+    // If no case matched, jump to default or end
+    bool hasDefault = false;
+    string defaultLabel = "";
+    for (const auto& caseInfo : cases) {
+        if (caseInfo.isDefault) {
+            hasDefault = true;
+            defaultLabel = caseInfo.label;
+            break;
+        }
+    }
+    
+    if (hasDefault) {
+        instructions.emplace_back(TACOp::GOTO, defaultLabel);
+    } else {
+        instructions.emplace_back(TACOp::GOTO, endLabel);
+    }
+    
+    // Generate code for each case body
+    for (const auto& caseInfo : cases) {
+        // Emit case label
+        instructions.emplace_back(TACOp::LABEL, caseInfo.label);
+        
+        // Generate statements for this case
+        if (caseInfo.node->children.size() > 1) {
+            Node* stmtList = caseInfo.node->children[1];  // STATEMENT_LIST
+            generateStatementList(stmtList);
+        } else if (caseInfo.node->children.size() == 1 && caseInfo.isDefault) {
+            // DEFAULT_ELEMENT only has STATEMENT_LIST
+            Node* stmtList = caseInfo.node->children[0];
+            generateStatementList(stmtList);
+        }
+    }
+    
+    // End label
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    // Restore previous break label
+    currentBreakLabel = prevBreakLabel;
+}
+
+void IRGenerator::generateBreakStatement(Node* node) {
+    cout << "DEBUG: Generating break statement" << endl;
+    
+    if (!currentBreakLabel.empty()) {
+        instructions.emplace_back(TACOp::GOTO, currentBreakLabel);
+    } else {
+        cout << "ERROR: break statement outside of loop/switch" << endl;
+    }
+}
+
+void IRGenerator::generateContinueStatement(Node* node) {
+    cout << "DEBUG: Generating continue statement" << endl;
+    
+    if (!currentContinueLabel.empty()) {
+        instructions.emplace_back(TACOp::GOTO, currentContinueLabel);
+    } else {
+        cout << "ERROR: continue statement outside of loop" << endl;
+    }
+}
+
+void IRGenerator::generateStatementList(Node* node) {
+    if (!node) return;
+    
+    if (node->name == "STATEMENT_LIST") {
+        for (auto child : node->children) {
+            if (child->name == "EXPR_LIST") {
+                // Process expressions in EXPR_LIST
+                for (auto expr : child->children) {
+                    generateExpression(expr);
+                }
+            } else {
+                generateStatement(child);
+            }
+        }
+    } else {
+        generateStatement(node);
+    }
+}
+
+// === NEW IN VERSION 2: Advanced Expressions ===
+
+string IRGenerator::generatePreIncrement(Node* node) {
+    if (!node || node->children.empty()) return "";
+    
+    Node* operand = node->children[0];
+    if (operand->name != "IDENTIFIER") return "";
+    
+    string varName = operand->lexeme;
+    string oneTemp = createTemp();
+    string resultTemp = createTemp();
+    
+    // Create constant 1
+    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    
+    // var = var + 1
+    instructions.emplace_back(TACOp::ADD, resultTemp, varName, oneTemp);
+    instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
+    
+    // Return the new value
+    return varName;
+}
+
+string IRGenerator::generatePreDecrement(Node* node) {
+    if (!node || node->children.empty()) return "";
+    
+    Node* operand = node->children[0];
+    if (operand->name != "IDENTIFIER") return "";
+    
+    string varName = operand->lexeme;
+    string oneTemp = createTemp();
+    string resultTemp = createTemp();
+    
+    // Create constant 1
+    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    
+    // var = var - 1
+    instructions.emplace_back(TACOp::SUB, resultTemp, varName, oneTemp);
+    instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
+    
+    // Return the new value
+    return varName;
+}
+
+string IRGenerator::generatePostIncrement(Node* node) {
+    if (!node || node->children.empty()) return "";
+    
+    Node* operand = node->children[0];
+    if (operand->name != "IDENTIFIER") return "";
+    
+    string varName = operand->lexeme;
+    string oldValue = createTemp();
+    string oneTemp = createTemp();
+    string newValue = createTemp();
+    
+    // Save old value
+    instructions.emplace_back(TACOp::ASSIGN, oldValue, varName);
+    
+    // Create constant 1
+    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    
+    // var = var + 1
+    instructions.emplace_back(TACOp::ADD, newValue, varName, oneTemp);
+    instructions.emplace_back(TACOp::ASSIGN, varName, newValue);
+    
+    // Return the old value (before increment)
+    return oldValue;
+}
+
+string IRGenerator::generatePostDecrement(Node* node) {
+    if (!node || node->children.empty()) return "";
+    
+    Node* operand = node->children[0];
+    if (operand->name != "IDENTIFIER") return "";
+    
+    string varName = operand->lexeme;
+    string oldValue = createTemp();
+    string oneTemp = createTemp();
+    string newValue = createTemp();
+    
+    // Save old value
+    instructions.emplace_back(TACOp::ASSIGN, oldValue, varName);
+    
+    // Create constant 1
+    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    
+    // var = var - 1
+    instructions.emplace_back(TACOp::SUB, newValue, varName, oneTemp);
+    instructions.emplace_back(TACOp::ASSIGN, varName, newValue);
+    
+    // Return the old value (before decrement)
+    return oldValue;
+}
+
+string IRGenerator::generateCompoundAssignment(Node* node) {
+    if (!node || node->children.size() < 3) return "";
+    
+    Node* lhs = node->children[0];
+    Node* op = node->children[1];
+    Node* rhs = node->children[2];
+    
+    if (lhs->name != "IDENTIFIER") return "";
+    
+    string varName = lhs->lexeme;
+    string rhsTemp = generateExpression(rhs);
+    string resultTemp = createTemp();
+    
+    // Determine the operation based on operator
+    string opStr = op->lexeme;
+    
+    if (opStr == "+=") {
+        instructions.emplace_back(TACOp::ADD, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "-=") {
+        instructions.emplace_back(TACOp::SUB, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "*=") {
+        instructions.emplace_back(TACOp::MUL, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "/=") {
+        instructions.emplace_back(TACOp::DIV, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "%=") {
+        instructions.emplace_back(TACOp::MOD, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "&=") {
+        instructions.emplace_back(TACOp::BIT_AND, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "|=") {
+        instructions.emplace_back(TACOp::BIT_OR, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "^=") {
+        instructions.emplace_back(TACOp::BIT_XOR, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == "<<=") {
+        instructions.emplace_back(TACOp::SHL, resultTemp, varName, rhsTemp);
+    }
+    else if (opStr == ">>=") {
+        instructions.emplace_back(TACOp::SHR, resultTemp, varName, rhsTemp);
+    }
+    else {
+        cout << "WARNING: Unknown compound operator: " << opStr << endl;
+        return "";
+    }
+    
+    // Store result back to variable
+    instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
+    
+    return varName;
+}
+
+string IRGenerator::generateTernaryOperator(Node* node) {
+    if (!node || node->children.size() < 3) return "";
+    
+    cout << "DEBUG: Generating ternary operator" << endl;
+    
+    Node* condition = node->children[0];
+    Node* trueExpr = node->children[1];
+    Node* falseExpr = node->children[2];
+    
+    string condTemp = generateExpression(condition);
+    string resultTemp = createTemp();
+    string trueLabel = createLabel("ternary_true");
+    string falseLabel = createLabel("ternary_false");
+    string endLabel = createLabel("ternary_end");
+    
+    // If condition is false, jump to false branch
+    instructions.emplace_back(TACOp::IF_FALSE_GOTO, falseLabel, condTemp);
+    
+    // True branch
+    instructions.emplace_back(TACOp::LABEL, trueLabel);
+    string trueTemp = generateExpression(trueExpr);
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, trueTemp);
+    instructions.emplace_back(TACOp::GOTO, endLabel);
+    
+    // False branch
+    instructions.emplace_back(TACOp::LABEL, falseLabel);
+    string falseTemp = generateExpression(falseExpr);
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, falseTemp);
+    
+    // End
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    return resultTemp;
+}
+
+string IRGenerator::generateLogicalAnd(Node* node) {
+    if (!node || node->children.size() < 2) return "";
+    
+    string leftTemp = generateExpression(node->children[0]);
+    string resultTemp = createTemp();
+    string falseLabel = createLabel("logical_false");
+    string endLabel = createLabel("logical_end");
+    
+    // Check left operand
+    instructions.emplace_back(TACOp::IF_FALSE_GOTO, falseLabel, leftTemp);
+    
+    // Left is true, evaluate right
+    string rightTemp = generateExpression(node->children[1]);
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, rightTemp);
+    instructions.emplace_back(TACOp::GOTO, endLabel);
+    
+    // False case
+    instructions.emplace_back(TACOp::LABEL, falseLabel);
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, "0");
+    
+    // End
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    return resultTemp;
+}
+
+string IRGenerator::generateLogicalOr(Node* node) {
+    if (!node || node->children.size() < 2) return "";
+    
+    string leftTemp = generateExpression(node->children[0]);
+    string resultTemp = createTemp();
+    string trueLabel = createLabel("logical_true");
+    string endLabel = createLabel("logical_end");
+    
+    // If left is true (non-zero), jump to true label
+    instructions.emplace_back(TACOp::IF_GOTO, trueLabel, leftTemp);
+    
+    // Evaluate right side (only if left is false)
+    string rightTemp = generateExpression(node->children[1]);
+    
+    // Both are false - result is right side (or 0)
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, rightTemp);
+    instructions.emplace_back(TACOp::GOTO, endLabel);
+    
+    // True label - result is 1
+    instructions.emplace_back(TACOp::LABEL, trueLabel);
+    instructions.emplace_back(TACOp::ASSIGN, resultTemp, "1");
+    
+    // End label
+    instructions.emplace_back(TACOp::LABEL, endLabel);
+    
+    return resultTemp;
 }
