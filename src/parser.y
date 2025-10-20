@@ -7,6 +7,7 @@
 #include "symbol_table.h"
 #include "ast.h"
 #include "semantic_analyzer.h"
+#include "ir_generator.h"
 #include <iostream>
 #include "errors.h"
 #include <unordered_set>
@@ -1408,22 +1409,45 @@ int main(int argc, char** argv) {
         
         cout << "\n=== STARTING SEMANTIC ANALYSIS ===" << endl;
         
-       // Instead of SemanticAnalyzer, use:
-	SemanticAnalyzer simpleAnalyzer(symTab);
-	simpleAnalyzer.buildSymbolTable(root);
-	//simpleAnalyzer.printResults();
+        // Semantic Analysis
+        SemanticAnalyzer semanticAnalyzer(symTab);
+        bool semanticSuccess = semanticAnalyzer.buildSymbolTable(root);
         
-       
         cout << "=== SEMANTIC ANALYSIS COMPLETE ===\n" << endl;
+        
+        // ✅ NEW: IR Generation only if semantics are valid
+        if (semanticSuccess && !semanticAnalyzer.hasErrors()) {
+            cout << "\n=== GENERATING TAC IR ===" << endl;
+            
+            IRGenerator irGenerator(symTab);
+            bool irSuccess = irGenerator.generateIR(root);
+            
+            if (irSuccess) {
+                // Print to console
+                irGenerator.printIR();
+                
+                // Write to file
+                irGenerator.writeToFile("output.3ac");
+                
+                cout << "✅ TAC IR generation successful" << endl;
+                cout << "📄 TAC output written to: output.3ac" << endl;
+            } else {
+                cout << "❌ TAC IR generation failed" << endl;
+                result = 1;
+            }
+        } else {
+            cout << "❌ Semantic errors detected - skipping IR generation" << endl;
+            semanticAnalyzer.printErrors();
+            result = 1;
+        }
     }
 
     printf("------------------------------------------|----------\n");
     printf("\n\n");
-    if (result == 0 ) {
+    if (result == 0) {
         printf("✅ Compilation completed successfully\n");
     } else {
-        printf("❌ Syntax errors detected\n");
-         result = 1; 
+        printf("❌ Compilation failed\n");
     }
     
     
