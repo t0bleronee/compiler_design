@@ -1,5 +1,7 @@
 #include "semantic_analyzer.h"
 #include <iostream>
+#include<functional>
+#include<set>
 
 using namespace std;
 
@@ -73,7 +75,10 @@ void SemanticAnalyzer::traverseAST(Node* node) {
     } 
     else if (node->name == "DECLARATION") {
     cout << "=== INSIDE DECLARATION BLOCK ===\n";
-  
+   if (isFunctionPrototype(node)) {
+            processFunctionPrototype(node);
+            return;  // Don't process as variable declaration
+        }
     // NEW: Check if this is a typedef declaration
     bool isTypedefDecl = false;
     for (auto child : node->children) {
@@ -279,27 +284,60 @@ else if (node->name == "GOTO_STMT") {
 }
 void SemanticAnalyzer::processFunction(Node* node) {
     if (!node) return;
-
+Node *nodee=NULL;
     string funcName;
     string returnType;
     vector<string> paramTypes;
     Node* funcDeclNode = nullptr;
+    bool hasStatic = false;
+    bool hasTypeSpec = false;
 
     // Extract function info from FUNCTION_DEFINITION children
     for (auto child : node->children) {
         if (child->name == "DECL_SPECIFIERS") {
+        // FIRST: Check for static keyword and type specifier presence
+            checkStaticKeyword(child, hasStatic, hasTypeSpec);
             returnType = extractTypeFromDeclSpecifiers(child);
+            for (auto specChild : child->children) {
+                if (specChild->name == "TYPE_SPECIFIER") {
+                    checkTypeSpecifier(specChild);
+                }
+            }
         }
         else if (child->name == "FUNCTION_DECL") {
             funcDeclNode = child;
             // Get function name from first child (IDENTIFIER)
             if (!child->children.empty() && child->children[0]->name == "IDENTIFIER") {
+           nodee=child->children[0];
                 funcName = child->children[0]->lexeme;
             }
         }
     }
 currentFunctionName = funcName;
 currentFunctionReturnType = returnType;
+
+if (funcName.empty()) {
+        addError("Function name missing");
+        return;
+    }
+
+    // VALIDATE: Static function must have type specifier
+    if (hasStatic && !hasTypeSpec) {
+        addError("Function '" + funcName + "' with 'static' storage class requires explicit return type specifier");
+        returnType = "int";  // Default for error recovery
+    }
+
+    // If no return type specified at all (and not static error case)
+    if (returnType.empty()) {
+        if (!hasStatic) {
+            // Non-static function without type - assume int with warning
+            addError("Function '" + funcName + "' declared without return type specifier");
+            returnType = "int";
+        } else {
+            // This case already handled above, but for safety
+            returnType = "int";
+        }
+    }
 
     if (funcName.empty()) {
         addError("Function name missing");
@@ -309,12 +347,30 @@ currentFunctionReturnType = returnType;
     // Extract parameter types
     paramTypes = extractFunctionParameters(funcDeclNode);
 
-    // Add function to symbol table with parameters
-    if (!symbolTable.addSymbol(funcName, returnType, node, true, paramTypes)) {
-        addError("Redeclaration of function: " + funcName);
+ 
+// Add function to symbol table with parameters
+    bool added = symbolTable.addSymbol(funcName, returnType, nodee, true, paramTypes);
+    
+  
+    if (!added) {
+        // Check if it's an incompatible redeclaration
+        Symbol* existing = symbolTable.lookupCurrentScope(funcName);
+        if (existing && existing->isFunction) {
+            if (existing->paramTypes != paramTypes || existing->type != returnType) {
+                addError("Conflicting declaration of function '" + funcName + "'");
+            }
+            // If parameters match, it's a valid redeclaration (no error)
+        } else if (existing) {
+            addError("Redeclaration of '" + funcName + "' as different kind of symbol");
+        }
+    } else {
+    // ✅ ADDED SUCCESSFULLY - NOW LOOKUP TO GET THE SYMBOL
+    Symbol* sym = symbolTable.lookupCurrentScope(funcName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
     }
-
-   
+}
 
 for (auto child : node->children) {
     if (child->name == "COMPOUND_STMT") {
@@ -411,14 +467,29 @@ string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode)
 
 void SemanticAnalyzer::processVariable(Node* node) {
     if (!node) return;
-
+bool hasStatic = false;
+    bool hasTypeSpec = false;
     string varType;
      int pointerDepth = 0;
+     bool hasStorageError=false;
+     Node* nodee=NULL;
     // Extract type
     for (auto child : node->children) {
-    
         if (child->name == "DECL_SPECIFIERS") {
+         checkStaticKeyword(child, hasStatic, hasTypeSpec);
+            if (hasStorageError) {
+                return;  // Don't process this declaration further
+            }
             varType = extractTypeFromDeclSpecifiers(child);
+            
+            // Check type specifiers
+            for (auto specChild : child->children) {
+                if (specChild->name == "TYPE_SPECIFIER") {
+                    checkTypeSpecifier(specChild);
+                }
+            }
+            
+            
             cout<<"VARRRTYPE"<<varType<<endl;
               // Count trailing '*'
     int starCount = 0;
@@ -446,22 +517,44 @@ cout<<"VARRRTYPE"<<varType<<endl;
                     string varName;
                     bool isArray = false;
                     vector<int> arrayDimensions; 
-                    
+                   nodee = nullptr; 
                     // Direct identifier: int x;
                     if (firstChild->name == "IDENTIFIER") {
+                        nodee=firstChild;
                         varName = firstChild->lexeme;
                     }
                     // Array: int a[10]; or int matrix[3][4];
                     else if (firstChild->name == "ARRAY") {
                         isArray = true;
                         arrayDimensions = extractArrayDimensions(firstChild, varName);
+                         nodee = findIdentifierInArray(firstChild);
                     }
                     else if (firstChild->name == "DECLARATOR") {
                         analyzeDeclarator(firstChild, varName, pointerDepthh, isArray, arrayDimensions);
+                        nodee = findIdentifierInDeclarator(firstChild); 
+           
                     }
                     pointerDepth=pointerDepth+pointerDepthh;
                      cout<<"VARRRTjhYPE"<<pointerDepth<<endl;
                     if (!varName.empty()) {
+                    // VALIDATE: Static must have type specifier
+                        if (hasStatic && !hasTypeSpec) {
+                            addError("Variable '" + varName + "' with 'static' storage class requires explicit type specifier");
+                            continue;  // Skip adding to symbol table
+                        }
+
+                        // If varType is still empty and we have static, that's an error
+                        if (hasStatic && varType.empty()) {
+                            addError("Variable '" + varName + "' with 'static' storage class must have explicit type specifier");
+                            continue;  // Skip adding to symbol table
+                        }
+                        
+                        // If no type at all (not even static), default to int with warning
+                        if (varType.empty() && !hasStatic) {
+                            addError("Variable '" + varName + "' declared without type specifier");
+                            varType = "int";  // Assume int for recovery
+                        }
+                    
                         cout << "DEBUG: Adding variableee " << varName << " [" << varType;
                         
                         // Print pointer depth
@@ -477,17 +570,59 @@ cout<<"VARRRTYPE"<<varType<<endl;
                         }
                         cout << "]\n";
                         
-                        if (!symbolTable.addSymbol(varName, varType, node, false, {}, 
-                                                   isArray, arrayDimensions, pointerDepth)) {
+                        if (!symbolTable.addSymbol(varName, varType, nodee, false, {},  isArray, arrayDimensions, pointerDepth)) {
                             addError("Redeclaration of variable: " + varName);
                         }
+                        else {
+    // ✅ ADDED SUCCESSFULLY - NOW LOOKUP TO GET THE SYMBOL
+    Symbol* sym = symbolTable.lookupCurrentScope(varName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        
+        cout << "DEBUG: Attached symbollll " <<  sym->name<< " to AST node" << endl;
+    }
+}
                     }
                 }
             }
         }
     }
 }
+Node* SemanticAnalyzer::findIdentifierInDeclarator(Node* declaratorNode) {
+    if (!declaratorNode) return nullptr;
+    
+    // Traverse DECLARATOR to find the IDENTIFIER
+    if (declaratorNode->name == "IDENTIFIER") {
+        return declaratorNode;
+    }
+    
+    for (auto child : declaratorNode->children) {
+        Node* result = findIdentifierInDeclarator(child);
+        if (result) return result;
+    }
+    
+    return nullptr;
+}
 
+Node* SemanticAnalyzer::findIdentifierInArray(Node* arrayNode) {
+    if (!arrayNode) return nullptr;
+    
+    // Traverse nested ARRAY nodes to find the IDENTIFIER
+    Node* current = arrayNode;
+    while (current && current->name == "ARRAY") {
+        if (!current->children.empty()) {
+            Node* firstChild = current->children[0];
+            if (firstChild->name == "IDENTIFIER") {
+                return firstChild;  // Found it!
+            }
+            current = firstChild;  // Go deeper for multi-dimensional
+        } else {
+            break;
+        }
+    }
+    
+    return nullptr;
+}
 void SemanticAnalyzer::processBlock(Node* node, bool isFunctionBody, Node* funcDeclNode) {
     if (!node) return;
 
@@ -580,7 +715,7 @@ vector<string> SemanticAnalyzer::extractFunctionParameters(Node* funcDeclNode) {
 
 void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
     if (!funcDeclNode) return;
-    
+    Node * nodee=NULL;
     for (auto child : funcDeclNode->children) {
         if (child->name == "PARAM_TYPE_LIST") {
             for (auto paramTypeListChild : child->children) {
@@ -592,7 +727,7 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                             bool isArray = false;
                             vector<int> arrayDims;
                             string paramName;
-                            
+                            nodee=NULL;
                             for (auto paramChild : paramDecl->children) {
                                 if (paramChild->name == "DECL_SPECIFIERS" || 
                                     paramChild->name == "declaration_specifiers") {
@@ -600,12 +735,17 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                                 }
                                 else if (paramChild->name == "DECLARATOR") {
                                     analyzeDeclarator(paramChild, paramName, pointerDepth, isArray, arrayDims);
+                                     nodee = findIdentifierInDeclarator(paramChild);  // ✅ FIX!
+                          
                                 }
                                 else if (paramChild->name == "ARRAY") {
                                      isArray=true;
                                     arrayDims = extractArrayDimensions(paramChild, paramName);
+                                     nodee = findIdentifierInArray(paramChild);  // ✅ FIX!
+                           
                                 }
                                 else if (paramChild->name == "IDENTIFIER") {
+                                nodee=paramChild;
                                     paramName = paramChild->lexeme;
                                 }
                                 else if (paramChild->name == "&") {
@@ -631,10 +771,17 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                             
                             if (!paramName.empty() && !baseType.empty()) {
                                 // ✅ Store with proper array/pointer info
-                                if (!symbolTable.addSymbol(paramName, baseType, paramDecl, false, {}, 
+                                if (!symbolTable.addSymbol(paramName, baseType, nodee, false, {}, 
                                                           isArray, arrayDims, pointerDepth)) {
                                     addError("Duplicate parameter name: " + paramName);
                                 } else {
+                             
+    Symbol* sym = symbolTable.lookupCurrentScope(paramName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
                                     cout << "DEBUG: Added parameter " << paramName << " [" << baseType;
                                     for (int i = 0; i < pointerDepth; i++) cout << "*";
                                     if (isArray) {
@@ -714,6 +861,11 @@ void SemanticAnalyzer::checkIdentifier(Node* node) {
     Symbol* sym = symbolTable.lookup(node->lexeme);
     if (!sym) {
         addError("Undeclared identifier: '" + node->lexeme + "'");
+    }
+    else {
+        // ✅ ATTACH SYMBOL TO AST NODE (this was missing!)
+        node->symbol = sym;
+        cout << "DEBUG: Attached symbol " << sym->name << " to identifier usage node" << endl;
     }
 }
 bool SemanticAnalyzer::isDeclarationContext(Node* node) {
@@ -1065,6 +1217,9 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
             return funcSym ? funcSym->type : "";
         }
     }
+      if (node->name == "SIZEOF" || node->name == "SIZEOF_TYPE") {
+        return "int";  // sizeof returns an integer type
+    }
     // Handle array access - returns element type
     else if (node->name == "ARRAY_ACCESS") {
         if (!node->children.empty()) {
@@ -1201,9 +1356,10 @@ else if (node->name == "MEMBER_ACCESS" || node->name == "PTR_MEMBER_ACCESS") {
 void SemanticAnalyzer::processStruct(Node* node) {
 
     if (!node) return;
-    
+    Node * nodee=NULL;
     string structName;
     map<string, string> members;
+     map<string, Node*> memberNodes; 
     bool isUnion = false;
     
     // Check if this is a union or struct
@@ -1215,10 +1371,11 @@ void SemanticAnalyzer::processStruct(Node* node) {
     }
     for (auto child : node->children) {
         if (child->name == "IDENTIFIER") {
+        nodee=child;
             structName = child->lexeme;
         }
         else if (child->name == "DECLARATION") {
-            extractStructMembers(child, members);
+            extractStructMembers(child, members,memberNodes);
         }
     }
     
@@ -1231,9 +1388,19 @@ void SemanticAnalyzer::processStruct(Node* node) {
         
         // Add struct members to the struct scope
         for (const auto& member : members) {
-            if (!symbolTable.addSymbol(member.first, member.second, node)) {
+          Node* memberNode = memberNodes[member.first];  // ✅ GET CORRECT NODE!
+         
+            if (!symbolTable.addSymbol(member.first, member.second, memberNode)) {
                 addError("Duplicate struct member: " + member.first);
             } else {
+          
+    // ✅ ADDED SUCCESSFULLY - NOW LOOKUP TO GET THE SYMBOL
+    Symbol* sym = symbolTable.lookupCurrentScope(member.first);
+    if (sym && memberNode) {
+        memberNode->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
                 cout << "DEBUG: Added struct member " << member.first << " [" << member.second << "] to struct scope\n";
             }
         }
@@ -1242,8 +1409,14 @@ void SemanticAnalyzer::processStruct(Node* node) {
         symbolTable.exitScope();
         
         string typeKeyword = isUnion ? "union" : "struct";
-        if (symbolTable.addSymbol(structName, typeKeyword, node, false, {}, false, {}, 0, true, false)) {
+        if (symbolTable.addSymbol(structName, typeKeyword, nodee, false, {}, false, {}, 0, true, false)) {
             Symbol* sym = symbolTable.lookupCurrentScope(structName);
+            
+         
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
             if (sym) {
                 sym->structMembers = members;  // Store member info
                 sym->isUnion = isUnion;  // Mark if it's a union
@@ -1255,11 +1428,13 @@ void SemanticAnalyzer::processStruct(Node* node) {
     }
 }
 
-void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>& members) {
+void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>& members ,map<string, Node*>& memberNodes) {
     if (!declNode || declNode->name != "DECLARATION") return;
     
     string memberType;
     vector<string> memberNames;
+     vector<pair<string, Node*>> memberNamesAndNodes;  // ✅ Store both!
+   
     
     for (auto child : declNode->children) {
         if (child->name == "DECL_SPECIFIERS") {
@@ -1269,8 +1444,12 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
             for (auto initDecl : child->children) {
                 if (!initDecl->children.empty()) {
                     Node* firstChild = initDecl->children[0];
+                    Node* identifierNode = nullptr;
                     if (firstChild->name == "IDENTIFIER") {
                         memberNames.push_back(firstChild->lexeme);
+                        identifierNode = firstChild;
+                        memberNamesAndNodes.push_back({firstChild->lexeme, identifierNode});
+                 
                     }
                     // Handle declarators with pointers/arrays
                     else if (firstChild->name == "DECLARATOR") {
@@ -1279,6 +1458,8 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
                         bool isArray = false;
                         vector<int> arrayDims;
                         analyzeDeclarator(firstChild, memberName, pointerDepth, isArray, arrayDims);
+                         identifierNode = findIdentifierInDeclarator(firstChild);  // ✅ GET NODE!
+                       
                         if (!memberName.empty()) {
                             // Append pointer notation to type if needed
                             string fullType = memberType;
@@ -1286,6 +1467,7 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
                                 fullType += "*";
                             }
                             members[memberName] = fullType;
+                             memberNodes[memberName] = identifierNode;
                             cout << "DEBUG: Found struct member: " << memberName << " [" << fullType << "]\n";
                             continue;  // Skip the default add below
                         }
@@ -1295,21 +1477,21 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
         }
         else if (child->name == "DECLARATION") {
             // Nested declaration - recursively extract
-            extractStructMembers(child, members);
+            extractStructMembers(child, members,memberNodes);
         }
     }
-    
-    // Add simple members (non-pointer, non-array)
-    for (const string& name : memberNames) {
-        if (members.find(name) == members.end()) {  // If not already added
-            members[name] = memberType;
-            cout << "DEBUG: Found struct member: " << name << " [" << memberType << "]\n";
+    for (const auto& pair : memberNamesAndNodes) {
+        if (members.find(pair.first) == members.end()) {
+            members[pair.first] = memberType;
+            memberNodes[pair.first] = pair.second;  // ✅ STORE NODE!
+             cout << "DEBUG: Found struct member: " << pair.first << " [" << memberType << "]\n";
         }
     }
+  
 }
 void SemanticAnalyzer::processEnum(Node* node) {
     if (!node) return;
-    
+    Node* nodee=NULL;
     string enumName;
     vector<Node*> enumerators;
     bool isDefinition = false;
@@ -1317,6 +1499,7 @@ void SemanticAnalyzer::processEnum(Node* node) {
     // Check if this is a definition (has enumerators) or declaration (no enumerators)
     for (auto child : node->children) {
         if (child->name == "IDENTIFIER") {
+        nodee=child;
             enumName = child->lexeme;
         }
         else if (child->name == "ENUMERATOR_LIST") {
@@ -1345,9 +1528,11 @@ void SemanticAnalyzer::processEnum(Node* node) {
         if (!enumerators.empty()) {
             map<string, int> values;
             int currentValue = 0;
-            
+            map<string, Node*> enumeratorNodes;
             for (auto enumerator : enumerators) {
                 values[enumerator->lexeme] = currentValue++;
+                    enumeratorNodes[enumerator->lexeme] = enumerator;  // ✅ STORE!
+       
             }
             
             if (existingSym) {
@@ -1360,9 +1545,17 @@ void SemanticAnalyzer::processEnum(Node* node) {
                     // ✅ ADD THIS: Create scope for enum constants
                     //symbolTable.enterScope();
                     for (const auto& pair : values) {
-                        if (!symbolTable.addSymbol(pair.first, "int", node)) {
+                       Node* enumNode = enumeratorNodes[pair.first];  // ✅ GET CORRECT NODE!
+               
+                        if (!symbolTable.addSymbol(pair.first, "int", enumNode)) {
                             addError("Redefinition of enumerator '" + pair.first + "'");
                         } else {
+    Symbol* sym = symbolTable.lookupCurrentScope(pair.first);
+    if (sym && enumNode) {
+        enumNode->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
                             cout << "DEBUG: Added enum constant " << pair.first << " = " << pair.second << "\n";
                         }
                     }
@@ -1376,8 +1569,14 @@ void SemanticAnalyzer::processEnum(Node* node) {
                 }
             }else {
                 // New enum definition
-                if (symbolTable.addSymbol(enumName, "enum", node, false, {}, false, {}, 0, false, true)) {
+                if (symbolTable.addSymbol(enumName, "enum", nodee, false, {}, false, {}, 0, false, true)) {
                     Symbol* sym = symbolTable.lookupCurrentScope(enumName);
+                    
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+      
                     if (sym) {
                         sym->enumValues = values;
                     }
@@ -1388,6 +1587,15 @@ void SemanticAnalyzer::processEnum(Node* node) {
                         if (!symbolTable.addSymbol(pair.first, "int", node)) {
                             addError("Redefinition of enumerator '" + pair.first + "'");
                         } else {
+                        
+    Symbol* sym = symbolTable.lookupCurrentScope(pair.first);
+    if (sym && node) {
+        node->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
+                        
+                        
                             cout << "DEBUG: Added enum constant " << pair.first << " = " << pair.second << "\n";
                         }
                     }
@@ -1408,7 +1616,15 @@ void SemanticAnalyzer::processEnum(Node* node) {
             // Else: duplicate declaration is OK in C
         } else {
             // Add forward declaration
-            if (symbolTable.addSymbol(enumName, "enum", node, false, {}, false, {}, 0, false, true)) {
+            if (symbolTable.addSymbol(enumName, "enum", nodee, false, {}, false, {}, 0, false, true)) {
+            
+    // ✅ ADDED SUCCESSFULLY - NOW LOOKUP TO GET THE SYMBOL
+    Symbol* sym = symbolTable.lookupCurrentScope(enumName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
                 cout << "DEBUG: Forward declared enum " << enumName << "\n";
             }
         }
@@ -2063,6 +2279,20 @@ void SemanticAnalyzer::checkMemberAccess(Node* node) {
     if (memberNode->name != "IDENTIFIER") return;
     
     string memberName = memberNode->lexeme;
+    
+     if (baseNode->name == "IDENTIFIER") {
+        if (!baseNode->symbol) {
+            Symbol* baseSym = symbolTable.lookup(baseNode->lexeme);
+            if (baseSym) {
+                baseNode->symbol = baseSym;
+                cout << "DEBUG: Attached symbol " << baseSym->name 
+                     << " to member access base identifier" << endl;
+            } else {
+                addError("Undeclared identifier: '" + baseNode->lexeme + "'");
+                return;
+            }
+        }
+    }
     string baseType = getExpressionType(baseNode);
     
     // Skip if we couldn't determine base type
@@ -2213,7 +2443,7 @@ if (node->name == "COMPOUND_STMT" || node->name == "BLOCK_ITEM_LIST") {
 
 void SemanticAnalyzer::processTypedef(Node* node) {
     if (!node) return;
-    
+    Node* nodee=NULL;
     string baseType;
     string aliasName;
     int pointerDepth = 0;
@@ -2233,6 +2463,7 @@ void SemanticAnalyzer::processTypedef(Node* node) {
                     Node* firstChild = declChild->children[0];
                     
                     if (firstChild->name == "IDENTIFIER") {
+                    nodee=firstChild;
                         aliasName = firstChild->lexeme;
                     }
                     else if (firstChild->name == "DECLARATOR") {
@@ -2267,11 +2498,19 @@ void SemanticAnalyzer::processTypedef(Node* node) {
     cout << "\n";
    
   
-     if (!symbolTable.addSymbol(aliasName, fullAliasedType, node, false, {}, 
+     if (!symbolTable.addSymbol(aliasName, fullAliasedType, nodee, false, {}, 
                                isArray, arrayDims, pointerDepth, false, false, false,
                                true, fullAliasedType)) {  // ← This is the aliased type!
         addError("Redefinition of typedef '" + aliasName + "'");
     } else {
+    
+    
+    Symbol* sym = symbolTable.lookupCurrentScope(aliasName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    
+}
         cout << "SUCCESS: Typedef '" << aliasName << "' registered as alias for '" 
              << fullAliasedType << "'\n";
     }
@@ -2502,4 +2741,228 @@ bool SemanticAnalyzer::isConstantIntegerExpression(Node* node) {
     // Check if it's a constant expression that evaluates to integer
     int value = evaluateConstantExpression(node);
     return value != -1; // -1 indicates non-constant or evaluation failure
+}
+
+
+
+
+void SemanticAnalyzer::checkStaticKeyword(Node* declSpecNode, bool& hasStatic, bool& hasTypeSpec) {
+    if (!declSpecNode) return;
+    
+    hasStatic = false;
+    hasTypeSpec = false;
+    int staticCount = 0;
+    vector<string> storageClasses;
+    
+    // Recursively collect storage classes and type specifiers
+    function<void(Node*)> collectInfo = [&](Node* node) {
+        if (!node) return;
+        
+        for (auto child : node->children) {
+            // Check for both STORAGE_CLASS_SPECIFIER wrapper and direct STATIC nodes
+            if (child->name == "STORAGE_CLASS_SPECIFIER") {
+                string storageClass = child->lexeme;
+                storageClasses.push_back(storageClass);
+                
+                if (storageClass == "static") {
+                    staticCount++;
+                    hasStatic = true;
+                }
+            }
+            else if (child->name == "STATIC") {
+                // Direct STATIC node (as seen in your AST)
+                storageClasses.push_back("static");
+                staticCount++;
+                hasStatic = true;
+            }
+            else if (child->name == "AUTO") {
+                storageClasses.push_back("auto");
+            }
+            else if (child->name == "TYPEDEF") {
+                storageClasses.push_back("typedef");
+            }
+            else if (child->name == "TYPE_SPECIFIER") {
+                if (!child->lexeme.empty()) {
+                    hasTypeSpec = true;
+                }
+            }
+            else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
+                hasTypeSpec = true;
+            }
+            else if (child->name == "ENUM_SPECIFIER") {
+                hasTypeSpec = true;
+            }
+            else if (child->name == "DECL_SPECIFIERS") {
+                collectInfo(child);  // Recurse into nested DECL_SPECIFIERS
+            }
+        }
+    };
+    
+    collectInfo(declSpecNode);
+    cout << "DEBUG: staticCount = " << staticCount << ", hasStatic = " << hasStatic << "\n";
+
+    // ✅ CHECK #1: Duplicate static (HIGHEST PRIORITY)
+    if (staticCount > 1) {
+        addError("Duplicate 'static' storage class specifier");
+        return;  // Return immediately
+    }
+    
+    // ✅ CHECK #2: Conflicting storage classes
+    if (storageClasses.size() > 1) {
+        set<string> uniqueClasses(storageClasses.begin(), storageClasses.end());
+        
+        // Only check if we have different storage classes
+        if (uniqueClasses.size() > 1) {
+            // Check all combinations of conflicts
+            if (uniqueClasses.count("static") && uniqueClasses.count("auto")) {
+                addError("Cannot combine 'static' and 'auto' storage classes");
+                
+            }
+            else if (uniqueClasses.count("static") && uniqueClasses.count("typedef")) {
+                addError("Cannot combine 'static' and 'typedef' storage classes");
+                
+            }
+            else if (uniqueClasses.count("auto") && uniqueClasses.count("typedef")) {
+                addError("Cannot combine 'auto' and 'typedef' storage classes");
+            }
+        }
+    }
+}
+
+void SemanticAnalyzer::checkTypeSpecifier(Node* typeSpecNode) {
+    if (!typeSpecNode || typeSpecNode->name != "TYPE_SPECIFIER") return;
+    
+    string typeName = typeSpecNode->lexeme;
+    
+    // Skip built-in types
+    if (typeName == "int" || typeName == "float" || typeName == "double" || 
+        typeName == "char" || typeName == "void" || typeName == "short" || 
+        typeName == "long" || typeName == "signed" || typeName == "unsigned" ||
+        typeName == "bool") {
+        return;  // Valid built-in type
+    }
+    
+    // Check if it's a valid typedef, struct, or enum
+    Symbol* typeSym = symbolTable.lookup(typeName);
+    
+    if (!typeSym) {
+        addError("Unknown type '" + typeName + "'");
+        return;
+    }
+    
+    // Verify it's actually a type (typedef, struct, or enum)
+    if (!typeSym->isTypedef && !typeSym->isStruct && !typeSym->isEnum) {
+        addError("'" + typeName + "' does not name a type");
+    }
+}
+
+
+bool SemanticAnalyzer::isFunctionPrototype(Node* declNode) {
+    if (!declNode || declNode->name != "DECLARATION") return false;
+    
+    // Check if INIT_DECL_LIST contains a function declarator
+    for (auto child : declNode->children) {
+        if (child->name == "INIT_DECL_LIST") {
+            for (auto initDecl : child->children) {
+                // Check for FUNCTION_DECL or function-style declarator
+                if (hasFunctionDeclarator(initDecl)) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    return false;
+}
+
+bool SemanticAnalyzer::hasFunctionDeclarator(Node* node) {
+    if (!node) return false;
+    
+    // Direct function declarator
+    if (node->name == "FUNCTION_DECL") return true;
+    
+    // Check children recursively
+    for (auto child : node->children) {
+        if (child->name == "FUNCTION_DECL") return true;
+        if (hasFunctionDeclarator(child)) return true;
+    }
+    
+    return false;
+}
+
+void SemanticAnalyzer::processFunctionPrototype(Node* declNode) {
+    if (!declNode) return;
+    
+    cout << "DEBUG: Processing function prototype\n";
+    Node* nodee=NULL;
+    string funcName;
+    string returnType;
+    vector<string> paramTypes;
+    Node* funcDeclNode = nullptr;
+    
+    // Extract return type
+    for (auto child : declNode->children) {
+        if (child->name == "DECL_SPECIFIERS") {
+            returnType = extractTypeFromDeclSpecifiers(child);
+        }
+        else if (child->name == "INIT_DECL_LIST") {
+            for (auto initDecl : child->children) {
+                funcDeclNode = findFunctionDeclarator(initDecl);
+                if (funcDeclNode) {
+                    // Get function name
+                    if (!funcDeclNode->children.empty() && 
+                        funcDeclNode->children[0]->name == "IDENTIFIER") {
+                        nodee=funcDeclNode->children[0];
+                        funcName = funcDeclNode->children[0]->lexeme;
+                    }
+                    paramTypes = extractFunctionParameters(funcDeclNode);
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (returnType.empty()) {
+        returnType = "int";  // Default
+    }
+    
+    if (!funcName.empty()) {
+        // Add function declaration to symbol table
+        bool added = symbolTable.addSymbol(funcName, returnType,nodee, true, paramTypes);
+        if (!added) {
+            Symbol* existing = symbolTable.lookupCurrentScope(funcName);
+            if (existing && existing->isFunction) {
+                // Check if signatures match
+                if (existing->paramTypes != paramTypes || existing->type != returnType) {
+                    addError("Conflicting declaration of function '" + funcName + "'");
+                }
+                // Otherwise it's a valid redeclaration (no error)
+            } else {
+                addError("Redeclaration of '" + funcName + "' as different kind of symbol");
+            }
+        } else {
+        
+    Symbol* sym = symbolTable.lookupCurrentScope(funcName);
+    if (sym && nodee) {
+        nodee->symbol = sym;  // ✅ ATTACH SYMBOL TO AST NODE
+        cout << "DEBUG: Attached symbol " << sym->name << " to AST node" << endl;
+    }
+
+            cout << "DEBUG: Added function prototype: " << funcName 
+                 << " [" << returnType << "] with " << paramTypes.size() << " parameter(s)\n";
+        }
+    }
+}
+
+Node* SemanticAnalyzer::findFunctionDeclarator(Node* node) {
+    if (!node) return nullptr;
+    
+    if (node->name == "FUNCTION_DECL") return node;
+    
+    for (auto child : node->children) {
+        Node* result = findFunctionDeclarator(child);
+        if (result) return result;
+    }
+    
+    return nullptr;
 }
