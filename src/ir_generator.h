@@ -1,3 +1,6 @@
+
+
+
 #ifndef IR_GENERATOR_H
 #define IR_GENERATOR_H
 
@@ -6,12 +9,14 @@
 #include <vector>
 #include <string>
 #include <iostream>
-
+#include<map>
+#include <set>
 struct CaseInfo {
     std::string value;      // Case constant value
     std::string label;      // Label for this case
-    bool isDefault;         // Is this the default case?
-    Node* node;             // AST node for this case
+    bool isDefault;    // Is this the default case?
+     Node* node;        // Label number for reference
+     
 };
 
 // TAC Operation Codes
@@ -35,6 +40,10 @@ enum class TACOp {
     STORE,        // *p = t1
     ADDRESS,      // t1 = &x
     
+    // Array operations
+    ARRAY_LOAD,   // t1 = arr[i]
+    ARRAY_STORE,  // arr[i] = t1
+    
     // Control flow
     GOTO,         // goto L1
     IF_GOTO,      // if t1 goto L1
@@ -47,7 +56,12 @@ enum class TACOp {
     PARAM,        // param t1
     
     // Special
-    CONST         // t1 = CONST 5
+    CONST   ,      // t1 = CONST 5
+    
+    MEMBER_ACCESS,      // struct.member
+    MEMBER_STORE,       // struct.member = value
+    PTR_MEMBER_ACCESS,  // struct->member
+    PTR_MEMBER_STORE    // struct->member = value
 };
 
 // TAC Instruction
@@ -63,6 +77,7 @@ struct TACInstruction {
     
     void print(std::ostream& out = std::cout) const;
     std::string toString() const;
+ 
 };
 
 class IRGenerator {
@@ -77,8 +92,9 @@ private:
     // Current function context
     std::string currentFunction;
     std::string currentBreakLabel;
-    std::string currentContinueLabel;
-
+std::string currentContinueLabel;
+     std::map<std::string, int> enumConstants; 
+         std::set<std::string> staticVariables;
 public:
     IRGenerator(SymbolTable& symTab);
     
@@ -90,7 +106,8 @@ public:
     void writeToFile(const std::string& filename) const;
     
 private:
-    void generateParameterHandling(Node* paramList);
+
+  void generateParameterHandling(Node* paramList);
     std::string findParameterName(Node* paramDecl);
     
     // Logical operators with short-circuit
@@ -101,6 +118,8 @@ private:
     void traverseAST(Node* node);
     bool hasStructBody(Node* node);
     std::string findIdentifier(Node* node);
+
+
 
     // Helper functions
     std::string createTemp();
@@ -117,36 +136,51 @@ private:
     std::string generateUnaryExpr(Node* node, TACOp op);
     std::string generateAssignment(Node* node);
     std::string generateFunctionCall(Node* node);
+    std::string generateArrayAccess(Node* node);
     
     // Control flow generators
     void generateIfStatement(Node* node);
     void generateWhileStatement(Node* node);
     void generateReturnStatement(Node* node);
     
-    // New in Version 2: Advanced control flow
-    void generateForStatement(Node* node);
-    void generateDoWhileStatement(Node* node);
-    void generateSwitchStatement(Node* node);
-    void generateBreakStatement(Node* node);
-    void generateContinueStatement(Node* node);
-    
-    // New in Version 2: Advanced expressions
-    std::string generatePreIncrement(Node* node);
-    std::string generatePreDecrement(Node* node);
-    std::string generatePostIncrement(Node* node);
-    std::string generatePostDecrement(Node* node);
-    std::string generateCompoundAssignment(Node* node);
-    std::string generateTernaryOperator(Node* node);
-    
     // Utility
     TACOp getBinaryOp(const std::string& nodeName);
     TACOp getUnaryOp(const std::string& nodeName);
+    TACOp getComparisonOp(const std::string& nodeName);
     
     // Helper for extracting names from declarators
     std::string getDeclaratorName(Node* node);
     
-    // New in Version 2: Statement list handling
-    void generateStatementList(Node* node);
+    void generateForStatement(Node* node);
+void generateDoWhileStatement(Node* node);
+
+std::string generatePreIncrement(Node* node);
+std::string generatePreDecrement(Node* node);
+std::string generatePostIncrement(Node* node);
+std::string generatePostDecrement(Node* node);
+std::string generateCompoundAssignment(Node* node);
+
+void generateSwitchStatement(Node* node);
+void generateBreakStatement(Node* node);
+void generateContinueStatement(Node* node);
+
+std::string generateTernaryOperator(Node* node);
+void generateStatementList(Node* node);
+std::string generateArrayStore(Node* arrayNode, Node* valueNode);
+
+std::string generateMemberAccess(Node* node, bool isPointer);
+std::string generateMemberStore(Node* memberNode, Node* valueNode, bool isPointer);
+void collectEnumConstants(Node* node);
+
+void generateGotoStatement(Node* node);
+void generateLabeledStatement(Node* node);
+
+void generateUntilStatement(Node* node);
+
+std::string generateSizeof(Node* node);
+int getSizeofType(Node* typeNode);
+int getSizeofExpression(Node* exprNode);
+int getBaseTypeSize(const std::string& typeName);
 };
 
 #endif // IR_GENERATOR_H
