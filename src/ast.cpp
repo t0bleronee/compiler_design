@@ -38,18 +38,44 @@ void Node::printTree(int depth, string prefix) {
     }
 }
 
-// Generate DOT format for Graphviz
-void Node::generateDOT(ofstream& out, int& nodeId) {
-    int currentId = nodeId++;
-    out << "  node" << currentId << " [label=\"" << name;
-    if (lexeme != "default") out << "\\n" << lexeme;
-    if (type != "default") out << "\\n[" << type << "]";
-    out << "\"];" << endl;
 
+void Node::generateDOT(std::ofstream& out, int& counter) {
+    int nodeId = counter++;
+    
+    // Escape the label content properly
+    std::string label = name;
+    if (!lexeme.empty()) {
+        label += "\\n" + lexeme;
+    }
+    
+    // Replace all problematic characters
+    std::string escapedLabel;
+    for (char c : label) {
+        switch (c) {
+            case '"': escapedLabel += "\\\""; break;
+            case '\\': escapedLabel += "\\\\"; break;
+            case '\n': escapedLabel += "\\n"; break;
+            case '\r': escapedLabel += "\\r"; break;
+            case '\t': escapedLabel += "\\t"; break;
+            case '<': escapedLabel += "&lt;"; break;
+            case '>': escapedLabel += "&gt;"; break;
+            case '{': escapedLabel += "\\{"; break;
+            case '}': escapedLabel += "\\}"; break;
+            case '|': escapedLabel += "\\|"; break;
+            case '[': escapedLabel += "\\["; break;
+            case ']': escapedLabel += "\\]"; break;
+            default: escapedLabel += c;
+        }
+    }
+    
+    out << "    " << nodeId << " [label=\"" << escapedLabel << "\"];" << std::endl;
+    
     for (auto child : children) {
-        int childId = nodeId;
-        child->generateDOT(out, nodeId);
-        out << "  node" << currentId << " -> node" << childId << ";" << endl;
+        if (child) {
+            int childId = counter;
+            child->generateDOT(out, counter);
+            out << "    " << nodeId << " -> " << childId << ";" << std::endl;
+        }
     }
 }
 
