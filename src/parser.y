@@ -232,7 +232,6 @@ void registerTypedefNames(Node* declSpec, Node* initDeclList) {
 %type <node> constant
 %type <node> printf_stmt
 %type <node> scanf_stmt
-%type <node> variable_list
 %type <node> type_name
 
 
@@ -1339,7 +1338,7 @@ scanf_stmt
         
         $$->addChild(strNode); // format string
     }
-    | SCANF LPAREN STRING_LITERAL COMMA variable_list RPAREN {
+    | SCANF LPAREN STRING_LITERAL COMMA argument_expression_list RPAREN {
         $$ = new Node("SCANF");
         Node* strNode = new Node("STRING_LITERAL", std::string($3));
         
@@ -1349,18 +1348,6 @@ scanf_stmt
     ;
 
 
-variable_list
-    : AMP IDENTIFIER {
-        $$ = new Node("IDENTIFIER", std::string($2));
-      
-    }
-    | variable_list COMMA AMP IDENTIFIER { 
-    $$ = $1;  // Use existing list
-    Node* idNode = new Node("IDENTIFIER", std::string($4));
-    free($4);
-    $$->addChild(idNode);
-}
-;
 
 
 %%
