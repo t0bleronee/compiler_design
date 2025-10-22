@@ -135,12 +135,16 @@ void SemanticAnalyzer::traverseAST(Node* node) {
                         }
                     }
                 }
+               
                 else if (declChild->name == "ENUM_SPECIFIER") {
-                    // Process enum definition
-                    processEnum(declChild);
-                    isStructOrEnumDef = true;
-                    break;
-                }
+    // ✅ FIX: Only process if it's actually a definition
+    if (isEnumDefinition(declChild)) {
+        processEnum(declChild);
+        isStructOrEnumDef = true;
+    }
+    // If it's just a reference, let it fall through to processVariable
+    break;
+}
             }
         }
     }
@@ -159,6 +163,14 @@ void SemanticAnalyzer::traverseAST(Node* node) {
     else if (node->name == "FUNC_CALL") {
         checkFunctionCall(node);
     }
+    else if (node->name == "PRINTF") {
+    checkPrintfStatement(node);
+}
+
+// Check scanf statements
+else if (node->name == "SCANF") {
+    checkScanfStatement(node);
+}
     // Check if statement conditions
 // Check if statement conditions
 else if (node->name == "IF_STMT" || node->name == "IF_ELSE_STMT") {
@@ -453,6 +465,16 @@ string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode)
             }
             return typePrefix;  // Anonymous
         }
+        else if (child->name == "ENUM_SPECIFIER") {
+    // Extract enum name as type
+    for (auto enumChild : child->children) {
+        if (enumChild->name == "IDENTIFIER") {
+            string enumType = "enum " + enumChild->lexeme;
+            cout << "  DEBUG extractType: Found ENUM_SPECIFIER = '" << enumType << "'\n";
+            return enumType;
+        }
+    }
+}
         else if (child->name == "DECL_SPECIFIERS") {
             // Recursively search in nested DECL_SPECIFIERS
             string type = extractTypeFromDeclSpecifiers(child);
@@ -1521,7 +1543,7 @@ void SemanticAnalyzer::processEnum(Node* node) {
     }
     
     // Lookup if this enum was previously declared
-    Symbol* existingSym = symbolTable.lookupCurrentScope(enumName);
+    Symbol* existingSym = symbolTable.lookup(enumName);
     
     if (isDefinition) {
         // This is a definition (with enumerators)
@@ -1530,10 +1552,22 @@ void SemanticAnalyzer::processEnum(Node* node) {
             int currentValue = 0;
             map<string, Node*> enumeratorNodes;
             for (auto enumerator : enumerators) {
-                values[enumerator->lexeme] = currentValue++;
-                    enumeratorNodes[enumerator->lexeme] = enumerator;  // ✅ STORE!
-       
+                int value = currentValue;
+                if (enumerator->parent && enumerator->parent->name == "ENUMERATOR") {
+                    for (auto enumChild : enumerator->parent->children) {
+                        if (enumChild->name == "CONSTANT_EXPR") {
+                            // Evaluate the constant expression
+                            value = evaluateConstantExpression(enumChild);
+                            break;
+                        }
+                    }
+                }
+                
+                values[enumerator->lexeme] = value;
+                enumeratorNodes[enumerator->lexeme] = enumerator;
+                currentValue = value + 1;  // Next enumerator gets next value
             }
+            
             
             if (existingSym) {
               
@@ -1630,6 +1664,7 @@ void SemanticAnalyzer::processEnum(Node* node) {
         }
     }
 }
+
 
 bool SemanticAnalyzer::isStructMemberDeclaration(Node* node) {
     if (!node || !node->parent) return false;
@@ -1793,6 +1828,14 @@ bool SemanticAnalyzer::areTypesCompatible(const string& type1, const string& typ
         // Both numeric types
         if (isNumericType(type1) && isNumericType(type2)) return true;
         
+         if ((type1.find("enum ") == 0 && isIntegerType(type2)) || (type2.find("enum ") == 0 && isIntegerType(type1))) {
+        return true;
+    }
+    
+    // Enum to enum of same type
+    if (type1.find("enum ") == 0 && type2.find("enum ") == 0) {
+        return type1 == type2;  // Same enum type
+    }
         // Pointer assignments
        if (isPointerType(type1) && isPointerType(type2)) {
     // ✅ Check if pointer depths match
@@ -2013,6 +2056,16 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     // Numeric types can be assigned to each other (with implicit conversion)
     if (isNumericType(lhsType) && isNumericType(rhsType)) return;
     
+      if ((lhsType.find("enum ") == 0 && isIntegerType(rhsType)) ||
+        (rhsType.find("enum ") == 0 && isIntegerType(lhsType))) {
+        return ;
+    }
+    
+    // Enum to enum of same type
+    if (lhsType.find("enum ") == 0 && rhsType.find("enum ") == 0) {
+        return ;  // Same enum type
+    }
+    
     // Pointer to pointer of same base type
     if (isPointerType(lhsType) && isPointerType(rhsType)) {
         checkPointerAssignment(/*node, */lhsType, rhsType);
@@ -2039,6 +2092,7 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
         }
         return;
     }
+   
     
     // General type mismatch
     if (lhsType != rhsType) {
@@ -2965,4 +3019,318 @@ Node* SemanticAnalyzer::findFunctionDeclarator(Node* node) {
     }
     
     return nullptr;
+}
+
+
+void SemanticAnalyzer::checkPrintfStatement(Node* node) {
+    if (!node || node->children.empty()) {
+        addError("printf requires at least one argument (format string)");
+        return;
+    }
+    
+    // First child should be STRING_LITERAL (format string)
+    Node* formatNode = node->children[0];
+    
+    // CHECK 1: First argument must be a string literal
+    if (!isStringLiteral(formatNode)) {
+        addError("printf format argument must be a string literal");
+        return;
+    }
+    
+    // Extract format string
+    string formatStr = formatNode->lexeme;
+    // Remove surrounding quotes
+    if (formatStr.length() >= 2 && formatStr.front() == '"' && formatStr.back() == '"') {
+        formatStr = formatStr.substr(1, formatStr.length() - 2);
+    }
+    
+    // Count format specifiers
+    int specifierCount = countFormatSpecifiers(formatStr);
+    
+    // Extract actual arguments (skip first child which is format string)
+    vector<Node*> argNodes;
+    for (size_t i = 1; i < node->children.size(); i++) {
+        Node* child = node->children[i];
+        
+        // Handle ARG_LIST wrapper
+        if (child->name == "ARG_LIST") {
+            for (auto argChild : child->children) {
+                argNodes.push_back(argChild);
+            }
+        } else {
+            // Direct argument (like in first example: printf("Hello, World!");)
+            argNodes.push_back(child);
+        }
+    }
+    
+    int actualArgCount = argNodes.size();
+    
+    // CHECK 2: Argument count matches format specifiers
+    if (specifierCount != actualArgCount) {
+        addError("printf expects " + to_string(specifierCount) + 
+                 " argument(s) for format string, but " + 
+                 to_string(actualArgCount) + " provided");
+    }
+    
+    // CHECK 3: Validate argument types match format specifiers
+    vector<string> argTypes;
+    for (Node* arg : argNodes) {
+        string argType = getExpressionType(arg);
+        argTypes.push_back(argType);
+        
+        // Also check that identifiers are declared
+        if (arg->name == "IDENTIFIER") {
+            checkIdentifier(arg);
+        }
+    }
+    
+    if (!argTypes.empty()) {
+        validateFormatString(formatStr, argTypes, false);
+    }
+    
+    cout << "DEBUG: printf statement validated with " << actualArgCount << " arguments\n";
+    
+    // Continue traversing children for nested expressions
+    for (auto child : node->children) {
+        traverseAST(child);
+    }
+}
+
+void SemanticAnalyzer::checkScanfStatement(Node* node) {
+    if (!node || node->children.empty()) {
+        addError("scanf requires at least one argument (format string)");
+        return;
+    }
+    
+    // First child should be STRING_LITERAL (format string)
+    Node* formatNode = node->children[0];
+    
+    // CHECK 1: First argument must be a string literal
+    if (!isStringLiteral(formatNode)) {
+        addError("scanf format argument must be a string literal");
+        return;
+    }
+    
+    // Extract format string
+    string formatStr = formatNode->lexeme;
+    if (formatStr.length() >= 2 && formatStr.front() == '"' && formatStr.back() == '"') {
+        formatStr = formatStr.substr(1, formatStr.length() - 2);
+    }
+    
+    // Count format specifiers
+    int specifierCount = countFormatSpecifiers(formatStr);
+    
+    // Extract actual arguments (skip first child which is format string)
+    vector<Node*> argNodes;
+    for (size_t i = 1; i < node->children.size(); i++) {
+        Node* child = node->children[i];
+        
+        // Handle ARG_LIST wrapper
+        if (child->name == "ARG_LIST") {
+            for (auto argChild : child->children) {
+                argNodes.push_back(argChild);
+            }
+        } else {
+            argNodes.push_back(child);
+        }
+    }
+    
+    int actualArgCount = argNodes.size();
+    
+    // CHECK 2: Argument count matches format specifiers
+    if (specifierCount != actualArgCount) {
+        addError("scanf expects " + to_string(specifierCount) + 
+                 " argument(s) for format string, but " + 
+                 to_string(actualArgCount) + " provided");
+    }
+    
+    // CHECK 3: All scanf arguments (except format string) must be pointers or address-of expressions
+    for (size_t i = 0; i < argNodes.size(); i++) {
+        Node* arg = argNodes[i];
+        
+        // Check if identifier is declared first
+        if (arg->name == "IDENTIFIER") {
+            Symbol* sym = symbolTable.lookup(arg->lexeme);
+            if (!sym) {
+                addError("Undeclared identifier in scanf: '" + arg->lexeme + "'");
+                continue;
+            }
+            
+            // scanf requires address - plain identifier is wrong
+            addError("scanf argument " + to_string(i + 1) + 
+                     " ('" + arg->lexeme + "') must be a pointer (use & operator)");
+        }
+        // Check if it's an address-of expression (which is correct)
+        else if (arg->name == "UNARY_OP") {
+            if (arg->children.size() >= 2 && arg->children[0]->name == "&") {
+                // This is correct: &x
+                Node* operand = arg->children[1];
+                if (operand->name == "IDENTIFIER") {
+                    checkIdentifier(operand);  // Verify the variable is declared
+                }
+            }
+        }
+        else {
+            // Get type and check if it's a pointer
+            string argType = getExpressionType(arg);
+            if (!argType.empty() && !isPointerType(argType)) {
+                addError("scanf argument " + to_string(i + 1) + 
+                         " must be a pointer (use & operator for variables)");
+            }
+        }
+    }
+    
+    // CHECK 4: Validate argument types match format specifiers
+    vector<string> argTypes;
+    for (Node* arg : argNodes) {
+        argTypes.push_back(getExpressionType(arg));
+    }
+    
+    if (!argTypes.empty()) {
+        validateFormatString(formatStr, argTypes, true);
+    }
+    
+    cout << "DEBUG: scanf statement validated with " << actualArgCount << " arguments\n";
+    
+    // Continue traversing children for nested expressions
+    for (auto child : node->children) {
+        traverseAST(child);
+    }
+}
+
+bool SemanticAnalyzer::isStringLiteral(Node* node) {
+    if (!node) return false;
+    return node->name == "STRING_LITERAL";
+}
+
+int SemanticAnalyzer::countFormatSpecifiers(const string& format) {
+    int count = 0;
+    for (size_t i = 0; i < format.length(); i++) {
+        if (format[i] == '%') {
+            if (i + 1 < format.length()) {
+                if (format[i + 1] == '%') {
+                    i++;  // Skip %% (escaped percent)
+                } else {
+                    count++;
+                    // Skip format specifier characters
+                    i++;
+                    while (i < format.length() && !isalpha(format[i])) {
+                        i++;  // Skip modifiers like .2, l, etc.
+                    }
+                }
+            }
+        }
+    }
+    return count;
+}
+
+bool SemanticAnalyzer::validateFormatString(const string& format, 
+                                            const vector<string>& argTypes, 
+                                            bool isScanf) {
+    size_t argIndex = 0;
+    
+    for (size_t i = 0; i < format.length(); i++) {
+        if (format[i] == '%') {
+            if (i + 1 >= format.length()) continue;
+            
+            if (format[i + 1] == '%') {
+                i++;  // Skip %%
+                continue;
+            }
+            
+            // Skip width/precision modifiers
+            i++;
+            while (i < format.length() && (isdigit(format[i]) || format[i] == '.' || format[i] == '-')) {
+                i++;
+            }
+            
+            // Skip length modifiers (l, ll, h, etc.)
+            if (i < format.length() && (format[i] == 'l' || format[i] == 'h' || format[i] == 'z')) {
+                if (i + 1 < format.length() && format[i] == format[i + 1]) {
+                    i++;  // ll or hh
+                }
+                i++;
+            }
+            
+            if (i >= format.length()) continue;
+            
+            char specifier = format[i];
+            
+            if (argIndex >= argTypes.size()) {
+                // Already reported count mismatch
+                return false;
+            }
+            
+            string argType = argTypes[argIndex];
+            
+            if (argType.empty()) {
+                argIndex++;
+                continue;  // Skip if type couldn't be determined
+            }
+            
+            // Remove pointer level for scanf (we expect pointers)
+            if (isScanf && isPointerType(argType)) {
+                argType = argType.substr(0, argType.length() - 1);
+            }
+            
+            // Type checking based on format specifier
+            bool typeMatch = true;
+            string expectedType;
+            
+            switch (specifier) {
+                case 'd': case 'i':  // signed int
+                    expectedType = "int";
+                    typeMatch = (argType == "int" || argType == "short" || argType == "long");
+                    break;
+                case 'u': case 'o': case 'x': case 'X':  // unsigned int
+                    expectedType = "unsigned int";
+                    typeMatch = (argType.find("unsigned") != string::npos || 
+                                argType == "int" || argType == "long");
+                    break;
+                case 'f': case 'e': case 'g': case 'F': case 'E': case 'G':  // float/double
+                    expectedType = "float/double";
+                    typeMatch = (argType == "float" || argType == "double");
+                    break;
+                case 'c':  // char
+                    expectedType = "char";
+                    typeMatch = (argType == "char" || argType == "int");
+                    break;
+                case 's':  // string
+                    expectedType = "char*";
+                    typeMatch = (argType == "char*" || 
+                                (isPointerType(argTypes[argIndex]) && argType == "char"));
+                    break;
+                case 'p':  // pointer
+                    expectedType = "pointer";
+                    typeMatch = isPointerType(argTypes[argIndex]);
+                    break;
+                default:
+                    // Unknown specifier - skip validation
+                    argIndex++;
+                    continue;
+            }
+            
+            if (!typeMatch) {
+                string funcName = isScanf ? "scanf" : "printf";
+                addError(funcName + " format specifier '%" + string(1, specifier) + 
+                         "' expects " + expectedType + " but argument " + 
+                         to_string(argIndex + 1) + " has type '" + argTypes[argIndex] + "'");
+            }
+            
+            argIndex++;
+        }
+    }
+    
+    return true;
+}
+
+bool SemanticAnalyzer::isEnumDefinition(Node* enumSpecNode) {
+    if (!enumSpecNode || enumSpecNode->name != "ENUM_SPECIFIER") return false;
+    
+    for (auto child : enumSpecNode->children) {
+        if (child->name == "ENUMERATOR_LIST") {
+            return true;  // Has enumerators = definition
+        }
+    }
+    return false;  // Just a name = reference
 }
