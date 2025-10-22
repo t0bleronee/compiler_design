@@ -115,6 +115,15 @@ Node* findIdentifierInArray(Node* arrayNode);
 Node* findIdentifierInDeclarator(Node* declaratorNode);
 void extractStructMembers(Node* declNode, std::map<std::string, std::string>& members, std::map<std::string, Node*>& memberNodes);  // Updated signature
 
+
+// Add these method declarations in the private section:
+void checkPrintfStatement(Node* node);
+void checkScanfStatement(Node* node);
+bool validateFormatString(const std::string& format, const std::vector<std::string>& argTypes, bool isScanf);
+int countFormatSpecifiers(const std::string& format);
+bool isStringLiteral(Node* node);
+
+bool isEnumDefinition(Node* enumSpecNode);
 };
 
 
