@@ -52,7 +52,17 @@ string TACInstruction::toString() const {
         case TACOp::PARAM:
             ss << "param " << operand1;
             break;
+        case TACOp::FUNC_BEGIN:
+            ss << "func_begin " << result;
+            break;
             
+        case TACOp::FUNC_END:
+            ss << "func_end " << result;
+            break;
+            
+        case TACOp::GET_PARAM:
+            ss << result << " = param[" << operand1 << "]";
+            break;
         // Binary operations
         case TACOp::ADD: case TACOp::SUB: case TACOp::MUL: case TACOp::DIV:
         case TACOp::MOD: case TACOp::EQ: case TACOp::NE: case TACOp::LT:
@@ -293,6 +303,7 @@ void IRGenerator::generateStatement(Node* node) {
             generateStatement(child);
         }
     }
+    
     else if (node->name == "IF_STMT" || node->name == "IF_ELSE_STMT") {
         generateIfStatement(node);
     }
@@ -317,14 +328,33 @@ else if (node->name == "UNTIL_STMT") {
     else if (node->name == "FUNCTION_DEFINITION") {
         generateFunction(node);
     }
+    else if (node->name == "PRINTF") {
+    generatePrintfStatement(node);
+}
+else if (node->name == "SCANF") {
+    generateScanfStatement(node);
+}
+    else if (node->name == "POST_INC" || node->name == "PRE_INC") {
+    // Increment as statement (discard return value)
+    generateExpression(node);
+}
+else if (node->name == "POST_DEC" || node->name == "PRE_DEC") {
+    // Decrement as statement (discard return value)
+    generateExpression(node);
+}
+else if (node->name == "UNARY_OP") {
+    // Unary operations should be evaluated as expressions
+    // even when used as statements (for side effects)
+    generateExpression(node);
+}
 else if (node->name == "SWITCH_STMT") {
     generateSwitchStatement(node);
 }
 else if (node->name == "BREAK_STMT") {
-    generateBreakStatement(node);
+    generateBreakStatement();
 }
 else if (node->name == "CONTINUE_STMT") {
-    generateContinueStatement(node);
+    generateContinueStatement();
 }
 else if (node->name == "GOTO_STMT") {
     generateGotoStatement(node);
@@ -540,8 +570,17 @@ else if (node->name == "SIZEOF" || node->name == "SIZEOF_TYPE") {
         string operandTemp = generateExpression(operandNode);
         string resultTemp = createTemp();
         
-        if (op == "&") {
+       if (op == "&") {
+            // ✅ FIX: Special case for &arr[i]
+            if (operandNode->name == "ARRAY_ACCESS") {
+                return generateArrayAddress(operandNode);
+            }
+            
+            // Normal address-of for variables
+             operandTemp = generateExpression(operandNode);
+            resultTemp = createTemp();
             instructions.emplace_back(TACOp::ADDRESS, resultTemp, operandTemp);
+            return resultTemp;
         } else if (op == "*") {
             instructions.emplace_back(TACOp::LOAD, resultTemp, operandTemp);
         } else if (op == "-") {
@@ -656,13 +695,36 @@ TACOp IRGenerator::getUnaryOp(const string& nodeName) {
 string IRGenerator::generateBinaryExpr(Node* node, TACOp op) {
     if (!node || node->children.size() < 2) return "";
     
-    string leftTemp = generateExpression(node->children[0]);
-    string rightTemp = generateExpression(node->children[1]);
-    string resultTemp = createTemp();
+    Node* leftNode = node->children[0];
+    Node* rightNode = node->children[1];
     
+    string leftTemp = generateExpression(leftNode);
+    string rightTemp = generateExpression(rightNode);
+    
+    // Check if this is pointer arithmetic
+    bool leftIsPointer = isPointerType(leftNode);
+    bool rightIsPointer = isPointerType(rightNode);
+    
+    // Pointer arithmetic: ptr + n or n + ptr
+    if ((op == TACOp::ADD || op == TACOp::SUB) && (leftIsPointer || rightIsPointer)) {
+        if (leftIsPointer && rightIsPointer && op == TACOp::SUB) {
+            // Pointer difference: (ptr1 - ptr2) / sizeof(*ptr)
+            return generatePointerDifference(leftNode, rightNode, leftTemp, rightTemp);
+        } else if (leftIsPointer && !rightIsPointer) {
+            // ptr + n or ptr - n
+            return generatePointerArithmetic(leftNode, leftTemp, rightTemp, op);
+        } else if (!leftIsPointer && rightIsPointer && op == TACOp::ADD) {
+            // n + ptr (commutative)
+            return generatePointerArithmetic(rightNode, rightTemp, leftTemp, TACOp::ADD);
+        }
+    }
+    
+    // Regular arithmetic
+    string resultTemp = createTemp();
     instructions.emplace_back(op, resultTemp, leftTemp, rightTemp);
     return resultTemp;
 }
+
 
 // Unary expression generation
 string IRGenerator::generateUnaryExpr(Node* node, TACOp op) {
@@ -706,19 +768,69 @@ string IRGenerator::generateFunctionCall(Node* node) {
     Node* funcNode = node->children[0];
     string funcName = (funcNode->name == "IDENTIFIER") ? funcNode->lexeme : "";
     
+    // Track function calls
+    functionCallCounts[funcName]++;
+    
+    // Detect self-recursion
+    if (funcName == currentFunction) {
+        cout << "DEBUG: Recursive call detected in " << currentFunction << endl;
+    }
+    
     if (funcName.empty()) return "";
     
-    // Handle arguments if present
+    // ✅ FIX: Evaluate ALL arguments FIRST in left-to-right order
+    // This ensures side effects happen in correct sequence
+    vector<string> evaluatedArgs;
+    
     if (node->children.size() > 1) {
         Node* argList = node->children[1];
-        for (auto arg : argList->children) {
+        
+        cout << "DEBUG: Evaluating " << argList->children.size() 
+             << " arguments for " << funcName << " in left-to-right order" << endl;
+        
+        // Step 1: Evaluate all arguments and store in temps (left-to-right)
+        for (size_t i = 0; i < argList->children.size(); i++) {
+            Node* arg = argList->children[i];
+            
+            cout << "DEBUG: Evaluating argument " << i << endl;
+            
+            // Generate expression - this may have side effects (i++, function calls, etc.)
             string argTemp = generateExpression(arg);
-            instructions.emplace_back(TACOp::PARAM, "", argTemp);
+            
+            // If the expression result is not already a temp, copy it to preserve value
+            // This is important for cases like: f(x, x++) where x changes between args
+            if (!argTemp.empty()) {
+                // Check if it's already a temporary or a constant
+                bool isTemp = (argTemp[0] == 't' && isdigit(argTemp[1]));
+                bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
+                               (argTemp[0] == '-' && isdigit(argTemp[1])));
+                
+                if (!isTemp && !isConst) {
+                    // It's a variable - copy to temp to preserve current value
+                    string preservedTemp = createTemp();
+                    instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
+                    evaluatedArgs.push_back(preservedTemp);
+                    
+                    cout << "DEBUG: Preserved variable " << argTemp 
+                         << " in " << preservedTemp << endl;
+                } else {
+                    evaluatedArgs.push_back(argTemp);
+                }
+            }
+        }
+        
+        // Step 2: Emit PARAM instructions for all evaluated args
+        // (Arguments are now evaluated, side effects complete)
+        for (size_t i = 0; i < evaluatedArgs.size(); i++) {
+            cout << "DEBUG: Emitting param " << i << ": " << evaluatedArgs[i] << endl;
+            instructions.emplace_back(TACOp::PARAM, "", evaluatedArgs[i]);
         }
     }
     
+    // Step 3: Emit the CALL instruction
     string resultTemp = createTemp();
     instructions.emplace_back(TACOp::CALL, resultTemp, funcName);
+    
     return resultTemp;
 }
 
@@ -842,17 +954,20 @@ void IRGenerator::generateFunction(Node* node) {
     instructions.emplace_back(TACOp::LABEL, label);
     
     cout << "Generating function: " << funcName << endl;
+       // NEW: Add function begin marker
+    instructions.emplace_back(TACOp::FUNC_BEGIN, funcName);  // Add FUNC_BEGIN to enum
     
     if (paramList) {
         generateParameterHandling(paramList);
     }
     
-    // Generate function body
     if (body) {
         generateStatement(body);
     }
     
-    // Add implicit return if needed
+    // NEW: Add function end marker before implicit return
+    instructions.emplace_back(TACOp::FUNC_END, funcName);  // Add FUNC_END to enum
+    
     if (currentFunction != "main" && 
         (instructions.empty() || instructions.back().opcode != TACOp::RETURN)) {
         instructions.emplace_back(TACOp::RETURN);
@@ -860,25 +975,47 @@ void IRGenerator::generateFunction(Node* node) {
     
     currentFunction = "";
 }
+
 void IRGenerator::generateParameterHandling(Node* paramList) {
     if (!paramList) return;
     
     cout << "DEBUG: Generating parameter handling" << endl;
     
-    // Process all parameters in the list
-    for (auto param : paramList->children) {
-        if (param->name == "PARAM_DECL") {
-            // Extract parameter name
-            string paramName = findParameterName(param);
+    int paramIndex = 0;
+    
+    // Handle nested structure: PARAM_TYPE_LIST -> PARAM_LIST -> PARAM_DECL
+    for (auto child : paramList->children) {
+        if (child->name == "PARAM_LIST") {
+            // Found PARAM_LIST, now process its children (PARAM_DECL nodes)
+            for (auto param : child->children) {
+                if (param->name == "PARAM_DECL") {
+                    string paramName = findParameterName(param);
+                    
+                    if (!paramName.empty()) {
+                        cout << "DEBUG: Parameter " << paramIndex << ": " << paramName << endl;
+                        
+                        // Generate GET_PARAM instruction
+                        instructions.emplace_back(TACOp::GET_PARAM, paramName, to_string(paramIndex));
+                        
+                        paramIndex++;
+                    }
+                }
+            }
+        }
+        // Also handle direct PARAM_DECL (for compatibility)
+        else if (child->name == "PARAM_DECL") {
+            string paramName = findParameterName(child);
+            
             if (!paramName.empty()) {
-                cout << "DEBUG: Found parameter: " << paramName << endl;
-                // In a real implementation, we'd generate code to handle parameters
-                // For now, just note that we found them
+                cout << "DEBUG: Parameter " << paramIndex << ": " << paramName << endl;
+                instructions.emplace_back(TACOp::GET_PARAM, paramName, to_string(paramIndex));
+                paramIndex++;
             }
         }
     }
+    
+    cout << "DEBUG: Total parameters processed: " << paramIndex << endl;
 }
-
 string IRGenerator::findParameterName(Node* paramDecl) {
     if (!paramDecl) return "";
     
@@ -1104,20 +1241,24 @@ string IRGenerator::generatePreIncrement(Node* node) {
     if (operand->name != "IDENTIFIER") return "";
     
     string varName = operand->lexeme;
-    string oneTemp = createTemp();
+    
+    // Check if it's a pointer
+    bool isPtr = isPointerType(operand);
+    int stepSize = isPtr ? getPointedToSize(operand) : 1;
+    
+    string stepTemp = createTemp();
     string resultTemp = createTemp();
     
-    // Create constant 1
-    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    // Create constant for step size
+    instructions.emplace_back(TACOp::CONST, stepTemp, to_string(stepSize));
     
-    // var = var + 1
-    instructions.emplace_back(TACOp::ADD, resultTemp, varName, oneTemp);
+    // var = var + stepSize
+    instructions.emplace_back(TACOp::ADD, resultTemp, varName, stepTemp);
     instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
     
     // Return the new value
     return varName;
 }
-
 string IRGenerator::generatePreDecrement(Node* node) {
     if (!node || node->children.empty()) return "";
     
@@ -1125,14 +1266,19 @@ string IRGenerator::generatePreDecrement(Node* node) {
     if (operand->name != "IDENTIFIER") return "";
     
     string varName = operand->lexeme;
-    string oneTemp = createTemp();
+    
+    // Check if it's a pointer
+    bool isPtr = isPointerType(operand);
+    int stepSize = isPtr ? getPointedToSize(operand) : 1;
+    
+    string stepTemp = createTemp();
     string resultTemp = createTemp();
     
-    // Create constant 1
-    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    // Create constant for step size
+    instructions.emplace_back(TACOp::CONST, stepTemp, to_string(stepSize));
     
-    // var = var - 1
-    instructions.emplace_back(TACOp::SUB, resultTemp, varName, oneTemp);
+    // var = var - stepSize
+    instructions.emplace_back(TACOp::SUB, resultTemp, varName, stepTemp);
     instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
     
     // Return the new value
@@ -1146,18 +1292,23 @@ string IRGenerator::generatePostIncrement(Node* node) {
     if (operand->name != "IDENTIFIER") return "";
     
     string varName = operand->lexeme;
+    
+    // Check if it's a pointer
+    bool isPtr = isPointerType(operand);
+    int stepSize = isPtr ? getPointedToSize(operand) : 1;
+    
     string oldValue = createTemp();
-    string oneTemp = createTemp();
+    string stepTemp = createTemp();
     string newValue = createTemp();
     
     // Save old value
     instructions.emplace_back(TACOp::ASSIGN, oldValue, varName);
     
-    // Create constant 1
-    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    // Create constant for step size
+    instructions.emplace_back(TACOp::CONST, stepTemp, to_string(stepSize));
     
-    // var = var + 1
-    instructions.emplace_back(TACOp::ADD, newValue, varName, oneTemp);
+    // var = var + stepSize
+    instructions.emplace_back(TACOp::ADD, newValue, varName, stepTemp);
     instructions.emplace_back(TACOp::ASSIGN, varName, newValue);
     
     // Return the old value (before increment)
@@ -1171,18 +1322,23 @@ string IRGenerator::generatePostDecrement(Node* node) {
     if (operand->name != "IDENTIFIER") return "";
     
     string varName = operand->lexeme;
+    
+    // Check if it's a pointer
+    bool isPtr = isPointerType(operand);
+    int stepSize = isPtr ? getPointedToSize(operand) : 1;
+    
     string oldValue = createTemp();
-    string oneTemp = createTemp();
+    string stepTemp = createTemp();
     string newValue = createTemp();
     
     // Save old value
     instructions.emplace_back(TACOp::ASSIGN, oldValue, varName);
     
-    // Create constant 1
-    instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+    // Create constant for step size
+    instructions.emplace_back(TACOp::CONST, stepTemp, to_string(stepSize));
     
-    // var = var - 1
-    instructions.emplace_back(TACOp::SUB, newValue, varName, oneTemp);
+    // var = var - stepSize
+    instructions.emplace_back(TACOp::SUB, newValue, varName, stepTemp);
     instructions.emplace_back(TACOp::ASSIGN, varName, newValue);
     
     // Return the old value (before decrement)
@@ -1245,6 +1401,7 @@ string IRGenerator::generateCompoundAssignment(Node* node) {
     
     return varName;
 }
+
 void IRGenerator::generateSwitchStatement(Node* node) {
     if (!node || node->children.size() < 2) return;
     
@@ -1274,10 +1431,28 @@ void IRGenerator::generateSwitchStatement(Node* node) {
     if (caseList->name == "CASE_LIST") {
         for (auto caseNode : caseList->children) {
             if (caseNode->name == "CASE_ELEMENT") {
-                // CASE_ELEMENT has: INTEGER_CONSTANT, STATEMENT_LIST
+                // CASE_ELEMENT has: CASE_VALUE, STATEMENT_LIST
                 if (!caseNode->children.empty()) {
                     CaseInfo info;
-                    info.value = caseNode->children[0]->lexeme;  // Get case value
+                    Node* caseValueNode = caseNode->children[0];
+                    
+                    // ✅ FIX: Check if the case value is an enum constant
+                    if (caseValueNode->name == "IDENTIFIER") {
+                        string caseName = caseValueNode->lexeme;
+                        if (enumConstants.find(caseName) != enumConstants.end()) {
+                            // It's an enum constant - use its numeric value
+                            info.value = to_string(enumConstants[caseName]);
+                            cout << "DEBUG: Case " << caseName << " resolved to " 
+                                 << info.value << endl;
+                        } else {
+                            // Unknown identifier in case (error, but use as-is)
+                            info.value = caseName;
+                        }
+                    } else {
+                        // INTEGER_CONSTANT or other literal
+                        info.value = caseValueNode->lexeme;
+                    }
+                    
                     info.label = createLabel("case");
                     info.isDefault = false;
                     info.node = caseNode;
@@ -1303,7 +1478,7 @@ void IRGenerator::generateSwitchStatement(Node* node) {
         string condTemp = createTemp();
         string caseValueTemp = createTemp();
         
-        // Load case constant
+        // Load case constant (now with proper enum value)
         instructions.emplace_back(TACOp::CONST, caseValueTemp, caseInfo.value);
         
         // Compare: condTemp = (switchTemp == caseValue)
@@ -1373,7 +1548,7 @@ void IRGenerator::generateStatementList(Node* node) {
 
 
 
-void IRGenerator::generateBreakStatement(Node* node) {
+void IRGenerator::generateBreakStatement() {
     cout << "DEBUG: Generating break statement" << endl;
     
     if (!currentBreakLabel.empty()) {
@@ -1383,7 +1558,7 @@ void IRGenerator::generateBreakStatement(Node* node) {
     }
 }
 
-void IRGenerator::generateContinueStatement(Node* node) {
+void IRGenerator::generateContinueStatement() {
     cout << "DEBUG: Generating continue statement" << endl;
     
     if (!currentContinueLabel.empty()) {
@@ -1436,15 +1611,100 @@ string IRGenerator::generateArrayStore(Node* arrayNode, Node* valueNode) {
     Node* arrayBase = arrayNode->children[0];
     Node* indexExpr = arrayNode->children[1];
     
-    string arrayTemp = generateExpression(arrayBase);
-    string indexTemp = generateExpression(indexExpr);
     string valueTemp = generateExpression(valueNode);
     
-    // Format: arr[index] = value
-    instructions.emplace_back(TACOp::ARRAY_STORE, valueTemp, arrayTemp, indexTemp);
+    // Check if this is multi-dimensional array store
+    if (arrayBase->name == "ARRAY_ACCESS") {
+        cout << "DEBUG: Multi-dimensional array store" << endl;
+        
+        // Get address of arr[i] (sub-array)
+        string subArrayAddr = generateMultiDimArrayAddress(arrayBase);
+        
+        // Unwrap EXPR_LIST for index
+        Node* actualIndexExpr = indexExpr;
+        if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+            actualIndexExpr = indexExpr->children[0];
+        }
+        
+        // Calculate offset for second index
+        string indexTemp = generateExpression(actualIndexExpr);
+        int elemSize = getInnerElementSize(arrayBase);
+        
+        string elemSizeTemp = createTemp();
+        string offsetTemp = createTemp();
+        string finalAddr = createTemp();
+        
+        instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+        instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, elemSizeTemp);
+        instructions.emplace_back(TACOp::ADD, finalAddr, subArrayAddr, offsetTemp);
+        
+        // Store value at calculated address
+        instructions.emplace_back(TACOp::STORE, finalAddr, valueTemp);
+        
+        return valueTemp;
+    }
+    
+    // Single-dimensional array store: arr[i] = value
+    // ✅ FIX: Detect if arrayBase is already an address or needs ADDRESS operator
+    // Unwrap EXPR_LIST for index
+Node* actualIndexExpr = indexExpr;
+if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+    actualIndexExpr = indexExpr->children[0];
+}
+
+string indexTemp = generateExpression(actualIndexExpr);
+
+string baseAddr = createTemp();
+  // bool baseIsAddress = false;
+    
+  
+if (arrayBase->name == "IDENTIFIER") {
+    // Simple array variable - get its address
+    string arrayName = arrayBase->lexeme;
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+    cout << "DEBUG: Array store on IDENTIFIER, using ADDRESS" << endl;
+}
+else if (arrayBase->name == "ARRAY_ACCESS") {
+    // Multi-dimensional - already handled above
+    cout << "ERROR: Unexpected nested ARRAY_ACCESS in store" << endl;
+}
+else if (expressionReturnsAddress(arrayBase)) {
+    // Expression yields an address (pointer)
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ASSIGN, baseAddr, exprTemp);
+    cout << "DEBUG: Expression returns address, using directly" << endl;
+}
+else {
+    // Expression yields a value
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, exprTemp);
+    cout << "DEBUG: Expression returns value, taking address" << endl;
+}
+
+    // Get element size
+    int elemSize = 4; // default
+    if (arrayBase->name == "IDENTIFIER" && arrayBase->symbol) {
+        elemSize = getBaseTypeSize(arrayBase->symbol->type);
+    }
+    
+    // Calculate address: baseAddr + (index * elemSize)
+    string elemSizeTemp = createTemp();
+    string offsetTemp = createTemp();
+    string finalAddr = createTemp();
+    
+    instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+    instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, elemSizeTemp);
+    instructions.emplace_back(TACOp::ADD, finalAddr, baseAddr, offsetTemp);
+    
+    // Store value
+    instructions.emplace_back(TACOp::STORE, finalAddr, valueTemp);
+    
+    cout << "DEBUG: Array store complete - STORE at address " << finalAddr << endl;
     
     return valueTemp;
 }
+
+
 
 string IRGenerator::generateArrayAccess(Node* node) {
     if (!node || node->children.size() < 2) return "";
@@ -1453,20 +1713,94 @@ string IRGenerator::generateArrayAccess(Node* node) {
     Node* indexExpr = node->children[1];
     
     // Check if base is itself an array access (multi-dimensional)
-    string baseTemp;
     if (arrayBase->name == "ARRAY_ACCESS") {
-        // Multi-dimensional: arr[i][j]
-        baseTemp = generateArrayAccess(arrayBase);
-    } else {
-        baseTemp = generateExpression(arrayBase);
+        cout << "DEBUG: Multi-dimensional array access detected" << endl;
+        
+        string subArrayAddr = generateMultiDimArrayAddress(arrayBase);
+        
+        // Unwrap EXPR_LIST for index
+        Node* actualIndexExpr = indexExpr;
+        if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+            actualIndexExpr = indexExpr->children[0];
+        }
+        
+        string indexTemp = generateExpression(actualIndexExpr);
+        int elemSize = getInnerElementSize(arrayBase);
+        
+        string elemSizeTemp = createTemp();
+        string offsetTemp = createTemp();
+        string elemAddr = createTemp();
+        string resultTemp = createTemp();
+        
+        instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+        instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, elemSizeTemp);
+        instructions.emplace_back(TACOp::ADD, elemAddr, subArrayAddr, offsetTemp);
+        instructions.emplace_back(TACOp::LOAD, resultTemp, elemAddr);
+        
+        return resultTemp;
     }
     
-    string indexTemp = generateExpression(indexExpr);
+    // ✅ FIX: Single dimension - detect if base is address or needs ADDRESS
+    Node* actualIndexExpr = indexExpr;
+if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+    actualIndexExpr = indexExpr->children[0];
+}
+
+string indexTemp = generateExpression(actualIndexExpr);
+    string baseAddr = createTemp();
+  
+if (arrayBase->name == "IDENTIFIER") {
+    // Simple array variable - get its address
+    string arrayName = arrayBase->lexeme;
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+    cout << "DEBUG: Array access on IDENTIFIER, using ADDRESS" << endl;
+}
+else if (arrayBase->name == "ARRAY_ACCESS") {
+    // This case is already handled above in multi-dimensional check
+    // Should not reach here
+    cout << "ERROR: Unexpected nested ARRAY_ACCESS" << endl;
+}
+else if (expressionReturnsAddress(arrayBase)) {
+    // Expression yields an address (pointer, &x, func returning pointer)
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ASSIGN, baseAddr, exprTemp);
+    cout << "DEBUG: Expression returns address, using directly" << endl;
+}
+else {
+    // Expression yields a value - this is unusual for array base
+    // But handle it by taking address
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, exprTemp);
+    cout << "DEBUG: Expression returns value, taking address" << endl;
+}
+
+
+    // Get element size
+    int elemSize = 4; // default
+    if (arrayBase->name == "IDENTIFIER" && arrayBase->symbol) {
+        elemSize = getBaseTypeSize(arrayBase->symbol->type);
+    }
+    
+    string elemSizeTemp = createTemp();
+    string offsetTemp = createTemp();
+    string elemAddr = createTemp();
     string resultTemp = createTemp();
     
-    instructions.emplace_back(TACOp::ARRAY_LOAD, resultTemp, baseTemp, indexTemp);
+    // offset = index * elemSize
+    instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+    instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, elemSizeTemp);
+    
+    // elemAddr = baseAddr + offset
+    instructions.emplace_back(TACOp::ADD, elemAddr, baseAddr, offsetTemp);
+    
+    // Load value
+    instructions.emplace_back(TACOp::LOAD, resultTemp, elemAddr);
+    
+    cout << "DEBUG: Array access complete - LOAD from address " << elemAddr << endl;
+    
     return resultTemp;
 }
+
 
 string IRGenerator::generateMemberAccess(Node* node, bool isPointer) {
     if (!node || node->children.size() < 2) return "";
@@ -1486,17 +1820,32 @@ string IRGenerator::generateMemberAccess(Node* node, bool isPointer) {
     
     if (memberName.empty()) return "";
     
+    // Calculate member offset
+      int offset = getMemberOffset(structNode, memberName); 
+ 
+    string baseAddr = createTemp();
+    string offsetTemp = createTemp();
+    string memberAddr = createTemp();
     string resultTemp = createTemp();
-    
+    cout << "DeeeeEBUG: Member access - member name: " << memberName << endl;
+cout << "DeeeeEBUG: Calculated offset: " << offset << endl;
     if (isPointer) {
-        instructions.emplace_back(TACOp::PTR_MEMBER_ACCESS, resultTemp, structTemp, memberName);
+        // ptr->member: ptr is already an address, just use it
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     } else {
-        instructions.emplace_back(TACOp::MEMBER_ACCESS, resultTemp, structTemp, memberName);
+        // struct.member: need to get address of struct variable
+        instructions.emplace_back(TACOp::ADDRESS, baseAddr, structTemp);
     }
+    
+    // Calculate member address: baseAddr + offset
+    instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
+    instructions.emplace_back(TACOp::ADD, memberAddr, baseAddr, offsetTemp);
+    
+    // Load value from member address
+    instructions.emplace_back(TACOp::LOAD, resultTemp, memberAddr);
     
     return resultTemp;
 }
-
 string IRGenerator::generateMemberStore(Node* memberNode, Node* valueNode, bool isPointer) {
     if (!memberNode || memberNode->children.size() < 2) return "";
     
@@ -1516,14 +1865,31 @@ string IRGenerator::generateMemberStore(Node* memberNode, Node* valueNode, bool 
     
     if (memberName.empty()) return "";
     
+    // Calculate member offset
+    int offset = getMemberOffset(structNode, memberName);
+    
+    string baseAddr = createTemp();
+    string offsetTemp = createTemp();
+    string memberAddr = createTemp();
+    
     if (isPointer) {
-        instructions.emplace_back(TACOp::PTR_MEMBER_STORE, valueTemp, structTemp, memberName);
+        // ptr->member: ptr is already an address
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     } else {
-        instructions.emplace_back(TACOp::MEMBER_STORE, valueTemp, structTemp, memberName);
+        // struct.member: get address of struct variable
+        instructions.emplace_back(TACOp::ADDRESS, baseAddr, structTemp);
     }
+    
+    // Calculate member address: baseAddr + offset
+    instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
+    instructions.emplace_back(TACOp::ADD, memberAddr, baseAddr, offsetTemp);
+    
+    // Store value to member address
+    instructions.emplace_back(TACOp::STORE, memberAddr, valueTemp);
     
     return valueTemp;
 }
+
 
 void IRGenerator::collectEnumConstants(Node* node) {
     if (!node) return;
@@ -1849,9 +2215,7 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
     // Handle function calls - return type size
 if (exprNode->name == "FUNC_CALL") {
     if (!exprNode->children.empty() && exprNode->children[0]->name == "IDENTIFIER") {
-        string funcName = exprNode->children[0]->lexeme;
-        Symbol* funcSym = symbolTable.lookup(funcName);
-        
+       Symbol* funcSym = exprNode->children[0]->symbol;   
         if (funcSym && funcSym->isFunction) {
             return getBaseTypeSize(funcSym->type);
         }
@@ -1914,20 +2278,8 @@ if (exprNode->name == "POST_INC" || exprNode->name == "POST_DEC" ||
             }
             // In getSizeofExpression, after checking sym->type:
 if (sym->isStruct || sym->isUnion) {
-    // For structs/unions, calculate total size
-    int totalSize = 0;
-    for (const auto& member : sym->structMembers) {
-        int memberSize = getBaseTypeSize(member.second);
-        
-        if (sym->isUnion) {
-            // Union: size is max of all members
-            totalSize = max(totalSize, memberSize);
-        } else {
-            // Struct: sum of all members (ignoring padding for now)
-            totalSize += memberSize;
-        }
-    }
-    return totalSize > 0 ? totalSize : 4;
+    // Use proper struct size calculation with alignment
+    return getStructSize(sym);
 }
             // Otherwise return base type size
             int size = getBaseTypeSize(sym->type);
@@ -1939,12 +2291,15 @@ if (sym->isStruct || sym->isUnion) {
     }
     
     // ✅ For other expression types, try to determine type
-    // (add more cases as needed: string literals, constants, etc.)
+   
     if (exprNode->name == "STRING_LITERAL") {
-        // String literal is char array
-        return exprNode->lexeme.length() + 1;  // +1 for null terminator
+    string str = exprNode->lexeme;
+    // Remove surrounding quotes
+    if (str.length() >= 2 && str.front() == '"' && str.back() == '"') {
+        return str.length() - 2 + 1;  // -2 for quotes, +1 for null terminator
     }
-    
+    return str.length() + 1;
+}
     if (exprNode->name == "INTEGER_CONSTANT") {
         return 4;  // int
     }
@@ -2014,3 +2369,693 @@ int IRGenerator::getBaseTypeSize(const string& typeName) {
     
     return 4;  // default
 }
+
+int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
+    if (!structNode) return 0;
+    
+    Symbol* varSym = structNode->symbol;  // ✅ Use attached symbol
+    
+    if (!varSym) {
+    
+      if (structNode->name == "FUNC_CALL") {
+            if (!structNode->children.empty() && 
+                structNode->children[0]->name == "IDENTIFIER") {
+                
+                string funcName = structNode->children[0]->lexeme;
+                Symbol* funcSym = symbolTable.lookuph(funcName);
+                
+                if (funcSym && funcSym->isFunction) {
+                    // Use the function's return type
+                    string returnType = funcSym->type;
+                    cout << "DEBUG: Function " << funcName 
+                         << " returns type: " << returnType << endl;
+                    
+                    // Remove "struct " prefix
+                    if (returnType.find("struct ") == 0) {
+                        returnType = returnType.substr(7);
+                    }
+                    
+                    // Look up the struct definition
+                    Symbol* structSym = symbolTable.lookuph(returnType);
+                    if (structSym && structSym->isStruct) {
+                        // Calculate offset with alignment (reuse existing code below)
+                        int offset = 0;
+                        for (const auto& member : structSym->structMembers) {
+                            string memType = member.second;
+                            int memberSize = getBaseTypeSize(memType);
+                            int memberAlign = getMemberAlignment(memType);
+                            
+                            if (offset % memberAlign != 0) {
+                                offset += memberAlign - (offset % memberAlign);
+                            }
+                            
+                            if (member.first == memberName) {
+                                cout << "DEBUG: Member " << memberName 
+                                     << " found at offset " << offset << endl;
+                                return offset;
+                            }
+                            
+                            offset += memberSize;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: try name-based lookup
+        if (structNode->name == "IDENTIFIER") {
+            varSym = symbolTable.lookuph(structNode->lexeme);
+        }
+    }
+    
+    if (!varSym) {
+        cout << "WARNING: Cannot determine struct type" << endl;
+        return 0;
+    }
+    
+    string structType = varSym->type;
+    
+    // Remove "struct " or "union " prefix
+    if (structType.find("struct ") == 0) {
+        structType = structType.substr(7);
+    } else if (structType.find("union ") == 0) {
+        structType = structType.substr(6);
+        // For unions, all members are at offset 0
+        return 0;
+    }
+    
+    // Look up the struct definition (type name lookup is OK)
+    Symbol* structSym = symbolTable.lookuph(structType);
+    if (!structSym || !structSym->isStruct) {
+        cout << "WARNING: Struct type " << structType << " not found" << endl;
+        return 0;
+    }
+    
+    // Calculate offset with alignment
+    int offset = 0;
+    
+    for (const auto& member : structSym->structMembers) {
+        string memType = member.second;
+        int memberSize = getBaseTypeSize(memType);
+        int memberAlign = getMemberAlignment(memType);
+        
+        // Add padding before this member if needed
+        if (offset % memberAlign != 0) {
+            offset += memberAlign - (offset % memberAlign);
+        }
+        
+        // Found the member we're looking for
+        if (member.first == memberName) {
+            cout << "DEBUG: Member " << memberName << " found at offset " << offset << endl;
+            return offset;
+        }
+        
+        // Move to next member
+        offset += memberSize;
+    }
+    
+    cout << "WARNING: Member " << memberName << " not found in struct " << structType << endl;
+    return 0;
+}
+
+int IRGenerator::getMemberAlignment(const string& typeName) {
+    // Check if it's a pointer
+    if (typeName.find("*") != string::npos) {
+        return 8;  // Pointers are 8-byte aligned
+    }
+    
+    // Base type alignments (simplified - match size for basic types)
+    if (typeName == "char" || typeName == "bool") return 1;
+    if (typeName == "short") return 2;
+    if (typeName == "int" || typeName == "float") return 4;
+    if (typeName == "long" || typeName == "double") return 8;
+    
+    // For struct/union types, need to find their alignment
+    string baseType = typeName;
+    if (baseType.find("struct ") == 0) {
+        baseType = baseType.substr(7);
+    } else if (baseType.find("union ") == 0) {
+        baseType = baseType.substr(6);
+    }
+    
+    Symbol* typeSym = symbolTable.lookuph(baseType);
+    if (typeSym && (typeSym->isStruct || typeSym->isUnion)) {
+        // Alignment of struct/union is the max alignment of its members
+        int maxAlign = 1;
+        for (const auto& member : typeSym->structMembers) {
+            int memberAlign = getMemberAlignment(member.second);
+            maxAlign = max(maxAlign, memberAlign);
+        }
+        return maxAlign;
+    }
+    
+    return 4;  // Default alignment
+}
+
+int IRGenerator::getStructSize(Symbol* structSym) {
+    if (!structSym) return 0;
+    
+    // For unions, size is max of all members
+    if (structSym->isUnion) {
+        int maxSize = 0;
+        for (const auto& member : structSym->structMembers) {
+            int memberSize = getBaseTypeSize(member.second);
+            maxSize = max(maxSize, memberSize);
+        }
+        // Align to largest member's alignment
+        int maxAlign = 1;
+        for (const auto& member : structSym->structMembers) {
+            int memberAlign = getMemberAlignment(member.second);
+            maxAlign = max(maxAlign, memberAlign);
+        }
+        if (maxSize % maxAlign != 0) {
+            maxSize += maxAlign - (maxSize % maxAlign);
+        }
+        return maxSize;
+    }
+    
+    // For structs, sum with alignment padding
+    int totalSize = 0;
+    int maxAlign = 1;
+    
+    for (const auto& member : structSym->structMembers) {
+        string memType = member.second;
+        int memberSize = getBaseTypeSize(memType);
+        int memberAlign = getMemberAlignment(memType);
+        
+        maxAlign = max(maxAlign, memberAlign);
+        
+        // Add padding before this member
+        if (totalSize % memberAlign != 0) {
+            totalSize += memberAlign - (totalSize % memberAlign);
+        }
+        
+        totalSize += memberSize;
+    }
+    
+    // Add padding at end to align whole struct
+    if (totalSize % maxAlign != 0) {
+        totalSize += maxAlign - (totalSize % maxAlign);
+    }
+    
+    return totalSize;
+}
+
+
+string IRGenerator::generateMultiDimArrayAddress(Node* arrayNode) {
+    if (!arrayNode || arrayNode->children.size() < 2) return "";
+    
+    cout << "DEBUG: generateMultiDimArrayAddress" << endl;
+    
+    Node* arrayBase = arrayNode->children[0];
+    Node* indexExprNode = arrayNode->children[1];
+
+    // ✅ Unwrap EXPR_LIST if present
+    Node* indexExpr = indexExprNode;
+    if (indexExprNode->name == "EXPR_LIST" && !indexExprNode->children.empty()) {
+        indexExpr = indexExprNode->children[0];
+    }
+    
+    string baseAddr;
+    
+    // Recursively handle nested array accesses: arr[i][j][k]...
+    if (arrayBase->name == "ARRAY_ACCESS") {
+        // Recurse to get address of sub-array
+        baseAddr = generateMultiDimArrayAddress(arrayBase);
+    } else if (arrayBase->name == "IDENTIFIER") {
+        // Base case: get address of the array variable
+        string arrayName = arrayBase->lexeme;
+        baseAddr = createTemp();
+        instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+    } else {
+        return "";
+    }
+    
+    // Calculate size to multiply by for THIS dimension
+    // We need to know which dimension we're at
+    int dimIndex = getDimensionIndex(arrayNode);
+    int subArraySize = getSubArraySizeForDimension(arrayBase, dimIndex);
+    
+    cout << "DEBUG: Dimension index = " << dimIndex << ", sub-array size = " << subArraySize << endl;
+    
+    // Generate: offset = index * subArraySize
+    string indexTemp = generateExpression(indexExpr);
+    string sizeTemp = createTemp();
+    string offsetTemp = createTemp();
+    string resultAddr = createTemp();
+    
+    instructions.emplace_back(TACOp::CONST, sizeTemp, to_string(subArraySize));
+    instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, sizeTemp);
+    instructions.emplace_back(TACOp::ADD, resultAddr, baseAddr, offsetTemp);
+    
+    return resultAddr;
+}
+
+// Helper to determine which dimension index we're at
+int IRGenerator::getDimensionIndex(Node* arrayAccessNode) {
+    // Count how many ARRAY_ACCESS nodes are below this one
+    int depth = 0;
+    Node* temp = arrayAccessNode;
+    
+    while (temp && temp->name == "ARRAY_ACCESS") {
+        if (temp->children.empty()) break;
+        temp = temp->children[0];
+        if (temp && temp->name == "ARRAY_ACCESS") {
+            depth++;
+        }
+    }
+    
+    // depth tells us how many more array accesses are below
+    // For matrix[1][2]:
+    //   - Outer [2]: depth = 1 (one ARRAY_ACCESS below) → dimension index 1
+    //   - Inner [1]: depth = 0 (no ARRAY_ACCESS below) → dimension index 0
+    
+    return depth;
+}
+
+int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
+    cout << "=== DEBUG getSubArraySizeForDimension, dimIndex = " << dimIndex << " ===" << endl;
+    
+    // Find base identifier
+    Node* base = arrayNode;
+    while (base && base->name == "ARRAY_ACCESS") {
+        if (base->children.empty()) break;
+        base = base->children[0];
+    }
+    
+    if (!base || base->name != "IDENTIFIER") return 4;
+    
+    Symbol* sym = base->symbol;
+    if (!sym || !sym->isArray) return 4;
+    
+    vector<int> dimensions = sym->arrayDimensions;
+    int elemSize = getBaseTypeSize(sym->type);
+    
+    cout << "DEBUG: Array " << base->lexeme << " has " << dimensions.size() << " dimensions: ";
+    for (int d : dimensions) cout << d << " ";
+    cout << endl;
+    cout << "DEBUG: Base element size = " << elemSize << endl;
+    cout << "DEBUG: Indexing dimension " << dimIndex << endl;
+    
+    // For dimension dimIndex, we need to multiply by all dimensions AFTER dimIndex
+    // For arr[3][4]:
+    //   - dimIndex 0: multiply by dimensions[1] = 4 → size = 4 × 4 = 16
+    //   - dimIndex 1: multiply by nothing → size = 4
+    
+    int subArraySize = elemSize;
+    for (size_t i = dimIndex + 1; i < dimensions.size(); i++) {
+        cout << "DEBUG: Multiplying by dimensions[" << i << "] = " << dimensions[i] << endl;
+        subArraySize *= dimensions[i];
+    }
+    
+    cout << "DEBUG: Final sub-array size = " << subArraySize << endl;
+    return subArraySize;
+}
+
+int IRGenerator::getInnerElementSize(Node* arrayNode) {
+    // Find the base array identifier
+    Node* base = arrayNode;
+    while (base && base->name == "ARRAY_ACCESS") {
+        if (base->children.empty()) break;
+        base = base->children[0];
+    }
+    
+    if (!base || base->name != "IDENTIFIER") return 4;
+    
+    Symbol* sym = base->symbol;
+    if (!sym) return 4;
+    
+    // Return the base type size (the innermost element)
+    return getBaseTypeSize(sym->type);
+}
+
+vector<int> IRGenerator::getArrayDimensions(Symbol* arraySym) {
+    if (!arraySym || !arraySym->isArray) {
+        return vector<int>();
+    }
+    return arraySym->arrayDimensions;
+}
+
+// Helper to check if a node represents a pointer type
+bool IRGenerator::isPointerType(Node* node) {
+    if (!node) return false;
+    
+    if (node->name == "IDENTIFIER") {
+        Symbol* sym = node->symbol;
+        if (sym) {
+            if (sym->isArray) return true;  // Array name decays to pointer
+            return sym->pointerDepth > 0;
+        }
+    }
+    
+    // If it's an expression, try to infer type
+    if (node->name == "UNARY_OP" && node->children.size() >= 2) {
+        Node* op = node->children[0];
+        string opStr = op->name.empty() ? op->lexeme : op->name;
+        
+        if (opStr == "&") {
+            return true;  // Address-of always returns pointer
+        }
+        if (opStr == "*") {
+            // Dereference reduces pointer level
+            return isPointerType(node->children[1]) && getPointerDepth(node->children[1]) > 1;
+        }
+    }
+    
+    return false;
+}
+
+int IRGenerator::getPointerDepth(Node* node) {
+    if (!node) return 0;
+    
+    if (node->name == "IDENTIFIER") {
+        Symbol* sym = node->symbol;
+        if (sym) {
+            if (sym->isArray) return 1;  // Array name is like pointer
+            return sym->pointerDepth;
+        }
+    }
+    
+    return 0;
+}
+int IRGenerator::getPointedToSize(Node* ptrNode) {
+    if (!ptrNode) return 4;
+    
+    if (ptrNode->name == "IDENTIFIER") {
+        Symbol* sym = ptrNode->symbol;
+        if (sym) {
+            cout << "DEBUG: getPointedToSize for " << sym->name 
+                 << " pointerDepth=" << sym->pointerDepth << endl;
+            
+            // If it's a multi-level pointer (int**, int***, etc.)
+            // The pointed-to type is still a pointer (size = 8 bytes on 64-bit)
+            if (sym->pointerDepth > 1) {
+                cout << "DEBUG: Multi-level pointer, returning 8" << endl;
+                return 8;  // Pointer size (64-bit)
+            }
+            // If it's a single-level pointer (int*) or array (int[])
+            // The pointed-to type is the base type
+            else if (sym->pointerDepth == 1 || sym->isArray) {
+                int size = getBaseTypeSize(sym->type);
+                cout << "DEBUG: Single-level pointer/array, base type size = " << size << endl;
+                return size;
+            }
+        }
+    }
+    
+    // For dereference operations, reduce pointer level
+    if (ptrNode->name == "UNARY_OP" && ptrNode->children.size() >= 2) {
+        Node* op = ptrNode->children[0];
+        string opStr = op->name.empty() ? op->lexeme : op->name;
+        
+        if (opStr == "*") {
+            // After one dereference, check the reduced pointer depth
+            Node* operand = ptrNode->children[1];
+            
+            // Recursively get the size of what we're pointing to after dereference
+            if (operand->name == "IDENTIFIER") {
+                Symbol* sym = operand->symbol;
+                if (sym) {
+                    cout << "DEBUG: Dereferencing " << sym->name 
+                         << " (depth=" << sym->pointerDepth << ")" << endl;
+                    
+                    // After dereferencing, pointer depth reduces by 1
+                    // int*** -> int** (still pointer, size 8)
+                    // int** -> int* (still pointer, size 8)
+                    // int* -> int (base type, size 4)
+                    if (sym->pointerDepth > 2) {
+                        cout << "DEBUG: After deref, still multi-level pointer, returning 8" << endl;
+                        return 8;  // Still a pointer
+                    } else if (sym->pointerDepth == 2) {
+                        cout << "DEBUG: After deref, becomes single pointer, returning 8" << endl;
+                        return 8;  // Becomes int* which is still a pointer
+                    } else if (sym->pointerDepth == 1) {
+                        int size = getBaseTypeSize(sym->type);
+                        cout << "DEBUG: After deref, becomes base type, returning " << size << endl;
+                        return size;  // Becomes base type
+                    }
+                }
+            }
+            // Recursively handle nested dereferences like **pp
+            return getPointedToSize(operand);
+        }
+    }
+    
+    return 4;  // Default to int size
+}
+
+
+string IRGenerator::generatePointerArithmetic(Node* ptrNode, const string& ptrTemp, 
+                                               const string& offsetTemp, TACOp op) {
+    int elemSize = getPointedToSize(ptrNode);
+    
+    cout << "DEBUG: Pointer arithmetic - element size = " << elemSize << endl;
+    
+    // Scale offset: scaledOffset = offset * elemSize
+    string elemSizeTemp = createTemp();
+    string scaledOffsetTemp = createTemp();
+    string resultTemp = createTemp();
+    
+    instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+    instructions.emplace_back(TACOp::MUL, scaledOffsetTemp, offsetTemp, elemSizeTemp);
+    
+    // Add or subtract scaled offset
+    instructions.emplace_back(op, resultTemp, ptrTemp, scaledOffsetTemp);
+    
+    return resultTemp;
+}
+
+string IRGenerator::generatePointerDifference(Node* ptr1Node, Node* ptr2Node,
+                                               const string& ptr1Temp, const string& ptr2Temp) {
+    int elemSize = getPointedToSize(ptr1Node);
+    
+    cout << "DEBUG: Pointer difference - element size = " << elemSize << endl;
+    
+    // byteDiff = ptr1 - ptr2
+    string byteDiffTemp = createTemp();
+    instructions.emplace_back(TACOp::SUB, byteDiffTemp, ptr1Temp, ptr2Temp);
+    
+    // elemDiff = byteDiff / elemSize
+    string elemSizeTemp = createTemp();
+    string resultTemp = createTemp();
+    
+    instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+    instructions.emplace_back(TACOp::DIV, resultTemp, byteDiffTemp, elemSizeTemp);
+    
+    return resultTemp;
+}
+
+
+// Add to ir_generator.cpp
+string IRGenerator::generateArrayAddress(Node* arrayNode) {
+    if (!arrayNode || arrayNode->children.size() < 2) return "";
+    
+    Node* arrayBase = arrayNode->children[0];
+    Node* indexExpr = arrayNode->children[1];
+    
+    // Unwrap EXPR_LIST
+    Node* actualIndexExpr = indexExpr;
+    if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+        actualIndexExpr = indexExpr->children[0];
+    }
+    
+   
+    
+    string indexTemp = generateExpression(actualIndexExpr);
+
+// Get base address
+string baseAddr = createTemp();
+
+if (arrayBase->name == "IDENTIFIER") {
+    string arrayName = arrayBase->lexeme;
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+    cout << "DEBUG: Array address of IDENTIFIER" << endl;
+}
+else if (expressionReturnsAddress(arrayBase)) {
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ASSIGN, baseAddr, exprTemp);
+    cout << "DEBUG: Expression already returns address" << endl;
+}
+else {
+    string exprTemp = generateExpression(arrayBase);
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, exprTemp);
+    cout << "DEBUG: Taking address of expression" << endl;
+}
+
+
+    // Calculate element size
+    int elemSize = 4;
+    if (arrayBase->name == "IDENTIFIER" && arrayBase->symbol) {
+        elemSize = getBaseTypeSize(arrayBase->symbol->type);
+    }
+    
+    // Calculate address: baseAddr + (index * elemSize)
+    string elemSizeTemp = createTemp();
+    string offsetTemp = createTemp();
+    string elemAddr = createTemp();
+    
+    instructions.emplace_back(TACOp::CONST, elemSizeTemp, to_string(elemSize));
+    instructions.emplace_back(TACOp::MUL, offsetTemp, indexTemp, elemSizeTemp);
+    instructions.emplace_back(TACOp::ADD, elemAddr, baseAddr, offsetTemp);
+    
+    return elemAddr;  // Return address WITHOUT loading
+}
+
+void IRGenerator::generatePrintfStatement(Node* node) {
+    if (!node) return;
+    
+    cout << "DEBUG: Generating printf statement (varargs function)" << endl;
+    
+    Node* formatString = nullptr;
+    Node* argList = nullptr;
+    
+    for (auto child : node->children) {
+        if (child->name == "STRING_LITERAL") {
+            formatString = child;
+        } else if (child->name == "ARG_LIST") {
+            argList = child;
+        }
+    }
+    
+    // ✅ Step 1: Evaluate ALL arguments first (left-to-right)
+    vector<string> evaluatedArgs;
+    
+    // Format string is always first
+    if (formatString) {
+        string formatTemp = createTemp();
+        instructions.emplace_back(TACOp::CONST, formatTemp, formatString->lexeme);
+        evaluatedArgs.push_back(formatTemp);
+    }
+    
+    // Evaluate remaining arguments (left-to-right)
+    if (argList) {
+        for (size_t i = 0; i < argList->children.size(); i++) {
+            Node* arg = argList->children[i];
+            
+            cout << "DEBUG: Evaluating printf argument " << i << endl;
+            
+            string argTemp = generateExpression(arg);
+            
+            if (!argTemp.empty()) {
+                // Preserve variables in temps to avoid side-effect issues
+                bool isTemp = (argTemp[0] == 't' && isdigit(argTemp[1]));
+                bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
+                               (argTemp[0] == '-' && isdigit(argTemp[1])));
+                
+                if (!isTemp && !isConst) {
+                    string preservedTemp = createTemp();
+                    instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
+                    evaluatedArgs.push_back(preservedTemp);
+                } else {
+                    evaluatedArgs.push_back(argTemp);
+                }
+            }
+        }
+    }
+    
+    // ✅ Step 2: Emit PARAM instructions in order
+    for (const auto& arg : evaluatedArgs) {
+        instructions.emplace_back(TACOp::PARAM, "", arg);
+    }
+    
+    // ✅ Step 3: Emit CALL
+    string resultTemp = createTemp();
+    instructions.emplace_back(TACOp::CALL, resultTemp, "printf");
+    
+    cout << "DEBUG: Generated printf with " << evaluatedArgs.size() 
+         << " parameters" << endl;
+}
+
+void IRGenerator::generateScanfStatement(Node* node) {
+    if (!node) return;
+    
+    cout << "DEBUG: Generating scanf statement (varargs function)" << endl;
+    
+    Node* formatString = nullptr;
+    Node* argList = nullptr;
+    
+    for (auto child : node->children) {
+        if (child->name == "STRING_LITERAL") {
+            formatString = child;
+        } else if (child->name == "ARG_LIST") {
+            argList = child;
+        }
+    }
+    
+    // ✅ Step 1: Evaluate ALL arguments first (left-to-right)
+    vector<string> evaluatedArgs;
+    
+    // Format string is always first
+    if (formatString) {
+        string formatTemp = createTemp();
+        instructions.emplace_back(TACOp::CONST, formatTemp, formatString->lexeme);
+        evaluatedArgs.push_back(formatTemp);
+    }
+    
+    // Evaluate address arguments (left-to-right)
+    // Note: scanf takes addresses, typically &var
+    if (argList) {
+        for (size_t i = 0; i < argList->children.size(); i++) {
+            Node* arg = argList->children[i];
+            
+            cout << "DEBUG: Evaluating scanf argument " << i 
+                 << " (should be address)" << endl;
+            
+            // Generate expression - for scanf, these should be address-of expressions
+            string argTemp = generateExpression(arg);
+            
+            if (!argTemp.empty()) {
+                // For scanf, arguments are already addresses from &x
+                // No need to preserve since addresses don't have side effects
+                evaluatedArgs.push_back(argTemp);
+            }
+        }
+    }
+    
+    // ✅ Step 2: Emit PARAM instructions in order
+    for (const auto& arg : evaluatedArgs) {
+        instructions.emplace_back(TACOp::PARAM, "", arg);
+    }
+    
+    // ✅ Step 3: Emit CALL
+    string resultTemp = createTemp();
+    instructions.emplace_back(TACOp::CALL, resultTemp, "scanf");
+    
+    cout << "DEBUG: Generated scanf with " << evaluatedArgs.size() 
+         << " parameters" << endl;
+}
+
+bool IRGenerator::expressionReturnsAddress(Node* node) {
+    if (!node) return false;
+    
+    // Function calls returning pointers
+    if (node->name == "FUNC_CALL") {
+        if (!node->children.empty() && node->children[0]->name == "IDENTIFIER") {
+            Symbol* funcSym = node->children[0]->symbol;
+            return funcSym && funcSym->pointerDepth > 0;
+        }
+    }
+    
+    // Address-of operator
+    if (node->name == "UNARY_OP" && node->children.size() >= 2) {
+        Node* op = node->children[0];
+        string opStr = op->name.empty() ? op->lexeme : op->name;
+        return opStr == "&";
+    }
+    
+    // Pointer arithmetic (ADD/SUB on pointers)
+    if (node->name == "ADD_EXPR" || node->name == "SUB_EXPR") {
+        if (node->children.size() >= 1) {
+            return isPointerType(node->children[0]);
+        }
+    }
+    
+    // Member access that returns pointer
+    if (node->name == "MEMBER_ACCESS" || node->name == "PTR_MEMBER_ACCESS") {
+        // Check if member is a pointer type
+        // For now, conservatively return false
+        return false;
+    }
+    
+    return false;
+}
+
