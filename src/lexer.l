@@ -10,53 +10,7 @@
 using namespace std;
 
 
-// Extend symbol tables for different user-defined types
-std::unordered_set<std::string> typedefNames;
-std::unordered_set<std::string> structNames;
-std::unordered_set<std::string> unionNames;
-std::unordered_set<std::string> enumNames;
-std::unordered_set<std::string> labelNames;
-
-bool isLabelName(const char* name) {
-    return labelNames.find(std::string(name)) != labelNames.end();
-}
-
-bool isTypedefName(const char* name) {
-    return typedefNames.find(std::string(name)) != typedefNames.end();
-}
-
-bool isUserDefinedType(const char* name) {
-    return typedefNames.find(std::string(name)) != typedefNames.end() ||
-           structNames.find(std::string(name)) != structNames.end() ||
-           unionNames.find(std::string(name)) != unionNames.end() ||
-           enumNames.find(std::string(name)) != enumNames.end();
-}
-
-// Functions to add user-defined type names
-void addTypedefName(const char* name) {
-    typedefNames.insert(std::string(name));
-    printf("DEBUG: Added typedef name: %s\n", name);
-}
-
-void addStructName(const char* name) {
-    structNames.insert(std::string(name));
-    printf("DEBUG: Added struct name: %s\n", name);
-}
-
-void addUnionName(const char* name) {
-    unionNames.insert(std::string(name));
-    printf("DEBUG: Added union name: %s\n", name);
-}
-
-void addEnumName(const char* name) {
-    enumNames.insert(std::string(name));
-    printf("DEBUG: Added enum name: %s\n", name);
-}
-
-void addLabelName(const char* name) {
-    labelNames.insert(std::string(name));
-    printf("DEBUG: Added label name: %s\n", name);
-}
+std::unordered_set<std::string> typedef_names;
 
 
 
@@ -293,10 +247,10 @@ DELIMITER   [()\[\]{},;]
 
 
 
-"true"          { printToken("BOOL_LITERAL", yytext); return BOOL_LITERAL; }
-"false"         { printToken("BOOL_LITERAL", yytext); return BOOL_LITERAL; }
-"TRUE"          { printToken("BOOL_LITERAL", yytext); return BOOL_LITERAL; }
-"FALSE"         { printToken("BOOL_LITERAL", yytext); return BOOL_LITERAL; }
+"true"          { printToken("BOOL_LITERAL", yytext); yylval.strval = strdup(yytext); return BOOL_LITERAL; }
+"false"         { printToken("BOOL_LITERAL", yytext); yylval.strval = strdup(yytext); return BOOL_LITERAL; }
+"TRUE"          { printToken("BOOL_LITERAL", yytext); yylval.strval = strdup(yytext); return BOOL_LITERAL; }
+"FALSE"         { printToken("BOOL_LITERAL", yytext); yylval.strval = strdup(yytext); return BOOL_LITERAL; }
 
 
 
@@ -322,14 +276,20 @@ DELIMITER   [()\[\]{},;]
                                             return INTEGER_CONSTANT; 
                                           }
 
+
 {IDENTIFIER}    { 
     yylval.strval = strdup(yytext);
-    bool isUserType = isUserDefinedType(yytext);
-  
-
-    printToken(isUserType ? "TYPE_NAME" : "IDENTIFIER", yytext); 
-    return isUserType ? TYPE_NAME : IDENTIFIER; 
+    
+    // Check if this is a typedef name
+    if (typedef_names.find(std::string(yytext)) != typedef_names.end()) {
+        printToken("TYPE_NAME", yytext);
+        return TYPE_NAME;
+    }
+ 
+    printToken("IDENTIFIER", yytext); 
+    return IDENTIFIER; 
 }
+
 
 
 "->"		    { printToken("OPERATOR", yytext); return ARROW_OPERATOR; }
