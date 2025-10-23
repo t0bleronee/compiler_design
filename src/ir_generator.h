@@ -1,6 +1,3 @@
-
-
-
 #ifndef IR_GENERATOR_H
 #define IR_GENERATOR_H
 
@@ -11,6 +8,7 @@
 #include <iostream>
 #include<map>
 #include <set>
+#include <algorithm>  // Add this header
 struct CaseInfo {
     std::string value;      // Case constant value
     std::string label;      // Label for this case
@@ -61,7 +59,10 @@ enum class TACOp {
     MEMBER_ACCESS,      // struct.member
     MEMBER_STORE,       // struct.member = value
     PTR_MEMBER_ACCESS,  // struct->member
-    PTR_MEMBER_STORE    // struct->member = value
+    PTR_MEMBER_STORE,    // struct->member = value
+    GET_PARAM,
+    FUNC_BEGIN,  // func_begin factorial
+    FUNC_END,    // func_end factorial
 };
 
 // TAC Instruction
@@ -84,6 +85,8 @@ class IRGenerator {
 private:
     std::vector<TACInstruction> instructions;
     SymbolTable& symbolTable;
+     int currentCallDepth;  // Track recursion depth during generation
+    std::map<std::string, int> functionCallCounts;  // Count calls to each function
     
     // Temporary and label counters
     int tempCounter;
@@ -161,8 +164,8 @@ std::string generatePostDecrement(Node* node);
 std::string generateCompoundAssignment(Node* node);
 
 void generateSwitchStatement(Node* node);
-void generateBreakStatement(Node* node);
-void generateContinueStatement(Node* node);
+void generateBreakStatement();
+void generateContinueStatement();
 
 std::string generateTernaryOperator(Node* node);
 void generateStatementList(Node* node);
@@ -181,6 +184,37 @@ std::string generateSizeof(Node* node);
 int getSizeofType(Node* typeNode);
 int getSizeofExpression(Node* exprNode);
 int getBaseTypeSize(const std::string& typeName);
+
+
+// Add these in the private section of IRGenerator class
+int getMemberOffset(Node* structNode, const std::string& memberName);
+
+int getStructSize(Symbol* structSym);
+int getMemberAlignment(const std::string& typeName);
+
+// Add to private section of IRGenerator class
+std::string generateMultiDimArrayAddress(Node* arrayNode);
+int getInnerElementSize(Node* arrayNode);
+std::vector<int> getArrayDimensions(Symbol* arraySym);
+
+
+int getDimensionIndex(Node* arrayAccessNode);
+int getSubArraySizeForDimension(Node* arrayNode, int dimIndex);
+
+
+// Add these after the existing helper function declarations
+bool isPointerType(Node* node);
+int getPointerDepth(Node* node);
+int getPointedToSize(Node* ptrNode);
+std::string generatePointerArithmetic(Node* ptrNode, const std::string& ptrTemp,const std::string& offsetTemp, TACOp op);
+std::string generatePointerDifference(Node* ptr1Node, Node* ptr2Node,const std::string& ptr1Temp, const std::string& ptr2Temp);
+
+std::string generateArrayAddress(Node* arrayNode);
+
+void generatePrintfStatement(Node* node);
+void generateScanfStatement(Node* node);
+
+bool expressionReturnsAddress(Node* node);
 };
 
 #endif // IR_GENERATOR_H
