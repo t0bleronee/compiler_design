@@ -57,7 +57,6 @@ void checkUnaryOperation(Node* node);
 std::string getExpressionType(Node* node);
 void processStruct(Node* node);
 void processEnum(Node* node);
-void extractStructMembers(Node* declNode, std::map<std::string, std::string>& members);
 bool isStructMemberDeclaration(Node* node);
 
 
