@@ -215,6 +215,13 @@ void generatePrintfStatement(Node* node);
 void generateScanfStatement(Node* node);
 
 bool expressionReturnsAddress(Node* node);
+
+    // Helpers to navigate ARRAY AST shapes
+    Node* findIdentifierInArray(Node* arrayNode);
+
+    // Helpers for general lvalue handling and ++/-- step calculation
+    std::string generateLValueAddress(Node* lvalue);
+    int getIncrementStepForLValue(Node* lvalue);
 };
 
 #endif // IR_GENERATOR_H
