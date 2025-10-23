@@ -15,13 +15,15 @@ bool SemanticAnalyzer::buildSymbolTable(Node* root) {
     if (!root) return false;
 
       cout << "DEBUG: Before enterScope, active scopes = " << symbolTable.getCurrentScopeLevel() << "\n";
-    //symbolTable.enterScope();  // Global scope for functions
+        // Ensure a global scope is available for all top-level declarations/definitions
+        symbolTable.enterScope();  // Global scope
     
 
     cout << "\n=== Building Symbol Table ===\n";
     traverseAST(root);
    
-symbolTable.exitScope();
+    // Close the global scope created above
+    symbolTable.exitScope();
     cout << "\n=== Semantic Analysis Completed ===\n";
     Symbol* modeSym = symbolTable.lookup("Mode");
     if (modeSym && modeSym->isEnum) {
@@ -1173,10 +1175,8 @@ void SemanticAnalyzer::checkUnaryOperation(Node* node) {
         }
     }
     else if (opNode->name == "&") {  // Address-of operator
-        // Check if operand is an lvalue
-        if (operandNode->name != "IDENTIFIER" && 
-            operandNode->name != "ARRAY_ACCESS" &&
-            operandNode->name != "MEMBER_ACCESS") {
+        // Address-of requires an lvalue operand (e.g., identifier, array element, *ptr, member)
+        if (!isLvalue(operandNode)) {
             addError("Cannot take address of rvalue");
         }
     }
@@ -1206,22 +1206,22 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
   
      if (node->name == "IDENTIFIER") {
         Symbol* sym = symbolTable.lookup(node->lexeme);
-        
         if (!sym){ return "";}
         
-        //string type = sym->type;
         string type = resolveTypedef(sym->type);
-        cout<<"hi"<<type<<sym->pointerDepth<<sym->isArray<<endl;
-        // If it's an array, treat it as a pointer in expressions
+        // Array identifiers decay to pointer-to-element in expressions.
+        // If the element itself is a pointer (e.g., char* arr[]), include its pointer depth, then add one more for decay.
         if (sym->isArray) {
-            return type + "*";
+            for (int i = 0; i < sym->pointerDepth + 1; i++) {
+                type += "*";
+            }
+            return type;
         }
         
-        // If it has pointer depth, add asterisks
+        // Non-array: apply pointer depth normally
         for (int i = 0; i < sym->pointerDepth; i++) {
             type += "*";
         }
-        
         return type;
     }
     else if (node->name == "INTEGER_CONSTANT") return "int";
@@ -1691,7 +1691,7 @@ bool SemanticAnalyzer::isIntegerType(const std::string& type) {
            type == "unsigned char" || type == "signed char" || type == "bool";
 }
 bool SemanticAnalyzer::isNumericType(const std::string& type) {
-    return isIntegerType(type) || type == "float" || type == "double";
+    return isIntegerType(type) || type == "float" || type == "double" || type.rfind("enum ", 0) == 0;;
 }
 
 bool SemanticAnalyzer::isPointerType(const string& type) {
@@ -1758,6 +1758,14 @@ bool SemanticAnalyzer::areTypesCompatible(const string& type1, const string& typ
         // CASE 2: Both boolean types - compatible
         if (type1 == "bool" && type2 == "bool") return true;
         
+          if ((type1.find("enum ") == 0 && isIntegerType(type2)) || (type2.find("enum ") == 0 && isIntegerType(type1))) {
+        return true;
+    }
+    
+    // Enum to enum of same type
+    if (type1.find("enum ") == 0 && type2.find("enum ") == 0) {
+        return type1 == type2;  // Same enum type
+    }
         // CASE 3: Boolean with integer (0=false, non-zero=true)
         if ((type1 == "bool" && isIntegerType(type2)) || 
             (type2 == "bool" && isIntegerType(type1))) {
@@ -2043,6 +2051,19 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     
     Node* lhs = node->children[0];
     Node* rhs = node->children[2];  // children[1] is the operator
+
+    // (debug traces removed)
+
+    // Special-case: skip generic assignment checks for initializer lists used in declarations
+    // Pattern: inside INIT_DECL_LIST with RHS=INIT_LIST/INIT_LIST_EMPTY
+    // Detailed per-element checks (arrays, structs, etc.) are handled separately by the
+    // initializer handling logic (and IR generation). Skipping here avoids false
+    // type-mismatch reports during the declaration processing phase.
+    if (node->parent && node->parent->name == "INIT_DECL_LIST") {
+        if (rhs && (rhs->name == "INIT_LIST" || rhs->name == "INIT_LIST_EMPTY")) {
+            return;
+        }
+    }
     
     string lhsType = getExpressionType(lhs);
     string rhsType = getExpressionType(rhs);
@@ -2072,9 +2093,17 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
         return;
     }
     
-    // NULL/0 can be assigned to pointers
+    // NULL (integer constant 0) can be assigned to pointers; other integers cannot
     if (isPointerType(lhsType) && isIntegerType(rhsType)) {
-        // Allow for now (could be NULL)
+        // Allow only the literal 0 as a null-pointer constant
+        if (rhs && rhs->name == "INTEGER_CONSTANT") {
+            // Accept only exact 0 as null (avoid accepting arbitrary integer constants)
+            if (rhs->lexeme == "0") {
+                return; // ok: ptr = 0;
+            }
+        }
+        // For any non-zero integer value or non-constant integer expression, this is invalid
+        addError("Cannot assign non-pointer type '" + rhsType + "' to pointer type '" + lhsType + "'");
         return;
     }
     
@@ -2102,20 +2131,16 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
 
 
 string SemanticAnalyzer::getBaseTypeFromPointer(const string& type) {
-    size_t lastStar = type.find_last_not_of('*');
-    if (lastStar == string::npos) {
-        // Only stars (e.g., "***"), return empty or handle as error
-        return "";
-    }
-    // Find the position where the base type ends (before the first star)
-    size_t firstStar = type.find('*');
-    if (firstStar == string::npos) {
-        // Not a pointer (shouldn't happen if called correctly)
+    // Find the first '*' in the type string and return everything before it as the base type
+    size_t pos = type.find('*');
+    if (pos == string::npos) {
+        // No pointer marker - return the type as-is
         return type;
     }
-    
-    // The base type is the substring up to the first star.
-    return type.substr(0, firstStar);
+    // Trim trailing spaces before the '*' if any
+    size_t end = pos;
+    while (end > 0 && isspace(static_cast<unsigned char>(type[end - 1]))) --end;
+    return type.substr(0, end);
 }
 
 void SemanticAnalyzer::checkLogicalOperation(Node* node) {
