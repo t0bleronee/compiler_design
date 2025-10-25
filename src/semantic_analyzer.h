@@ -112,7 +112,7 @@ Node* findFunctionDeclarator(Node* node);
 Node* findIdentifierInArray(Node* arrayNode);
 
 Node* findIdentifierInDeclarator(Node* declaratorNode);
-void extractStructMembers(Node* declNode, std::map<std::string, std::string>& members, std::map<std::string, Node*>& memberNodes);  // Updated signature
+void extractStructMembers(Node* declNode, std::map<std::string, std::string>& members, std::map<std::string, Node*>& memberNodes, std::vector<std::string>& memberOrder);
 
 
 // Add these method declarations in the private section:
@@ -127,3 +127,4 @@ bool isEnumDefinition(Node* enumSpecNode);
 
 
 #endif
+
