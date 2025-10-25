@@ -163,6 +163,21 @@ case TACOp::PTR_MEMBER_STORE:
 IRGenerator::IRGenerator(SymbolTable& symTab) 
     : symbolTable(symTab), tempCounter(0), labelCounter(0), 
       currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
+
+// Produce a unique IR name for an identifier using its bound Symbol
+std::string IRGenerator::getUniqueNameFor(Node* idNode, const std::string& fallback) {
+    if (!idNode) return fallback;
+    if (idNode->symbol) {
+        auto it = symbolUniqueNames.find(idNode->symbol);
+        if (it != symbolUniqueNames.end()) return it->second;
+        // Create a readable unique name: baseName#N
+        std::string base = idNode->lexeme.empty() ? fallback : idNode->lexeme;
+        std::string unique = base + "#" + std::to_string(++symbolNameCounter);
+        symbolUniqueNames[idNode->symbol] = unique;
+        return unique;
+    }
+    return fallback;
+}
 bool IRGenerator::generateIR(Node* ast) {
     if (!ast) return false;
     
@@ -227,7 +242,7 @@ void IRGenerator::traverseAST(Node* node) {
                         if (specChild->name == "TYPEDEF" || 
                             specChild->name == "STORAGE_CLASS_SPECIFIER" ||
                             (specChild->name == "STRUCT_OR_UNION_SPECIFIER" && hasStructBody(specChild)) ||
-                            specChild->name == "ENUM_SPECIFIER") {
+                            (specChild->name == "ENUM_SPECIFIER" && hasEnumBody(specChild))) {
                             isTypeDecl = true;
                             break;
                         }
@@ -318,7 +333,7 @@ void IRGenerator::generateStatement(Node* node) {
                     if (specChild->name == "TYPEDEF" || 
                         specChild->name == "STORAGE_CLASS_SPECIFIER" ||
                         (specChild->name == "STRUCT_OR_UNION_SPECIFIER" && hasStructBody(specChild)) ||
-                        specChild->name == "ENUM_SPECIFIER") {
+                        (specChild->name == "ENUM_SPECIFIER" && hasEnumBody(specChild))) {
                         isTypeDecl = true;
                         break;
                     }
@@ -380,6 +395,17 @@ bool IRGenerator::hasStructBody(Node* node) {
         }
     }
     return false;  // Just a declaration/usage
+}
+
+// Helper to check if enum has a body (definition with enumerators) vs mere usage
+bool IRGenerator::hasEnumBody(Node* node) {
+    if (!node) return false;
+    for (auto child : node->children) {
+        if (child->name == "ENUMERATOR_LIST") {
+            return true; // Has body - it's a definition
+        }
+    }
+    return false; // Just a declaration/usage
 }
 
 // Helper to find identifier in a subtree
@@ -459,7 +485,8 @@ string IRGenerator::generateExpression(Node* node) {
         instructions.emplace_back(TACOp::CONST, temp,to_string(enumConstants[node->lexeme]));
         return temp;
     }
-    return node->lexeme;
+    // Use unique name per bound symbol (handles shadowing)
+    return getUniqueNameFor(node, node->lexeme);
 }
     else if (node->name == "INTEGER_CONSTANT" || node->name == "FLOAT_CONSTANT" || 
              node->name == "CHAR_LITERAL" || node->name == "BOOL_LITERAL") {
@@ -839,11 +866,13 @@ string IRGenerator::generateAssignment(Node* node) {
         // Optimize: if RHS is a constant, assign directly without temp
         if (rhs->name == "INTEGER_CONSTANT" || rhs->name == "FLOAT_CONSTANT" || 
             rhs->name == "CHAR_LITERAL" || rhs->name == "BOOL_LITERAL") {
-            instructions.emplace_back(TACOp::ASSIGN, lhs->lexeme, rhs->lexeme);
-            return lhs->lexeme;
+            string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
+            instructions.emplace_back(TACOp::ASSIGN, lhsName, rhs->lexeme);
+            return lhsName;
         } else {
-            instructions.emplace_back(TACOp::ASSIGN, lhs->lexeme, rhsTemp);
-            return lhs->lexeme;
+            string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
+            instructions.emplace_back(TACOp::ASSIGN, lhsName, rhsTemp);
+            return lhsName;
         }
     }
     
@@ -978,7 +1007,7 @@ void IRGenerator::generateDeclaration(Node* node) {
                     }
                     if (arrayNodeCandidate && initNode->name == "INIT_LIST") {
                         if (idNode) {
-                            string arrayName = idNode->lexeme;
+                            string arrayName = getUniqueNameFor(idNode, idNode->lexeme);
                             int declaredSize = -1; // legacy fallback for 1D explicit size only
                             if (arrayNodeCandidate->children.size() > 1 && arrayNodeCandidate->children[1]->name == "INTEGER_CONSTANT") {
                                 declaredSize = stoi(arrayNodeCandidate->children[1]->lexeme);
@@ -1150,14 +1179,31 @@ void IRGenerator::generateDeclaration(Node* node) {
                     if ((varNode->name == "IDENTIFIER" || varNode->name == "DECLARATOR") && initNode->name == "INIT_LIST") {
                         // Resolve variable name
                         string varName = "";
+                        Node* idInDecl = nullptr;
                         if (varNode->name == "IDENTIFIER") {
-                            varName = varNode->lexeme;
+                            idInDecl = varNode;
                         } else {
-                            varName = getDeclaratorName(varNode);
+                            // Find IDENTIFIER inside declarator
+                            std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                                if (!n) return nullptr;
+                                if (n->name == "IDENTIFIER") return n;
+                                for (auto c : n->children) { auto r = findId(c); if (r) return r; }
+                                return nullptr;
+                            };
+                            idInDecl = findId(varNode);
                         }
+                        varName = idInDecl ? getUniqueNameFor(idInDecl, idInDecl->lexeme) : getDeclaratorName(varNode);
                         if (!varName.empty()) {
-                            // Look up variable symbol and struct type symbol
-                            Symbol* varSym = symbolTable.lookuph(varName);
+                            // Look up variable symbol and struct type symbol using source name if possible
+                            // Attempt to resolve by the raw lexeme from idInDecl when available
+                            Symbol* varSym = nullptr;
+                            if (idInDecl && !idInDecl->lexeme.empty()) {
+                                varSym = symbolTable.lookuph(idInDecl->lexeme);
+                            }
+                            if (!varSym) {
+                                // Fallback: try unique name (may not be found in history)
+                                varSym = symbolTable.lookuph(varName);
+                            }
                             if (varSym) {
                                 string t = varSym->type; // e.g., "struct P"
                                 bool isStructType = false;
@@ -1199,11 +1245,21 @@ void IRGenerator::generateDeclaration(Node* node) {
                     
                     // Case 2: Scalar or pointer variable with initializer
                     string varName = "";
+                    Node* idInDecl = nullptr;
                     if (varNode->name == "IDENTIFIER") {
-                        varName = varNode->lexeme;
+                        idInDecl = varNode;
                     } else if (varNode->name == "DECLARATOR") {
-                        varName = getDeclaratorName(varNode);
+                        // Find IDENTIFIER inside declarator
+                        std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                            if (!n) return nullptr;
+                            if (n->name == "IDENTIFIER") return n;
+                            for (auto c : n->children) { auto r = findId(c); if (r) return r; }
+                            return nullptr;
+                        };
+                        idInDecl = findId(varNode);
                     }
+                    if (idInDecl) varName = getUniqueNameFor(idInDecl, idInDecl->lexeme);
+                    else if (varNode->name == "DECLARATOR") varName = getDeclaratorName(varNode);
                     
                     // Track static variables
                     if (isStatic && !varName.empty()) {
@@ -1286,13 +1342,14 @@ void IRGenerator::generateFunction(Node* node) {
         generateStatement(body);
     }
     
-    // NEW: Add function end marker before implicit return
-    instructions.emplace_back(TACOp::FUNC_END, funcName);  // Add FUNC_END to enum
-    
+    // Emit implicit return inside the function (before func_end) only if needed
     if (currentFunction != "main" && 
         (instructions.empty() || instructions.back().opcode != TACOp::RETURN)) {
         instructions.emplace_back(TACOp::RETURN);
     }
+
+    // Add function end marker after body and any implicit return
+    instructions.emplace_back(TACOp::FUNC_END, funcName);
     
     currentFunction = "";
 }
@@ -1311,12 +1368,22 @@ void IRGenerator::generateParameterHandling(Node* paramList) {
             for (auto param : child->children) {
                 if (param->name == "PARAM_DECL") {
                     string paramName = findParameterName(param);
-                    
-                    if (!paramName.empty()) {
-                        cout << "DEBUG: Parameter " << paramIndex << ": " << paramName << endl;
+                    // Find the identifier node inside PARAM_DECL to seed unique naming
+                    Node* idNode = nullptr;
+                    std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                        if (!n) return nullptr;
+                        if (n->name == "IDENTIFIER") return n;
+                        for (auto c : n->children) { auto r = findId(c); if (r) return r; }
+                        return nullptr;
+                    };
+                    idNode = findId(param);
+                    string targetName = paramName;
+                    if (idNode) targetName = getUniqueNameFor(idNode, paramName);
+                    if (!targetName.empty()) {
+                        cout << "DEBUG: Parameter " << paramIndex << ": " << targetName << endl;
                         
-                        // Generate GET_PARAM instruction
-                        instructions.emplace_back(TACOp::GET_PARAM, paramName, to_string(paramIndex));
+                        // Generate GET_PARAM instruction into the unique name
+                        instructions.emplace_back(TACOp::GET_PARAM, targetName, to_string(paramIndex));
                         
                         paramIndex++;
                     }
@@ -1326,10 +1393,19 @@ void IRGenerator::generateParameterHandling(Node* paramList) {
         // Also handle direct PARAM_DECL (for compatibility)
         else if (child->name == "PARAM_DECL") {
             string paramName = findParameterName(child);
-            
-            if (!paramName.empty()) {
-                cout << "DEBUG: Parameter " << paramIndex << ": " << paramName << endl;
-                instructions.emplace_back(TACOp::GET_PARAM, paramName, to_string(paramIndex));
+            Node* idNode = nullptr;
+            std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                if (!n) return nullptr;
+                if (n->name == "IDENTIFIER") return n;
+                for (auto c : n->children) { auto r = findId(c); if (r) return r; }
+                return nullptr;
+            };
+            idNode = findId(child);
+            string targetName = paramName;
+            if (idNode) targetName = getUniqueNameFor(idNode, paramName);
+            if (!targetName.empty()) {
+                cout << "DEBUG: Parameter " << paramIndex << ": " << targetName << endl;
+                instructions.emplace_back(TACOp::GET_PARAM, targetName, to_string(paramIndex));
                 paramIndex++;
             }
         }
@@ -1561,7 +1637,7 @@ string IRGenerator::generatePreIncrement(Node* node) {
     Node* operand = node->children[0];
     // Fast path: simple identifier
     if (operand->name == "IDENTIFIER") {
-        string varName = operand->lexeme;
+        string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
         string stepTemp = createTemp();
@@ -1590,7 +1666,7 @@ string IRGenerator::generatePreDecrement(Node* node) {
     
     Node* operand = node->children[0];
     if (operand->name == "IDENTIFIER") {
-        string varName = operand->lexeme;
+        string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
         string stepTemp = createTemp();
@@ -1618,7 +1694,7 @@ string IRGenerator::generatePostIncrement(Node* node) {
     
     Node* operand = node->children[0];
     if (operand->name == "IDENTIFIER") {
-        string varName = operand->lexeme;
+        string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
         string oldValue = createTemp();
@@ -1648,7 +1724,7 @@ string IRGenerator::generatePostDecrement(Node* node) {
     
     Node* operand = node->children[0];
     if (operand->name == "IDENTIFIER") {
-        string varName = operand->lexeme;
+        string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
         string oldValue = createTemp();
@@ -1682,7 +1758,7 @@ string IRGenerator::generateCompoundAssignment(Node* node) {
     
     if (lhs->name != "IDENTIFIER") return "";
     
-    string varName = lhs->lexeme;
+    string varName = getUniqueNameFor(lhs, lhs->lexeme);
     string rhsTemp = generateExpression(rhs);
     string resultTemp = createTemp();
     
@@ -1978,6 +2054,26 @@ string IRGenerator::generateArrayStore(Node* arrayNode, Node* valueNode) {
     }
     
     // Single-dimensional array store: base[i] = value
+    // Special-case: array member like a.b[i] = v
+    if (baseExpr->name == "MEMBER_ACCESS" || baseExpr->name == "PTR_MEMBER_ACCESS") {
+        // Base address is the address of the member within the struct
+        string memberAddr = generateLValueAddress(baseExpr);
+        // Unwrap index
+        Node* actualIndexExprM = indexExpr;
+        if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+            actualIndexExprM = indexExpr->children[0];
+        }
+        string indexTempM = generateExpression(actualIndexExprM);
+        int elemSizeM = getPointedToSize(baseExpr);
+        string elemSizeTempM = createTemp();
+        string offsetTempM = createTemp();
+        string finalAddrM = createTemp();
+        instructions.emplace_back(TACOp::CONST, elemSizeTempM, to_string(elemSizeM));
+        instructions.emplace_back(TACOp::MUL, offsetTempM, indexTempM, elemSizeTempM);
+        instructions.emplace_back(TACOp::ADD, finalAddrM, memberAddr, offsetTempM);
+        instructions.emplace_back(TACOp::STORE, finalAddrM, valueTemp);
+        return valueTemp;
+    }
     // Detect if base is an array variable (needs &base) or a pointer (use its value)
     // Unwrap EXPR_LIST for index
 Node* actualIndexExpr = indexExpr;
@@ -1994,17 +2090,18 @@ string baseAddr = createTemp();
     if (baseExpr->name == "IDENTIFIER") {
     // IDENTIFIER can be an array or a pointer
         Symbol* sym = baseExpr->symbol;
+        string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
     if (sym && sym->isArray) {
         // Array variable: take address of the array object
-            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array store on array IDENTIFIER, using ADDRESS" << endl;
     } else if (sym && sym->pointerDepth > 0) {
         // Pointer variable: use pointer value as base address
-            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
         cout << "DEBUG: Array store on pointer IDENTIFIER, using pointer value" << endl;
     } else {
         // Fallback: treat as taking address (unlikely)
-            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array store on IDENTIFIER, default ADDRESS" << endl;
     }
 }
@@ -2115,6 +2212,25 @@ string IRGenerator::generateArrayAccess(Node* node) {
     }
     
     // Single dimension - detect if base is an array (needs &base) or a pointer (use its value)
+    // Special-case: array member like a.b[i]
+    if (baseExpr->name == "MEMBER_ACCESS" || baseExpr->name == "PTR_MEMBER_ACCESS") {
+        string memberAddr = generateLValueAddress(baseExpr);
+        Node* actualIndexExprM = indexExpr;
+        if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
+            actualIndexExprM = indexExpr->children[0];
+        }
+        string indexTempM = generateExpression(actualIndexExprM);
+        int elemSizeM = getPointedToSize(baseExpr);
+        string elemSizeTempM = createTemp();
+        string offsetTempM = createTemp();
+        string elemAddrM = createTemp();
+        string resultTempM = createTemp();
+        instructions.emplace_back(TACOp::CONST, elemSizeTempM, to_string(elemSizeM));
+        instructions.emplace_back(TACOp::MUL, offsetTempM, indexTempM, elemSizeTempM);
+        instructions.emplace_back(TACOp::ADD, elemAddrM, memberAddr, offsetTempM);
+        instructions.emplace_back(TACOp::LOAD, resultTempM, elemAddrM);
+        return resultTempM;
+    }
     Node* actualIndexExpr = indexExpr;
     if (indexExpr->name == "EXPR_LIST" && !indexExpr->children.empty()) {
     actualIndexExpr = indexExpr->children[0];
@@ -2125,17 +2241,18 @@ string indexTemp = generateExpression(actualIndexExpr);
   
 if (baseExpr->name == "IDENTIFIER") {
     Symbol* sym = baseExpr->symbol;
+    string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
     if (sym && sym->isArray) {
         // Array variable: address of array object
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array access on array IDENTIFIER, using ADDRESS" << endl;
     } else if (sym && sym->pointerDepth > 0) {
         // Pointer variable: use its value
-        instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseExpr->lexeme);
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
         cout << "DEBUG: Array access on pointer IDENTIFIER, using pointer value" << endl;
     } else {
         // Fallback
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array access on IDENTIFIER, default ADDRESS" << endl;
     }
 }
@@ -2214,7 +2331,11 @@ string IRGenerator::generateMemberAccess(Node* node, bool isPointer) {
     Node* structNode = node->children[0];
     Node* memberNode = node->children[1];
     
-    string structTemp = generateExpression(structNode);
+    // For member access, we need the base address of the struct object
+    // - For ptr->member: base is already an address (pointer value)
+    // - For obj.member: compute address of the lvalue (handles identifiers, array elements, nested members)
+    string structTemp = isPointer ? generateExpression(structNode)
+                                  : generateLValueAddress(structNode);
     string memberName = "";
     
     if (memberNode->name == "IDENTIFIER") {
@@ -2236,8 +2357,8 @@ cout << "DeeeeEBUG: Calculated offset: " << offset << endl;
         // ptr->member: ptr is already an address, just use it
         instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     } else {
-        // struct.member: need to get address of struct variable
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, structTemp);
+        // struct.member: we already computed the lvalue address
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     }
     
     // Calculate member address: baseAddr + offset
@@ -2258,7 +2379,9 @@ string IRGenerator::generateMemberStore(Node* memberNode, Node* valueNode, bool 
     Node* structNode = memberNode->children[0];
     Node* memberIdNode = memberNode->children[1];
     
-    string structTemp = generateExpression(structNode);
+    // Compute base address similarly to access case
+    string structTemp = isPointer ? generateExpression(structNode)
+                                  : generateLValueAddress(structNode);
     string valueTemp = generateExpression(valueNode);
     string memberName = "";
     
@@ -2279,8 +2402,8 @@ string IRGenerator::generateMemberStore(Node* memberNode, Node* valueNode, bool 
         // ptr->member: ptr is already an address
         instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     } else {
-        // struct.member: get address of struct variable
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, structTemp);
+        // struct.member: we already computed the lvalue address
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, structTemp);
     }
     
     // Calculate member address: baseAddr + offset
@@ -2452,20 +2575,38 @@ int IRGenerator::getSizeofType(Node* typeNode) {
     
     string typeName = "";
     int pointerDepth = 0;
-     for (auto child : typeNode->children) {
-      
+    // If there's an explicit pointer, sizeof(type*) is pointer size
+    for (auto child : typeNode->children) {
         if (child->name == "POINTER") {
             return 8;
         }
     }
     
-    // Extract type from SPEC_QUAL_LIST or TYPE_NAME
+    // Extract type from SPEC_QUAL_LIST or handle struct/union specifiers
     for (auto child : typeNode->children) {
         if (child->name == "TYPE_SPECIFIER") {
             typeName = child->lexeme;
         }
+        else if (child->name == "TYPE_NAME") {
+            // e.g., typedef names like 'S' or 'Mode'
+            typeName = child->lexeme;
+        }
         else if (child->name == "SPEC_QUAL_LIST") {
             return getSizeofType(child);  // Recurse
+        }
+        else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
+            // sizeof(struct/union T)
+            string structName;
+            for (auto sChild : child->children) {
+                if (sChild->name == "IDENTIFIER") structName = sChild->lexeme;
+            }
+            if (!structName.empty()) {
+                Symbol* structSym = symbolTable.lookuph(structName);
+                if (structSym && (structSym->isStruct || structSym->isUnion)) {
+                    return getStructSize(structSym);
+                }
+            }
+            // Unknown struct name; fallback
         }
         else if (child->name == "POINTER") {
             pointerDepth++;
@@ -2483,6 +2624,35 @@ int IRGenerator::getSizeofType(Node* typeNode) {
     if (typeName == "float") return 4;
     if (typeName == "double") return 8;
     if (typeName == "bool") return 1;
+    
+    // sizeof(struct/union/typedef Name) when represented as TYPE_NAME
+    if (!typeName.empty()) {
+        string base = typeName;
+        // Direct struct/union spellings
+        if (base.rfind("struct ", 0) == 0) {
+            string tag = base.substr(7);
+            if (Symbol* tSym = symbolTable.lookuph(tag)) {
+                if (tSym->isStruct || tSym->isUnion) return getStructSize(tSym);
+            }
+        } else if (base.rfind("union ", 0) == 0) {
+            string tag = base.substr(6);
+            if (Symbol* tSym = symbolTable.lookuph(tag)) {
+                if (tSym->isStruct || tSym->isUnion) return getStructSize(tSym);
+            }
+        } else {
+            // Possibly a typedef or tag name without prefix
+            if (Symbol* tSym = symbolTable.lookuph(base)) {
+                if (tSym->isTypedef) {
+                    if (tSym->pointerDepth > 0) return 8;
+                    string aliased = tSym->aliasedType.empty() ? tSym->type : tSym->aliasedType;
+                    return getBaseTypeSize(aliased);
+                }
+                if (tSym->isStruct || tSym->isUnion) {
+                    return getStructSize(tSym);
+                }
+            }
+        }
+    }
     
     return 4;  // default
 }
@@ -2656,7 +2826,9 @@ if (exprNode->name == "POST_INC" || exprNode->name == "POST_DEC" ||
     // For identifiers, look up in symbol table
     if (exprNode->name == "IDENTIFIER") {
         string varName = exprNode->lexeme;
-        Symbol* sym = exprNode->symbol;
+        // Prefer the symbol attached by the analyzer; if missing (e.g., in some
+        // sizeof(expr) contexts), fall back to a direct lookup in the current symbol table.
+        Symbol* sym = exprNode->symbol ? exprNode->symbol : symbolTable.lookuph(varName);
         
         if (sym != NULL) {
             cout << "DEBUG sizeof: Found symbol " << varName 
@@ -2769,6 +2941,35 @@ if (exprNode->name == "BIT_AND" || exprNode->name == "BIT_OR" ||
 }
 
 int IRGenerator::getBaseTypeSize(const string& typeName) {
+    // Fast-path for obvious pointer spellings
+    if (typeName.find("*") != string::npos) return 8;
+
+    // Arrays encoded in type string, e.g., "int[10]" or "struct B[2][3]"
+    auto lb = typeName.find('[');
+    if (lb != string::npos) {
+        string base = typeName.substr(0, lb);
+        int elemSize = getBaseTypeSize(base);
+        long long total = elemSize;
+        size_t pos = lb;
+        while (pos < typeName.size()) {
+            size_t l = typeName.find('[', pos);
+            if (l == string::npos) break;
+            size_t r = typeName.find(']', l + 1);
+            if (r == string::npos) break;
+            string inside = typeName.substr(l + 1, r - l - 1);
+            if (inside.empty()) {
+                // Unknown size (e.g., []), treat as 0 for sizeof at compile time
+                // but don't crash; leave total as-is
+            } else {
+                int dim = stoi(inside);
+                if (dim > 0) total *= dim;
+            }
+            pos = r + 1;
+        }
+        return static_cast<int>(total);
+    }
+
+    // Built-in scalars
     if (typeName == "char") return 1;
     if (typeName == "short") return 2;
     if (typeName == "int") return 4;
@@ -2776,16 +2977,70 @@ int IRGenerator::getBaseTypeSize(const string& typeName) {
     if (typeName == "float") return 4;
     if (typeName == "double") return 8;
     if (typeName == "bool") return 1;
-    
-    return 4;  // default
+
+    // Handle struct/union spelled inline: "struct T" / "union U"
+    if (typeName.rfind("struct ", 0) == 0) {
+        string tag = typeName.substr(7);
+        if (Symbol* s = symbolTable.lookuph(tag)) {
+            if (s->isStruct) return getStructSize(s);
+        }
+        return 0; // unknown tag → size 0 (caller usually pads/alines after)
+    }
+    if (typeName.rfind("union ", 0) == 0) {
+        string tag = typeName.substr(6);
+        if (Symbol* s = symbolTable.lookuph(tag)) {
+            if (s->isUnion) return getStructSize(s);
+        }
+        return 0;
+    }
+
+    // Handle typedef names or tag names without the "struct/union" prefix
+    if (!typeName.empty()) {
+        Symbol* tSym = symbolTable.lookuph(typeName);
+        if (tSym) {
+            // Typedef to something
+            if (tSym->isTypedef) {
+                // Pointer typedef
+                if (tSym->pointerDepth > 0) return 8;
+                // Recurse into aliased type (could itself be struct/union or another typedef)
+                if (!tSym->aliasedType.empty()) {
+                    return getBaseTypeSize(tSym->aliasedType);
+                }
+                // Fallback to its declared type
+                if (!tSym->type.empty()) {
+                    return getBaseTypeSize(tSym->type);
+                }
+            }
+            // Direct struct/union tags by plain name
+            if (tSym->isStruct || tSym->isUnion) {
+                return getStructSize(tSym);
+            }
+        }
+    }
+
+    return 4;  // default to int-size when unknown
 }
 
 int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
     if (!structNode) return 0;
-    
-    Symbol* varSym = structNode->symbol;  // ✅ Use attached symbol
+
+    // First try to resolve via attached symbol
+    Symbol* varSym = structNode->symbol;
+    string resolvedStructType = "";
     
     if (!varSym) {
+        // Handle array element base: arr[i].member
+        if (structNode->name == "ARRAY_ACCESS") {
+            // Find the base identifier of the array
+            Node* base = structNode;
+            while (base && base->name == "ARRAY_ACCESS") {
+                if (base->children.empty()) break;
+                base = base->children[0];
+            }
+            if (base && base->name == "IDENTIFIER") {
+                varSym = base->symbol ? base->symbol : symbolTable.lookuph(base->lexeme);
+            }
+        }
     
       if (structNode->name == "FUNC_CALL") {
             if (!structNode->children.empty() && 
@@ -2835,14 +3090,23 @@ int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
         if (structNode->name == "IDENTIFIER") {
             varSym = symbolTable.lookuph(structNode->lexeme);
         }
+
+        // As an additional fallback, attempt to resolve the struct type from the lvalue expression itself
+        if (!varSym) {
+            resolvedStructType = resolveStructTypeFromLValue(structNode);
+        }
     }
     
-    if (!varSym) {
+    // Determine the struct/union type string to use
+    string structType;
+    if (varSym) {
+        structType = varSym->type;
+    } else if (!resolvedStructType.empty()) {
+        structType = resolvedStructType;
+    } else {
         cout << "WARNING: Cannot determine struct type" << endl;
         return 0;
     }
-    
-    string structType = varSym->type;
     
     // Remove "struct " or "union " prefix
     if (structType.find("struct ") == 0) {
@@ -2860,11 +3124,27 @@ int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
         return 0;
     }
     
-    // Calculate offset with alignment
+    // Calculate offset with alignment, preserving declaration order
     int offset = 0;
-    
-    for (const auto& member : structSym->structMembers) {
-        string memType = member.second;
+
+    std::vector<std::pair<std::string, std::string>> orderedMembers;
+    if (!structSym->structMemberOrder.empty()) {
+        std::set<std::string> seen;
+        for (const auto& name : structSym->structMemberOrder) {
+            if (seen.count(name)) continue;
+            auto it = structSym->structMembers.find(name);
+            if (it != structSym->structMembers.end()) {
+                orderedMembers.emplace_back(it->first, it->second);
+                seen.insert(name);
+            }
+        }
+    } else {
+        for (const auto& kv : structSym->structMembers) orderedMembers.emplace_back(kv.first, kv.second);
+    }
+
+    for (const auto& kv : orderedMembers) {
+        const std::string& name = kv.first;
+        const std::string& memType = kv.second;
         int memberSize = getBaseTypeSize(memType);
         int memberAlign = getMemberAlignment(memType);
         
@@ -2874,7 +3154,7 @@ int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
         }
         
         // Found the member we're looking for
-        if (member.first == memberName) {
+        if (name == memberName) {
             cout << "DEBUG: Member " << memberName << " found at offset " << offset << endl;
             return offset;
         }
@@ -2887,37 +3167,146 @@ int IRGenerator::getMemberOffset(Node* structNode, const string& memberName) {
     return 0;
 }
 
+// Resolve the struct/union type of an lvalue expression, handling nested member access and array elements
+std::string IRGenerator::resolveStructTypeFromLValue(Node* node) {
+    if (!node) return "";
+    
+    // Simple identifier: use its symbol type
+    if (node->name == "IDENTIFIER") {
+        Symbol* sym = node->symbol ? node->symbol : symbolTable.lookuph(node->lexeme);
+        if (sym) {
+            return sym->type; // May be "struct X", "union Y", or base type
+        }
+        return "";
+    }
+    
+    // Direct member access: base.member
+    if (node->name == "MEMBER_ACCESS" || node->name == "DIRECT_MEMBER" || node->name == "DOT") {
+        if (node->children.size() < 2) return "";
+        Node* base = node->children[0];
+        Node* mem = node->children[1];
+        if (!mem || mem->name != "IDENTIFIER") return "";
+        string baseType = resolveStructTypeFromLValue(base);
+        if (baseType.empty()) return "";
+        // Strip prefixes
+        string tag = baseType;
+        if (tag.rfind("struct ", 0) == 0) tag = tag.substr(7);
+        else if (tag.rfind("union ", 0) == 0) tag = tag.substr(6);
+        Symbol* structSym = symbolTable.lookuph(tag);
+        if (!structSym) return "";
+        auto it = structSym->structMembers.find(mem->lexeme);
+        if (it == structSym->structMembers.end()) return "";
+        return it->second; // Return the member's declared type (could be struct/union)
+    }
+    
+    // Pointer member access: base->member
+    if (node->name == "PTR_MEMBER_ACCESS" || node->name == "ARROW") {
+        if (node->children.size() < 2) return "";
+        Node* base = node->children[0];
+        Node* mem = node->children[1];
+        if (!mem || mem->name != "IDENTIFIER") return "";
+        // Base is a pointer to a struct/union; get its pointed-to type
+        string baseType = resolveStructTypeFromLValue(base);
+        if (baseType.empty()) return "";
+        string tag = baseType;
+        if (tag.rfind("struct ", 0) == 0) tag = tag.substr(7);
+        else if (tag.rfind("union ", 0) == 0) tag = tag.substr(6);
+        Symbol* structSym = symbolTable.lookuph(tag);
+        if (!structSym) return "";
+        auto it = structSym->structMembers.find(mem->lexeme);
+        if (it == structSym->structMembers.end()) return "";
+        return it->second;
+    }
+    
+    // Array element of struct type: arr[i]
+    if (node->name == "ARRAY_ACCESS") {
+        // Find base expression
+        Node* base = node;
+        while (base && base->name == "ARRAY_ACCESS") {
+            if (base->children.empty()) break;
+            base = base->children[0];
+        }
+        if (base) {
+            if (base->name == "IDENTIFIER") {
+                Symbol* sym = base->symbol ? base->symbol : symbolTable.lookuph(base->lexeme);
+                if (sym) return sym->type; // Element type
+            } else if (base->name == "MEMBER_ACCESS" || base->name == "PTR_MEMBER_ACCESS") {
+                // Resolve member type, then strip one array dimension if present
+                if (base->children.size() >= 2 && base->children[1]->name == "IDENTIFIER") {
+                    string baseStructType = resolveStructTypeFromLValue(base->children[0]);
+                    if (!baseStructType.empty()) {
+                        string tag = baseStructType;
+                        if (tag.rfind("struct ", 0) == 0) tag = tag.substr(7);
+                        else if (tag.rfind("union ", 0) == 0) tag = tag.substr(6);
+                        if (Symbol* s = symbolTable.lookuph(tag)) {
+                            auto it = s->structMembers.find(base->children[1]->lexeme);
+                            if (it != s->structMembers.end()) {
+                                string mType = it->second;
+                                // Strip one array dimension
+                                size_t lb = mType.find('[');
+                                if (lb != string::npos) {
+                                    return mType.substr(0, lb);
+                                }
+                                return mType;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return "";
+}
+
 int IRGenerator::getMemberAlignment(const string& typeName) {
-    // Check if it's a pointer
-    if (typeName.find("*") != string::npos) {
-        return 8;  // Pointers are 8-byte aligned
+    cout << "DEBUG align: type='" << typeName << "'" << endl;
+    // Pointers align to 8 (spellings with * or typedef pointers)
+    if (typeName.find("*") != string::npos) return 8;
+    // Arrays: alignment is alignment of element type
+    auto lb = typeName.find('[');
+    if (lb != string::npos) {
+        string base = typeName.substr(0, lb);
+        int a = getMemberAlignment(base);
+        cout << " -> align array base '" << base << "' = " << a << endl;
+        return a;
     }
-    
+    if (!typeName.empty()) {
+        Symbol* tSym = symbolTable.lookuph(typeName);
+        if (tSym && tSym->isTypedef && tSym->pointerDepth > 0) return 8;
+    }
+
     // Base type alignments (simplified - match size for basic types)
-    if (typeName == "char" || typeName == "bool") return 1;
-    if (typeName == "short") return 2;
-    if (typeName == "int" || typeName == "float") return 4;
-    if (typeName == "long" || typeName == "double") return 8;
-    
-    // For struct/union types, need to find their alignment
+    if (typeName == "char" || typeName == "bool") { cout << " -> align 1" << endl; return 1; }
+    if (typeName == "short") { cout << " -> align 2" << endl; return 2; }
+    if (typeName == "int" || typeName == "float") { cout << " -> align 4" << endl; return 4; }
+    if (typeName == "long" || typeName == "double") { cout << " -> align 8" << endl; return 8; }
+
+    // For struct/union or typedefs to them, use max member alignment
     string baseType = typeName;
-    if (baseType.find("struct ") == 0) {
-        baseType = baseType.substr(7);
-    } else if (baseType.find("union ") == 0) {
-        baseType = baseType.substr(6);
-    }
-    
+    if (baseType.rfind("struct ", 0) == 0) baseType = baseType.substr(7);
+    else if (baseType.rfind("union ", 0) == 0) baseType = baseType.substr(6);
+
     Symbol* typeSym = symbolTable.lookuph(baseType);
+    // If it's a typedef, resolve to underlying aliased type/tag
+    if (typeSym && typeSym->isTypedef) {
+        if (typeSym->pointerDepth > 0) return 8;
+        baseType = typeSym->aliasedType.empty() ? typeSym->type : typeSym->aliasedType;
+        if (baseType.rfind("struct ", 0) == 0) baseType = baseType.substr(7);
+        else if (baseType.rfind("union ", 0) == 0) baseType = baseType.substr(6);
+        typeSym = symbolTable.lookuph(baseType);
+    }
+
     if (typeSym && (typeSym->isStruct || typeSym->isUnion)) {
-        // Alignment of struct/union is the max alignment of its members
         int maxAlign = 1;
         for (const auto& member : typeSym->structMembers) {
             int memberAlign = getMemberAlignment(member.second);
             maxAlign = max(maxAlign, memberAlign);
         }
+        cout << " -> align struct/union tag '" << baseType << "' = " << maxAlign << endl;
         return maxAlign;
     }
-    
+    cout << " -> default align 4" << endl;
     return 4;  // Default alignment
 }
 
@@ -2943,12 +3332,29 @@ int IRGenerator::getStructSize(Symbol* structSym) {
         return maxSize;
     }
     
-    // For structs, sum with alignment padding
+    // For structs, sum with alignment padding (preserve declaration order)
     int totalSize = 0;
     int maxAlign = 1;
     
-    for (const auto& member : structSym->structMembers) {
-        string memType = member.second;
+    std::vector<std::pair<std::string, std::string>> orderedMembers;
+    if (!structSym->structMemberOrder.empty()) {
+        std::set<std::string> seen;
+        for (const auto& name : structSym->structMemberOrder) {
+            if (seen.count(name)) continue;
+            auto it = structSym->structMembers.find(name);
+            if (it != structSym->structMembers.end()) {
+                orderedMembers.emplace_back(it->first, it->second);
+                seen.insert(name);
+            }
+        }
+    } else {
+        for (const auto& kv : structSym->structMembers) {
+            orderedMembers.emplace_back(kv.first, kv.second);
+        }
+    }
+
+    for (const auto& kv : orderedMembers) {
+        const std::string& memType = kv.second;
         int memberSize = getBaseTypeSize(memType);
         int memberAlign = getMemberAlignment(memType);
         
@@ -3178,6 +3584,37 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
             }
         }
     }
+    // Member access: if the member is an array, return its element size
+    if ((ptrNode->name == "MEMBER_ACCESS" || ptrNode->name == "PTR_MEMBER_ACCESS") && ptrNode->children.size() >= 2) {
+        Node* base = ptrNode->children[0];
+        Node* memId = ptrNode->children[1];
+        if (memId && memId->name == "IDENTIFIER") {
+            // Resolve base struct type
+            string baseType = resolveStructTypeFromLValue(base);
+            if (!baseType.empty()) {
+                string tag = baseType;
+                if (tag.rfind("struct ", 0) == 0) tag = tag.substr(7);
+                else if (tag.rfind("union ", 0) == 0) tag = tag.substr(6);
+                if (Symbol* s = symbolTable.lookuph(tag)) {
+                    auto it = s->structMembers.find(memId->lexeme);
+                    if (it != s->structMembers.end()) {
+                        const string& mType = it->second;
+                        size_t lb2 = mType.find('[');
+                        if (lb2 != string::npos) {
+                            string elemBase = mType.substr(0, lb2);
+                            return getBaseTypeSize(elemBase);
+                        }
+                        // Pointer member: pointed-to base
+                        if (mType.find('*') != string::npos) {
+                            return getBaseTypeSize(mType);
+                        }
+                        // Otherwise, treat as scalar
+                        return getBaseTypeSize(mType);
+                    }
+                }
+            }
+        }
+    }
     
     // For dereference operations, reduce pointer level
     if (ptrNode->name == "UNARY_OP" && ptrNode->children.size() >= 2) {
@@ -3308,16 +3745,17 @@ string baseAddr = createTemp();
 
     if (baseExpr->name == "IDENTIFIER") {
         Symbol* sym = baseExpr->symbol;
+        string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
     if (sym && sym->isArray) {
         // Array variable: &array
-            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array address of array IDENTIFIER" << endl;
     } else if (sym && sym->pointerDepth > 0) {
         // Pointer variable: value is already an address
-            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
         cout << "DEBUG: Array address of pointer IDENTIFIER (using value)" << endl;
     } else {
-            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseExpr->lexeme);
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
         cout << "DEBUG: Array address of IDENTIFIER (default ADDRESS)" << endl;
     }
 }
@@ -3542,7 +3980,8 @@ string IRGenerator::generateLValueAddress(Node* lvalue) {
     // Identifier -> &var
     if (lvalue->name == "IDENTIFIER") {
         string addr = createTemp();
-        instructions.emplace_back(TACOp::ADDRESS, addr, lvalue->lexeme);
+        string varName = getUniqueNameFor(lvalue, lvalue->lexeme);
+        instructions.emplace_back(TACOp::ADDRESS, addr, varName);
         return addr;
     }
     // Dereference -> pointer expression value is already an address
@@ -3563,11 +4002,10 @@ string IRGenerator::generateLValueAddress(Node* lvalue) {
             Node* structNode = lvalue->children[0];
             string memberName = lvalue->children[1]->lexeme;
             int offset = getMemberOffset(structNode, memberName);
-            string structTemp = generateExpression(structNode);
-            string baseAddr = createTemp();
+            // Compute address of the base struct lvalue (not its value)
+            string baseAddr = generateLValueAddress(structNode);
             string offsetTemp = createTemp();
             string memberAddr = createTemp();
-            instructions.emplace_back(TACOp::ADDRESS, baseAddr, structTemp);
             instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
             instructions.emplace_back(TACOp::ADD, memberAddr, baseAddr, offsetTemp);
             return memberAddr;
