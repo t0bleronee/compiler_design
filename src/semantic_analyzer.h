@@ -127,4 +127,3 @@ bool isEnumDefinition(Node* enumSpecNode);
 
 
 #endif
-
