@@ -152,6 +152,9 @@ public:
     void writeToFile(const std::string& filename) const;
     
 private:
+    // String literal pooling: map label -> literal contents (raw)
+    int stringLiteralCounter = 0;
+    std::map<std::string, std::string> stringLiterals;
         // Resolve a stable, unique IR name for an identifier node using its attached Symbol
         std::string getUniqueNameFor(Node* idNode, const std::string& fallback);
 
