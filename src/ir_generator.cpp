@@ -162,7 +162,7 @@ case TACOp::PTR_MEMBER_STORE:
 
 IRGenerator::IRGenerator(SymbolTable& symTab) 
     : symbolTable(symTab), tempCounter(0), labelCounter(0), 
-      currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
+    currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
 
 // Produce a unique IR name for an identifier using its bound Symbol
 std::string IRGenerator::getUniqueNameFor(Node* idNode, const std::string& fallback) {
@@ -189,6 +189,9 @@ bool IRGenerator::generateIR(Node* ast) {
     labelCounter = 0;
     currentFunction = "";
      enumConstants.clear();  // Add this
+    // Reset string literal pool
+    stringLiteralCounter = 0;
+    stringLiterals.clear();
     
     // First pass: collect enum constants
     collectEnumConstants(ast);
@@ -495,9 +498,11 @@ string IRGenerator::generateExpression(Node* node) {
         return temp;
     }
     else if (node->name == "STRING_LITERAL") {
+    // Generate a label for this string literal and return its address as a CONST label
+    string label = "str" + to_string(++stringLiteralCounter);
+    stringLiterals[label] = node->lexeme; // keep raw (with quotes)
     string temp = createTemp();
-    // Store the string literal (including quotes for now)
-    instructions.emplace_back(TACOp::CONST, temp, node->lexeme);
+    instructions.emplace_back(TACOp::CONST, temp, label);
     return temp;
 }
     // Basic cast expression handling: evaluate inner expression and pass value through
@@ -1005,7 +1010,7 @@ void IRGenerator::generateDeclaration(Node* node) {
                             idNode = findIdentifierInArray(arrayNodeCandidate);
                         }
                     }
-                    if (arrayNodeCandidate && initNode->name == "INIT_LIST") {
+                    if (arrayNodeCandidate && (initNode->name == "INIT_LIST" || initNode->name == "STRING_LITERAL")) {
                         if (idNode) {
                             string arrayName = getUniqueNameFor(idNode, idNode->lexeme);
                             int declaredSize = -1; // legacy fallback for 1D explicit size only
@@ -1082,13 +1087,97 @@ void IRGenerator::generateDeclaration(Node* node) {
                                     return false;
                                 }
                                 for (auto c : n->children) {
-                                    if (c->name != "INIT_LIST") {
-                                        return true; // scalar before innermost
+                                    if (c->name == "INIT_LIST") {
+                                        if (needsFlatten(c, dimIdx + 1)) return true;
+                                        continue;
                                     }
-                                    if (needsFlatten(c, dimIdx + 1)) return true;
+                                    // Allow string literals to initialize a whole row at the next (last) dimension for char arrays
+                                    if (c->name == "STRING_LITERAL" && elemSize == 1 && dimIdx == static_cast<int>(dims.size()) - 2) {
+                                        continue;
+                                    }
+                                    return true; // other scalars before innermost → flatten
                                 }
                                 return false;
                             };
+
+                            // Special-case: string literal initializer for char arrays
+                            if (initNode->name == "STRING_LITERAL") {
+                                // Only handle 1-D char arrays here
+                                int totalElements = 0;
+                                if (!dims.empty()) {
+                                    totalElements = dims[0] > 0 ? dims[0] : 0;
+                                } else if (declaredSize > 0) {
+                                    totalElements = declaredSize;
+                                }
+                                // Extract string contents without quotes and handle a few escapes
+                                string raw = initNode->lexeme;
+                                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+                                    raw = raw.substr(1, raw.size() - 2);
+                                }
+                                string decoded;
+                                for (size_t i = 0; i < raw.size(); ++i) {
+                                    char c = raw[i];
+                                    if (c == '\\' && i + 1 < raw.size()) {
+                                        char n = raw[i+1];
+                                        if (n == 'n') { decoded.push_back('\n'); i++; continue; }
+                                        if (n == 't') { decoded.push_back('\t'); i++; continue; }
+                                        if (n == 'r') { decoded.push_back('\r'); i++; continue; }
+                                        if (n == '0') { decoded.push_back('\0'); i++; continue; }
+                                        if (n == '"') { decoded.push_back('"'); i++; continue; }
+                                        if (n == '\\') { decoded.push_back('\\'); i++; continue; }
+                                        // Fallback: keep as-is
+                                    }
+                                    decoded.push_back(c);
+                                }
+                                int writeCount = static_cast<int>(decoded.size());
+                                // Emit characters up to array size - 1 (reserve for null), if size known
+                                int limit = totalElements > 0 ? max(0, totalElements - 1) : writeCount;
+                                int actualChars = (totalElements > 0) ? min(writeCount, limit) : writeCount;
+                                for (int i = 0; i < actualChars; ++i) {
+                                    string idxTemp = createTemp();
+                                    string offTemp = createTemp();
+                                    string addrTemp = createTemp();
+                                    string valTemp = createTemp();
+                                    instructions.emplace_back(TACOp::CONST, idxTemp, to_string(i));
+                                    instructions.emplace_back(TACOp::MUL, offTemp, idxTemp, elemSizeTemp);
+                                    instructions.emplace_back(TACOp::ADD, addrTemp, baseAddr, offTemp);
+                                    instructions.emplace_back(TACOp::CONST, valTemp, to_string(static_cast<unsigned char>(decoded[i])));
+                                    instructions.emplace_back(TACOp::STORE, addrTemp, valTemp);
+                                }
+                                // Null-terminate if space allows
+                                if (totalElements > 0 && actualChars < totalElements) {
+                                    string idxTemp = createTemp();
+                                    string offTemp = createTemp();
+                                    string addrTemp = createTemp();
+                                    string zeroTemp = createTemp();
+                                    instructions.emplace_back(TACOp::CONST, idxTemp, to_string(actualChars));
+                                    instructions.emplace_back(TACOp::MUL, offTemp, idxTemp, elemSizeTemp);
+                                    instructions.emplace_back(TACOp::ADD, addrTemp, baseAddr, offTemp);
+                                    instructions.emplace_back(TACOp::CONST, zeroTemp, "0");
+                                    instructions.emplace_back(TACOp::STORE, addrTemp, zeroTemp);
+                                }
+                                // Zero-fill remaining elements if array larger than string+null
+                                if (totalElements > 0) {
+                                    int start = min(totalElements, actualChars + 1);
+                                    int count = totalElements - start;
+                                    if (count > 0) {
+                                        string zeroTemp = createTemp();
+                                        instructions.emplace_back(TACOp::CONST, zeroTemp, "0");
+                                        for (int k = 0; k < count; ++k) {
+                                            int idx = start + k;
+                                            string idxTemp = createTemp();
+                                            string offTemp = createTemp();
+                                            string addrTemp = createTemp();
+                                            instructions.emplace_back(TACOp::CONST, idxTemp, to_string(idx));
+                                            instructions.emplace_back(TACOp::MUL, offTemp, idxTemp, elemSizeTemp);
+                                            instructions.emplace_back(TACOp::ADD, addrTemp, baseAddr, offTemp);
+                                            instructions.emplace_back(TACOp::STORE, addrTemp, zeroTemp);
+                                        }
+                                    }
+                                }
+                                // Done handling string literal init
+                                continue;
+                            }
 
                             bool useFlatten = dims.empty() || needsFlatten(initNode, 0);
                             if (useFlatten) {
@@ -1161,6 +1250,46 @@ void IRGenerator::generateDeclaration(Node* node) {
                                             // not innermost: must be INIT_LIST per useFlatten=false
                                             if (child->name == "INIT_LIST") {
                                                 emitNested(child, dimIdx + 1, baseElem + processed * stride);
+                                            } else if (child->name == "STRING_LITERAL" && elemSize == 1 && dimIdx == (int)dims.size() - 2) {
+                                                // Handle string literal initializing a whole char row
+                                                int rowLen = dims[dimIdx + 1];
+                                                string raw = child->lexeme;
+                                                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+                                                    raw = raw.substr(1, raw.size() - 2);
+                                                }
+                                                string decoded;
+                                                for (size_t k = 0; k < raw.size(); ++k) {
+                                                    char c = raw[k];
+                                                    if (c == '\\' && k + 1 < raw.size()) {
+                                                        char n = raw[k+1];
+                                                        if (n == 'n') { decoded.push_back('\n'); ++k; continue; }
+                                                        if (n == 't') { decoded.push_back('\t'); ++k; continue; }
+                                                        if (n == 'r') { decoded.push_back('\r'); ++k; continue; }
+                                                        if (n == '0') { decoded.push_back('\0'); ++k; continue; }
+                                                        if (n == '"') { decoded.push_back('"'); ++k; continue; }
+                                                        if (n == '\\') { decoded.push_back('\\'); ++k; continue; }
+                                                    }
+                                                    decoded.push_back(c);
+                                                }
+                                                int startElem = baseElem + processed * stride; // row start
+                                                int actualChars = rowLen > 0 ? std::min((int)decoded.size(), std::max(0, rowLen - 1)) : (int)decoded.size();
+                                                for (int j = 0; j < actualChars; ++j) {
+                                                    string chTemp = createTemp();
+                                                    instructions.emplace_back(TACOp::CONST, chTemp, to_string((unsigned char)decoded[j]));
+                                                    emitStoreAtIndex(startElem + j, chTemp);
+                                                }
+                                                // Null terminate if room
+                                                if (rowLen > 0 && actualChars < rowLen) {
+                                                    string zeroTemp = createTemp();
+                                                    instructions.emplace_back(TACOp::CONST, zeroTemp, "0");
+                                                    emitStoreAtIndex(startElem + actualChars, zeroTemp);
+                                                }
+                                                // Zero-fill remainder of the row
+                                                if (rowLen > 0) {
+                                                    int filled = std::min(rowLen, actualChars + 1);
+                                                    int rem = rowLen - filled;
+                                                    emitZeroRange(startElem + filled, rem);
+                                                }
                                             }
                                         }
                                     }
@@ -2556,11 +2685,33 @@ string IRGenerator::generateSizeof(Node* node) {
         size = getSizeofType(typeNode);
     }
     else if (node->name == "SIZEOF") {
-        // sizeof(expr): SIZEOF -> EXPR_LIST -> expression
-        Node* exprList = node->children[0];
-        if (exprList && !exprList->children.empty()) {
-            Node* expr = exprList->children[0];
+        // sizeof(expr): child may be EXPR_LIST -> expr OR a direct expression node
+        Node* child = node->children[0];
+        Node* expr = child;
+        if (child && child->name == "EXPR_LIST" && !child->children.empty()) {
+            expr = child->children[0];
+        }
+        if (expr) {
             size = getSizeofExpression(expr);
+            // Fallback: if for some reason size stayed 0, try a direct symbol-based computation
+            if (size == 0 && expr->name == "IDENTIFIER") {
+                Symbol* sym = expr->symbol ? expr->symbol : symbolTable.lookuph(expr->lexeme);
+                if (sym) {
+                    if (sym->isArray && !sym->arrayDimensions.empty()) {
+                        // Compute total array size: product(dims) * sizeof(element)
+                        int elem = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+                        long long total = elem;
+                        for (int dim : sym->arrayDimensions) {
+                            if (dim > 0) total *= dim;
+                        }
+                        size = static_cast<int>(total);
+                    } else if (sym->pointerDepth > 0) {
+                        size = 8;
+                    } else {
+                        size = getBaseTypeSize(sym->type);
+                    }
+                }
+            }
         }
     }
     
@@ -2659,6 +2810,11 @@ int IRGenerator::getSizeofType(Node* typeNode) {
 
 int IRGenerator::getSizeofExpression(Node* exprNode) {
     if (!exprNode) return 4;
+
+    // Unwrap trivial EXPR_LIST wrappers (e.g., SIZEOF -> EXPR_LIST -> expr)
+    while (exprNode && exprNode->name == "EXPR_LIST" && !exprNode->children.empty()) {
+        exprNode = exprNode->children[0];
+    }
     
     // ✅ FIX: Handle member access (p.x or ptr->member)
     if (exprNode->name == "MEMBER_ACCESS" || exprNode->name == "PTR_MEMBER_ACCESS") {
@@ -2724,38 +2880,61 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
         return 4;  // fallback
     }
     
-    // ✅ Handle array access (arr[i])
+    // ✅ Handle array access (arr[i]) and nested accesses (arr[i][j]...)
     if (exprNode->name == "ARRAY_ACCESS") {
         if (exprNode->children.empty()) return 4;
         
-        Node* arrayBase = exprNode->children[0];
-        
-        // Find the base identifier
-        while (arrayBase && arrayBase->name == "ARRAY_ACCESS") {
-            if (arrayBase->children.empty()) break;
-            arrayBase = arrayBase->children[0];
+        // Count how many ARRAY_ACCESS levels are applied and find the base
+        int levels = 1; // current ARRAY_ACCESS is one level
+        Node* base = exprNode->children[0];
+        while (base && base->name == "ARRAY_ACCESS") {
+            levels++;
+            if (base->children.empty()) break;
+            base = base->children[0];
         }
         
-        if (arrayBase && arrayBase->name == "IDENTIFIER") {
-            Symbol* sym = arrayBase->symbol;
-            if (sym) {
-                // Array access gives element type. For arrays-of-pointers, element size is pointer size (8).
-                int elemSize = 4;
-                if (sym->isArray) {
-                    elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
-                } else if (sym->pointerDepth > 0) {
-                    // Pointer variable: element is the pointed-to base type
-                    elemSize = getBaseTypeSize(sym->type);
-                } else {
-                    elemSize = getBaseTypeSize(sym->type);
+        if (!base) return 4;
+        
+        // Identifier-backed array variable
+        if (base->name == "IDENTIFIER") {
+            Symbol* sym = base->symbol ? base->symbol : symbolTable.lookuph(base->lexeme);
+            if (!sym) return 4;
+            if (!sym->isArray) {
+                // Base is not an array; treat as pointer indexing
+                // sizeof(*(ptr + ...)) semantics: size of pointed-to type
+                int pDepth = sym->pointerDepth;
+                if (pDepth > 1) return 8; // still pointer after deref(s)
+                if (pDepth == 1) return getBaseTypeSize(sym->type);
+                return getBaseTypeSize(sym->type);
+            }
+            const vector<int>& dims = sym->arrayDimensions;
+            int elemBaseSize = getBaseTypeSize(sym->type);
+            int elemPtrDepth = sym->pointerDepth; // pointer depth on element type
+            
+            if (levels < (int)dims.size()) {
+                // Still pointing to a subarray of remaining dimensions
+                long long size = elemBaseSize;
+                for (size_t i = levels; i < dims.size(); ++i) {
+                    int dim = dims[i];
+                    if (dim > 0) size *= dim;
                 }
-                
-                // If multi-dimensional, this still returns the single element size
-                return elemSize;
+                return (int)size;
+            } else if (levels == (int)dims.size()) {
+                // Exactly at the array element
+                if (elemPtrDepth > 0) return 8; // element is a pointer object
+                return elemBaseSize;
+            } else {
+                // Indexed beyond array dims: indexing into the pointer element
+                int extra = levels - (int)dims.size();
+                int remainingPtr = max(0, elemPtrDepth - extra);
+                if (remainingPtr > 0) return 8; // still a pointer
+                return elemBaseSize; // fully dereferenced to base type
             }
         }
         
-        return 4;  // fallback
+        // For other base expressions (e.g., member producing array/pointer), fallback to pointed-to size
+        int elemSize = getPointedToSize(base);
+        return elemSize <= 0 ? 4 : elemSize;
     }
     
     // ✅ Handle pointer dereference (*ptr)
@@ -2777,6 +2956,18 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
                         return 8;
                     }
                 }
+            } else if (operand->name == "UNARY_OP" && operand->children.size() >= 2) {
+                // Handle sizeof(*(&X)) -> sizeof(X)
+                Node* innerOp = operand->children[0];
+                Node* innerExpr = operand->children[1];
+                string innerOpStr = innerOp->name.empty() ? innerOp->lexeme : innerOp->name;
+                if (innerOpStr == "&") {
+                    return getSizeofExpression(innerExpr);
+                }
+            } else {
+                // General-case: sizeof(*<expr>) where <expr> yields a pointer (e.g., array access result)
+                int ptSize = getPointedToSize(operand);
+                if (ptSize > 0) return ptSize;
             }
         }
          else if (opStr == "&") {
@@ -2875,13 +3066,29 @@ if (sym->isStruct || sym->isUnion) {
     // ✅ For other expression types, try to determine type
    
     if (exprNode->name == "STRING_LITERAL") {
-    string str = exprNode->lexeme;
-    // Remove surrounding quotes
-    if (str.length() >= 2 && str.front() == '"' && str.back() == '"') {
-        return str.length() - 2 + 1;  // -2 for quotes, +1 for null terminator
+        string raw = exprNode->lexeme;
+        // Remove quotes
+        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+            raw = raw.substr(1, raw.size() - 2);
+        }
+        // Decode a subset of common escapes consistent with initializer handling
+        string decoded;
+        for (size_t i = 0; i < raw.size(); ++i) {
+            char c = raw[i];
+            if (c == '\\' && i + 1 < raw.size()) {
+                char n = raw[i+1];
+                if (n == 'n') { decoded.push_back('\n'); ++i; continue; }
+                if (n == 't') { decoded.push_back('\t'); ++i; continue; }
+                if (n == 'r') { decoded.push_back('\r'); ++i; continue; }
+                if (n == '0') { decoded.push_back('\0'); ++i; continue; }
+                if (n == '"') { decoded.push_back('"'); ++i; continue; }
+                if (n == '\\') { decoded.push_back('\\'); ++i; continue; }
+                // Fallback: treat as literal following char
+            }
+            decoded.push_back(c);
+        }
+        return static_cast<int>(decoded.size()) + 1; // +1 for null terminator
     }
-    return str.length() + 1;
-}
     if (exprNode->name == "INTEGER_CONSTANT") {
         return 4;  // int
     }
@@ -3500,9 +3707,13 @@ int IRGenerator::getInnerElementSize(Node* arrayNode) {
     
     Symbol* sym = base->symbol;
     if (!sym) return 4;
-    
-    // Return the base element size; if the element type is a pointer, use pointer size
-    return (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+    // We are computing the size for the NEXT index after having already indexed once
+    // into the array in generateMultiDimArrayAddress. Therefore, regardless of whether
+    // the array's element type is a pointer (e.g., char* arr[]), the "inner element"
+    // accessed by the subsequent index is the base type that the pointer points to
+    // (char in the example) or simply the array's base scalar type for true multi-d arrays.
+    // Hence, always return the base type size here.
+    return getBaseTypeSize(sym->type);
 }
 
 vector<int> IRGenerator::getArrayDimensions(Symbol* arraySym) {
@@ -3523,6 +3734,8 @@ bool IRGenerator::isPointerType(Node* node) {
             return sym->pointerDepth > 0;
         }
     }
+    // String literals decay to char* in expressions
+    if (node->name == "STRING_LITERAL") return true;
     
     // If it's an expression, try to infer type
     if (node->name == "UNARY_OP" && node->children.size() >= 2) {
@@ -3551,14 +3764,69 @@ int IRGenerator::getPointerDepth(Node* node) {
             return sym->pointerDepth;
         }
     }
+    if (node->name == "STRING_LITERAL") return 1;
     
     return 0;
 }
 int IRGenerator::getPointedToSize(Node* ptrNode) {
     if (!ptrNode) return 4;
+    // String literals behave like pointer to char
+    if (ptrNode->name == "STRING_LITERAL") return 1;
     
+    // Handle array access expressions: result may be a pointer-valued element (e.g., arr[i] where arr is array of pointers)
+    if (ptrNode->name == "ARRAY_ACCESS" && !ptrNode->children.empty()) {
+        // Count access levels and find base
+        int levels = 1;
+        Node* base = ptrNode->children[0];
+        while (base && base->name == "ARRAY_ACCESS") {
+            levels++;
+            if (base->children.empty()) break;
+            base = base->children[0];
+        }
+        if (base && base->name == "IDENTIFIER") {
+            Symbol* sym = base->symbol ? base->symbol : symbolTable.lookuph(base->lexeme);
+            if (sym) {
+                const vector<int>& dims = sym->arrayDimensions;
+                int elemPtrDepth = sym->pointerDepth;
+                string elemTypeStr = sym->type;
+                // If indexing exactly to the element and the element is a pointer, return size of what it points to
+                if (levels == (int)dims.size()) {
+                    if (elemPtrDepth > 1) return 8; // still pointer after one deref
+                    if (elemPtrDepth == 1) {
+                        // Compute base type by stripping one '*'
+                        string baseType = elemTypeStr;
+                        size_t star = baseType.find('*');
+                        if (star != string::npos) {
+                            baseType.erase(star, 1);
+                        }
+                        // Trim any residual spaces
+                        while (!baseType.empty() && baseType.back() == ' ') baseType.pop_back();
+                        while (!baseType.empty() && baseType.front() == ' ') baseType.erase(baseType.begin());
+                        return getBaseTypeSize(baseType);
+                    }
+                    // Element is not a pointer; pointed-to size of a non-pointer is its own base size
+                    return getBaseTypeSize(elemTypeStr);
+                }
+                // If indexing beyond the array dimensions, consume pointer levels from the element type
+                if (levels > (int)dims.size()) {
+                    int extra = levels - (int)dims.size();
+                    int remainingPtr = max(0, elemPtrDepth - extra);
+                    if (remainingPtr > 0) return 8; // still a pointer
+                    // Fully dereferenced to base type
+                    return getBaseTypeSize(elemTypeStr);
+                }
+                // If still within array (subarray result), the decay-to-pointer would point to its element
+                // In that case, the pointed-to size is the size of one element of that subarray
+                // which is either pointer-sized (if element is pointer) or the base element size.
+                if (elemPtrDepth > 0) return 8; // subarray of pointers
+                return getBaseTypeSize(elemTypeStr);
+            }
+        }
+    }
+
     if (ptrNode->name == "IDENTIFIER") {
-        Symbol* sym = ptrNode->symbol;
+        // Prefer attached symbol; fall back to lookup by name if missing
+        Symbol* sym = ptrNode->symbol ? ptrNode->symbol : symbolTable.lookuph(ptrNode->lexeme);
         if (sym) {
             cout << "DEBUG: getPointedToSize for " << sym->name 
                  << " pointerDepth=" << sym->pointerDepth << endl;
@@ -3569,9 +3837,17 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                     cout << "DEBUG: Array of pointers, returning 8" << endl;
                     return 8;
                 }
-                int size = getBaseTypeSize(sym->type);
-                cout << "DEBUG: Array of base type, base size = " << size << endl;
-                return size;
+                // If multi-dimensional array, the element is the subarray of remaining dims
+                int elemSize = getBaseTypeSize(sym->type);
+                if (!sym->arrayDimensions.empty()) {
+                    // Multiply by all dims except the first
+                    for (size_t i = 1; i < sym->arrayDimensions.size(); ++i) {
+                        int dim = sym->arrayDimensions[i];
+                        if (dim > 0) elemSize *= dim;
+                    }
+                }
+                cout << "DEBUG: Array element size (considering remaining dims) = " << elemSize << endl;
+                return elemSize;
             }
             // Pointers: if depth > 1, still a pointer (8); if depth == 1, base type size
             if (sym->pointerDepth > 1) {
@@ -4071,4 +4347,3 @@ int IRGenerator::getIncrementStepForLValue(Node* lvalue) {
     // Member values: conservatively treat as scalar (1). For pointer members, they will be handled via identifier path when accessed directly.
     return 1;
 }
-
