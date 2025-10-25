@@ -243,7 +243,19 @@ else if (node->name == "WHILE_STMT" || node->name == "DO_WHILE_STMT" ||
         return;
     }
     else {
-        // FOR_RANGE_STMT, UNTIL_STMT: default traversal
+        // FOR_RANGE_STMT, UNTIL_STMT: validate condition if present, then default traversal
+        if (node->name == "FOR_RANGE_STMT") {
+            if (!node->children.empty()) {
+                // Typically, child[0] would be the range expression; if it represents a condition, validate
+                checkConditionExpression(node->children[0]);
+            }
+        }
+        if (node->name == "UNTIL_STMT") {
+            if (!node->children.empty()) {
+                // Assume first child is the condition for UNTIL
+                checkConditionExpression(node->children[0]);
+            }
+        }
         for (auto child : node->children) {
             traverseAST(child);
         }
@@ -967,14 +979,42 @@ bool SemanticAnalyzer::isDeclarationContext(Node* node) {
         }
     }
     
-    // Treat identifiers that are part of a declaration (including struct members)
-    // as declaration context to avoid spurious 'undeclared' errors.
+    // More precise check: Only treat as declaration context if this IDENTIFIER
+    // is within the LHS (declarator) of an initializer inside a declaration.
+    // Identifiers used in the RHS of an initializer should be treated as usages.
     Node* anc = node;
+    Node* nearestAssign = nullptr;
+    Node* nearestDecl = nullptr;
     while (anc) {
-        if (anc->name == "DECLARATION" || anc->name == "INIT_DECL_LIST" || anc->name == "DECLARATOR" || anc->name == "ARRAY") {
-            return true;
-        }
+        if (!nearestDecl && anc->name == "DECLARATION") nearestDecl = anc;
+        if (!nearestAssign && anc->name == "ASSIGN_EXPR") nearestAssign = anc;
         anc = anc->parent;
+    }
+    if (nearestDecl) {
+        // If inside an ASSIGN_EXPR, check whether we're on the LHS subtree
+        if (nearestAssign && nearestAssign->children.size() >= 1) {
+            Node* lhsSubtree = nearestAssign->children[0];
+            // Walk up from node to see if we hit the LHS subtree root first
+            Node* cur = node;
+            while (cur && cur != nearestAssign) {
+                if (cur == lhsSubtree) {
+                    return true;  // Part of declarator (LHS)
+                }
+                cur = cur->parent;
+            }
+            return false; // Inside declaration but not on LHS → usage context
+        }
+        // No ASSIGN_EXPR ancestor: treat as declaration context only if it's
+        // within a DECLARATOR or ARRAY declarator subtree
+        anc = node;
+        while (anc && anc != nearestDecl) {
+            if (anc->name == "DECLARATOR" || anc->name == "ARRAY") {
+                return true;
+            }
+            anc = anc->parent;
+        }
+        // Otherwise, it's likely a usage within the declaration statement
+        return false;
     }
     return false;
 }
@@ -1143,7 +1183,7 @@ void SemanticAnalyzer::checkArrayAccess(Node* node) {
         }
     }
     
-    // Now current should be the base (IDENTIFIER)
+    // Now current should be the base (IDENTIFIER or other expr like STRING_LITERAL)
     if (current && current->name == "IDENTIFIER") {
         arrayName = current->lexeme;
         sym = symbolTable.lookup(arrayName);
@@ -1158,18 +1198,31 @@ void SemanticAnalyzer::checkArrayAccess(Node* node) {
             addError("Subscripted value '" + arrayName + "' is not an array or pointer");
             return;
         }
-        
-        // Check dimension count
-        if (sym->isArray) {
-            int declaredDimensions = sym->arrayDimensions.size();
-            
-            if (accessedDimensions > declaredDimensions) {
+
+        // Simulate stepwise indexing: consume array dimensions first, then pointer levels
+        int remainingArrayDims = sym->isArray ? static_cast<int>(sym->arrayDimensions.size()) : 0;
+        int remainingPtrDepth = sym->pointerDepth;
+        for (int i = 0; i < accessedDimensions; ++i) {
+            if (remainingArrayDims > 0) {
+                remainingArrayDims--;  // consume an array dimension
+            } else if (remainingPtrDepth > 0) {
+                remainingPtrDepth--;   // consume a pointer level (arr of pointers case)
+            } else {
                 addError("Too many array subscripts for '" + arrayName + 
-                         "' (declared with " + to_string(declaredDimensions) + 
-                         " dimension(s), accessed with " + to_string(accessedDimensions) + ")");
+                         "' (no remaining array dimensions or pointer levels to index)");
                 return;
             }
         }
+    } else if (current) {
+        // Base is not an identifier (e.g., string literal). Validate it's a pointer-like expr.
+        string baseType = getExpressionType(current);
+        // Allow if it's a pointer OR an encoded array type like "struct B[2]"
+        bool isEncodedArrayType = (baseType.find('[') != string::npos && baseType.find(']') != string::npos);
+        if (!isPointerType(baseType) && !isEncodedArrayType) {
+            addError("Subscripted value is not an array or pointer");
+            return;
+        }
+        // No symbol-based bounds checks when base is not a declared array.
     }
     
     // Check index type
@@ -1244,12 +1297,20 @@ void SemanticAnalyzer::checkUnaryOperation(Node* node) {
         if (!isNumericType(operandType)) {
             addError("Invalid operand to unary " + opNode->name + " (have '" + operandType + "')");
         }
+        // Disallow unary + / - on boolean explicitly
+        else if (operandType == "bool") {
+            addError("Invalid unary operation '" + opNode->name + "' on boolean type");
+        }
     }
   
 }
 
 string SemanticAnalyzer::getExpressionType(Node* node) {
     if (!node) return "";
+    // Unwrap trivial EXPR_LIST wrappers to reach the underlying expression
+    while (node && node->name == "EXPR_LIST" && !node->children.empty()) {
+        node = node->children[0];
+    }
     
   
      if (node->name == "IDENTIFIER") {
@@ -1357,7 +1418,12 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
     // Handle dereference - removes pointer level
     else if (node->name == "UNARY_OP" && node->children.size() >= 2) {
         if (node->children[0]->name == "*") {
-            string operandType = getExpressionType(node->children[1]);
+            Node* operandNode = node->children[1];
+            // Unwrap EXPR_LIST for operand if present
+            if (operandNode && operandNode->name == "EXPR_LIST" && !operandNode->children.empty()) {
+                operandNode = operandNode->children[0];
+            }
+            string operandType = getExpressionType(operandNode);
             if (operandType.length() > 0 && operandType.back() == '*') {
                 return operandType.substr(0, operandType.length() - 1);
             }
@@ -1365,7 +1431,11 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
         
         // Handle address-of - adds pointer level
         else if (node->children[0]->name == "&") {
-          string operandType = getExpressionType(node->children[1]);
+          Node* operandNode = node->children[1];
+          if (operandNode && operandNode->name == "EXPR_LIST" && !operandNode->children.empty()) {
+              operandNode = operandNode->children[0];
+          }
+          string operandType = getExpressionType(operandNode);
         
         // Handle address-of operator: add one pointer level
         if (!operandType.empty()) {
@@ -1381,6 +1451,24 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
         // Unary +/- keeps the type
         else if (node->children[0]->name == "+" || node->children[0]->name == "-") {
             return getExpressionType(node->children[1]);
+        }
+        // Logical NOT (!) yields a boolean type regardless of operand's scalar type
+        else if (node->children[0]->name == "!") {
+            return "bool";
+        }
+        // Bitwise NOT (~) yields an integer type; prefer preserving operand's integer type
+        else if (node->children[0]->name == "~") {
+            // Determine the operand type and, if it's an integer type, preserve it
+            Node* operandNode = node->children[1];
+            if (operandNode && operandNode->name == "EXPR_LIST" && !operandNode->children.empty()) {
+                operandNode = operandNode->children[0];
+            }
+            string opType = getExpressionType(operandNode);
+            if (!opType.empty() && isIntegerType(opType)) {
+                return opType;
+            }
+            // Fallback: treat as int if we can't determine a specific integer type
+            return "int";
         }
     }
     // Assignment expression - returns type of LHS
@@ -1772,10 +1860,12 @@ bool SemanticAnalyzer::isStructMemberDeclaration(Node* node) {
 
 
 bool SemanticAnalyzer::isIntegerType(const std::string& type) {
+    // Treat boolean as a distinct logical type (not an integer) for semantics.
+    // This ensures bitwise ops, modulo, and arithmetic integer-only checks exclude 'bool'.
     return type == "int" || type == "short" || type == "long" || type == "long long" ||
            type == "unsigned" || type == "unsigned int" || type == "unsigned short" || 
            type == "unsigned long" || type == "signed" || type == "char" ||
-           type == "unsigned char" || type == "signed char" || type == "bool";
+           type == "unsigned char" || type == "signed char"; // intentionally excludes bool
 }
 bool SemanticAnalyzer::isNumericType(const std::string& type) {
     return isIntegerType(type) || type == "float" || type == "double" || type.rfind("enum ", 0) == 0;;
@@ -2005,6 +2095,12 @@ void SemanticAnalyzer::checkArithmeticOperation(Node* node) {
     else if (node->name == "MUL_EXPR") operation = "*";
     else if (node->name == "DIV_EXPR") operation = "/";
     else if (node->name == "MOD_EXPR") operation = "%";
+
+    // Disallow boolean arithmetic explicitly for all arithmetic ops
+    if (leftType == "bool" || rightType == "bool") {
+        addError("Invalid arithmetic on boolean type with '" + operation + "' (operands must be non-bool numeric types)");
+        return;
+    }
     
     // Modulo requires integer types (no pointers, no floats)
     if (node->name == "MOD_EXPR") {
@@ -2138,6 +2234,10 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     
     Node* lhs = node->children[0];
     Node* rhs = node->children[2];  // children[1] is the operator
+    string op;
+    if (node->children[1]) {
+        op = node->children[1]->lexeme; // e.g., '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>='
+    }
 
     // (debug traces removed)
 
@@ -2157,12 +2257,62 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     
     // Skip if we couldn't determine types
     if (lhsType.empty() || rhsType.empty()) return;
+
+    // Handle compound assignment operators with proper arithmetic semantics
+    if (op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" ||
+        op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") {
+        // Disallow boolean participation in compound arithmetic/bitwise
+        if (lhsType == "bool" || rhsType == "bool") {
+            addError("Invalid compound operation '" + op + "' with boolean operand(s)");
+            return;
+        }
+        // Pointer rules
+        if (isPointerType(lhsType)) {
+            if (op == "+=" || op == "-=") {
+                // pointer += integer is allowed; float/double and pointer RHS are invalid
+                if (!isIntegerType(rhsType)) {
+                    addError("Invalid operation: cannot apply '" + op + "' with pointer '" + lhsType + "' and non-integer '" + rhsType + "'");
+                }
+                return;
+            }
+            // Any other compound op on pointer is invalid
+            addError("Invalid operation: cannot apply '" + op + "' to pointer type '" + lhsType + "'");
+            return;
+        }
+        // Numeric requirements for specific ops
+        if (op == "%=") {
+            if (!isIntegerType(lhsType) || !isIntegerType(rhsType)) {
+                addError("Invalid operands for '%=' (requires integer types)");
+                return;
+            }
+            return; // ok
+        }
+        if (op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") {
+            if (!isIntegerType(lhsType) || !isIntegerType(rhsType)) {
+                addError("Invalid operands for bitwise compound op '" + op + "' (requires integer types)");
+                return;
+            }
+            return; // ok
+        }
+        // For +=, -=, *=, /= on numerics, ensure both are numeric (non-pointer) types
+        if (!isNumericType(lhsType) || !isNumericType(rhsType)) {
+            addError("Type mismatch in compound arithmetic: '" + lhsType + "' " + op + " '" + rhsType + "'");
+            return;
+        }
+        return; // ok
+    }
     
     // Exact match is always OK
     if (lhsType == rhsType) return;
     
     // Numeric types can be assigned to each other (with implicit conversion)
     if (isNumericType(lhsType) && isNumericType(rhsType)) return;
+
+    // Allow assignments between boolean and integer types (implicit conversion)
+    if ((lhsType == "bool" && isIntegerType(rhsType)) ||
+        (rhsType == "bool" && isIntegerType(lhsType))) {
+        return;
+    }
     
       if ((lhsType.find("enum ") == 0 && isIntegerType(rhsType)) ||
         (rhsType.find("enum ") == 0 && isIntegerType(lhsType))) {
@@ -2357,6 +2507,10 @@ int SemanticAnalyzer::countPointerLevel(const string& type) {
     if (!operandType.empty() && !isNumericType(operandType) && !isPointerType(operandType)) {
         addError("Invalid operand to " + operation + " (have '" + operandType + "')");
     }
+    // Disallow increment/decrement on boolean explicitly
+    else if (operandType == "bool") {
+        addError("Invalid operand to " + operation + " (boolean type)");
+    }
 }
 
 void SemanticAnalyzer::checkPrefixOperation(Node* node) {
@@ -2376,6 +2530,10 @@ void SemanticAnalyzer::checkPrefixOperation(Node* node) {
     // Check if operand type is valid (numeric or pointer)
     if (!operandType.empty() && !isNumericType(operandType) && !isPointerType(operandType)) {
         addError("Invalid operand to " + operation + " (have '" + operandType + "')");
+    }
+    // Disallow increment/decrement on boolean explicitly
+    else if (operandType == "bool") {
+        addError("Invalid operand to " + operation + " (boolean type)");
     }
 }
 bool SemanticAnalyzer::isLvalue(Node* node) {
@@ -2810,6 +2968,15 @@ void SemanticAnalyzer::checkConditionExpression(Node* node) {
         }
     }
     
+    // Additional specific checks aligned with logical operation rules
+    if (condType == "float" || condType == "double") {
+        addError("Invalid use of floating-point type '" + condType + "' in condition (use explicit comparison, e.g., " + condType + " != 0.0)");
+        return;
+    }
+    if (condType == "char") {
+        addError("Invalid use of character type in condition (use explicit comparison, e.g., char != '\\0')");
+        return;
+    }
     if (!isValid) {
         addError("Invalid type '" + condType + "' in condition (requires boolean, integer, or pointer type)");
     }
