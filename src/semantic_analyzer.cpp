@@ -190,27 +190,66 @@ else if (node->name == "WHILE_STMT" || node->name == "DO_WHILE_STMT" ||
          node->name == "FOR_STMT_2" || node->name == "FOR_STMT_3" || 
          node->name == "FOR_RANGE_STMT" || node->name == "UNTIL_STMT") {
     loopDepth++;
-    
-    // Check the condition expression for all loop types
-    if (node->name == "WHILE_STMT" && !node->children.empty()) {
-        checkConditionExpression(node->children[0]);  // while(condition)
-    } 
-    else if (node->name == "DO_WHILE_STMT" && node->children.size() > 1) {
-        checkConditionExpression(node->children[1]);  // do...while(condition)
+
+    // Handle loops, ensuring correct scoping for for-loop declarations
+    if (node->name == "WHILE_STMT") {
+        if (!node->children.empty()) {
+            checkConditionExpression(node->children[0]);
+        }
+        for (auto child : node->children) {
+            traverseAST(child);
+        }
+        loopDepth--;
+        return;
     }
-    else if (node->name == "FOR_STMT_2" && node->children.size() > 1) {
-        checkConditionExpression(node->children[1]);  // for(init; condition; )
+    else if (node->name == "DO_WHILE_STMT") {
+        for (auto child : node->children) {
+            traverseAST(child);
+        }
+        if (node->children.size() > 1) {
+            checkConditionExpression(node->children[1]);
+        }
+        loopDepth--;
+        return;
     }
-    else if (node->name == "FOR_STMT_3" && node->children.size() > 1) {
-        checkConditionExpression(node->children[1]);  // for(init; condition; update)
+    else if (node->name == "FOR_STMT_3") {
+        // C: a declaration in for-init introduces a new scope for the entire for-statement
+        symbolTable.enterScope();
+        // Expect children: [0]=DECLARATION, [1]=condition, [2]=update, [3]=body
+        if (!node->children.empty()) {
+            // Process init declaration first so its symbols are visible to cond/update/body
+            traverseAST(node->children[0]);
+        }
+        if (node->children.size() > 1) {
+            checkConditionExpression(node->children[1]);
+        }
+        // Traverse remaining parts (condition itself, update, body)
+        for (size_t idx = 1; idx < node->children.size(); ++idx) {
+            traverseAST(node->children[idx]);
+        }
+        symbolTable.exitScope();
+        loopDepth--;
+        return;
     }
-    // UNTIL_STMT condition is also checkable if you want
-    
-    for (auto child : node->children) {
-        traverseAST(child);
+    else if (node->name == "FOR_STMT_2") {
+        // No new scope needed if init is an expression
+        if (node->children.size() > 1) {
+            checkConditionExpression(node->children[1]);
+        }
+        for (auto child : node->children) {
+            traverseAST(child);
+        }
+        loopDepth--;
+        return;
     }
-    loopDepth--;
-    return;  
+    else {
+        // FOR_RANGE_STMT, UNTIL_STMT: default traversal
+        for (auto child : node->children) {
+            traverseAST(child);
+        }
+        loopDepth--;
+        return;
+    }
 }
 
 
@@ -928,6 +967,15 @@ bool SemanticAnalyzer::isDeclarationContext(Node* node) {
         }
     }
     
+    // Treat identifiers that are part of a declaration (including struct members)
+    // as declaration context to avoid spurious 'undeclared' errors.
+    Node* anc = node;
+    while (anc) {
+        if (anc->name == "DECLARATION" || anc->name == "INIT_DECL_LIST" || anc->name == "DECLARATOR" || anc->name == "ARRAY") {
+            return true;
+        }
+        anc = anc->parent;
+    }
     return false;
 }
 
@@ -1246,9 +1294,15 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
     else if (node->name == "ARRAY_ACCESS") {
         if (!node->children.empty()) {
             string baseType = getExpressionType(node->children[0]);
-            // Remove one level of pointer/array
-            if (baseType.length() > 0 && baseType.back() == '*') {
+            // Remove one level of pointer
+            if (!baseType.empty() && baseType.back() == '*') {
                 return baseType.substr(0, baseType.length() - 1);
+            }
+            // If baseType encodes an array (e.g., "struct B[2]"), strip one dimension
+            size_t lb = baseType.rfind('[');
+            size_t rb = baseType.rfind(']');
+            if (lb != string::npos && rb != string::npos && rb > lb) {
+                return baseType.substr(0, lb);
             }
             return baseType;
         }
@@ -1381,7 +1435,8 @@ void SemanticAnalyzer::processStruct(Node* node) {
     Node * nodee=NULL;
     string structName;
     map<string, string> members;
-     map<string, Node*> memberNodes; 
+    map<string, Node*> memberNodes; 
+    vector<string> memberOrder; // preserve declaration order
     bool isUnion = false;
     
     // Check if this is a union or struct
@@ -1397,7 +1452,7 @@ void SemanticAnalyzer::processStruct(Node* node) {
             structName = child->lexeme;
         }
         else if (child->name == "DECLARATION") {
-            extractStructMembers(child, members,memberNodes);
+            extractStructMembers(child, members, memberNodes, memberOrder);
         }
     }
     
@@ -1441,6 +1496,7 @@ void SemanticAnalyzer::processStruct(Node* node) {
     }
             if (sym) {
                 sym->structMembers = members;  // Store member info
+                sym->structMemberOrder = memberOrder; // preserve order
                 sym->isUnion = isUnion;  // Mark if it's a union
             }
             cout << "DEBUG: Defined " << typeKeyword << " " << structName << " with " << members.size() << " member(s)\n";
@@ -1450,12 +1506,12 @@ void SemanticAnalyzer::processStruct(Node* node) {
     }
 }
 
-void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>& members ,map<string, Node*>& memberNodes) {
+void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>& members ,map<string, Node*>& memberNodes, vector<string>& memberOrder) {
     if (!declNode || declNode->name != "DECLARATION") return;
     
     string memberType;
     vector<string> memberNames;
-     vector<pair<string, Node*>> memberNamesAndNodes;  // ✅ Store both!
+    vector<pair<string, Node*>> memberNamesAndNodes;  // ✅ Store both!
    
     
     for (auto child : declNode->children) {
@@ -1471,7 +1527,28 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
                         memberNames.push_back(firstChild->lexeme);
                         identifierNode = firstChild;
                         memberNamesAndNodes.push_back({firstChild->lexeme, identifierNode});
+                        memberOrder.push_back(firstChild->lexeme);
                  
+                    }
+                    // Handle array declarators for struct members, e.g., struct B b[2];
+                    else if (firstChild->name == "ARRAY") {
+                        string memberName;
+                        vector<int> arrayDims = extractArrayDimensions(firstChild, memberName);
+                        identifierNode = findIdentifierInArray(firstChild);
+                        if (!memberName.empty()) {
+                            // Encode array dimensions into type string, e.g., "struct B[2][3]"
+                            string fullType = memberType;
+                            for (int dim : arrayDims) {
+                                fullType += "[";
+                                if (dim > 0) fullType += to_string(dim);
+                                fullType += "]";
+                            }
+                            members[memberName] = fullType;
+                            memberNodes[memberName] = identifierNode;
+                            memberOrder.push_back(memberName);
+                            cout << "DEBUG: Found struct array member: " << memberName << " [" << fullType << "]\n";
+                            continue;
+                        }
                     }
                     // Handle declarators with pointers/arrays
                     else if (firstChild->name == "DECLARATOR") {
@@ -1488,8 +1565,16 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
                             for (int i = 0; i < pointerDepth; i++) {
                                 fullType += "*";
                             }
+                            if (isArray) {
+                                for (int dim : arrayDims) {
+                                    fullType += "[";
+                                    if (dim > 0) fullType += to_string(dim);
+                                    fullType += "]";
+                                }
+                            }
                             members[memberName] = fullType;
-                             memberNodes[memberName] = identifierNode;
+                            memberNodes[memberName] = identifierNode;
+                            memberOrder.push_back(memberName);
                             cout << "DEBUG: Found struct member: " << memberName << " [" << fullType << "]\n";
                             continue;  // Skip the default add below
                         }
@@ -1499,13 +1584,14 @@ void SemanticAnalyzer::extractStructMembers(Node* declNode, map<string, string>&
         }
         else if (child->name == "DECLARATION") {
             // Nested declaration - recursively extract
-            extractStructMembers(child, members,memberNodes);
+            extractStructMembers(child, members, memberNodes, memberOrder);
         }
     }
     for (const auto& pair : memberNamesAndNodes) {
         if (members.find(pair.first) == members.end()) {
             members[pair.first] = memberType;
             memberNodes[pair.first] = pair.second;  // ✅ STORE NODE!
+            memberOrder.push_back(pair.first);
              cout << "DEBUG: Found struct member: " << pair.first << " [" << memberType << "]\n";
         }
     }
@@ -1580,8 +1666,8 @@ void SemanticAnalyzer::processEnum(Node* node) {
                     //symbolTable.enterScope();
                     for (const auto& pair : values) {
                        Node* enumNode = enumeratorNodes[pair.first];  // ✅ GET CORRECT NODE!
-               
-                        if (!symbolTable.addSymbol(pair.first, "int", enumNode)) {
+                       string enumConstType = "enum " + enumName;
+                        if (!symbolTable.addSymbol(pair.first, enumConstType, enumNode)) {
                             addError("Redefinition of enumerator '" + pair.first + "'");
                         } else {
     Symbol* sym = symbolTable.lookupCurrentScope(pair.first);
@@ -1618,7 +1704,8 @@ void SemanticAnalyzer::processEnum(Node* node) {
                     // Add enum constants to scope
                     //symbolTable.enterScope();
                     for (const auto& pair : values) {
-                        if (!symbolTable.addSymbol(pair.first, "int", node)) {
+                        string enumConstType = "enum " + enumName;
+                        if (!symbolTable.addSymbol(pair.first, enumConstType, node)) {
                             addError("Redefinition of enumerator '" + pair.first + "'");
                         } else {
                         
@@ -2534,7 +2621,23 @@ void SemanticAnalyzer::processTypedef(Node* node) {
         if (child->name == "DECL_SPECIFIERS") {
             baseType = extractTypeFromDeclSpecifiers(child);
              cout << "DEBUG processTypedef: Extracted base type = '" << baseType << "'\n";
-      
+            // If this typedef includes a struct/union/enum definition, process it so the type exists
+            for (auto specChild : child->children) {
+                if (specChild->name == "STRUCT_OR_UNION_SPECIFIER") {
+                    // Has body? then define struct/union
+                    for (auto bodyChild : specChild->children) {
+                        if (bodyChild->name == "DECLARATION") {
+                            processStruct(specChild);
+                            break;
+                        }
+                    }
+                } else if (specChild->name == "ENUM_SPECIFIER") {
+                    // Has enumerators? then define enum and its constants
+                    if (isEnumDefinition(specChild)) {
+                        processEnum(specChild);
+                    }
+                }
+            }
         }
         else if (child->name == "INIT_DECL_LIST") {
             for (auto declChild : child->children) {
@@ -2580,7 +2683,24 @@ void SemanticAnalyzer::processTypedef(Node* node) {
      if (!symbolTable.addSymbol(aliasName, fullAliasedType, nodee, false, {}, 
                                isArray, arrayDims, pointerDepth, false, false, false,
                                true, fullAliasedType)) {  // ← This is the aliased type!
-        addError("Redefinition of typedef '" + aliasName + "'");
+        // If a symbol with the same name already exists, it may be a struct/union/enum tag.
+        // In C, tags (struct/union/enum) live in a separate namespace and it's legal to
+        // have "typedef struct S S;" and "typedef enum E E;". In that case, don't treat it
+        // as a redefinition error — augment the existing tag symbol with typedef metadata.
+        Symbol* existing = symbolTable.lookupCurrentScope(aliasName);
+        if (existing && (existing->isStruct || existing->isUnion || existing->isEnum) && !existing->isTypedef) {
+            existing->isTypedef = true;
+            existing->aliasedType = fullAliasedType;  // e.g., "struct S" or "enum E"
+            // Note: do NOT mutate pointerDepth for the tag symbol; typedef name equals tag implies no stars.
+            if (nodee) {
+                nodee->symbol = existing;
+                cout << "DEBUG: Attached symbol " << existing->name << " to AST node (typedef overlay)" << endl;
+            }
+            cout << "SUCCESS: Typedef '" << aliasName << "' registered as alias for '"
+                 << fullAliasedType << "' (overlay on tag)\n";
+        } else {
+            addError("Redefinition of typedef '" + aliasName + "'");
+        }
     } else {
     
     
@@ -2602,34 +2722,27 @@ string SemanticAnalyzer::resolveTypedef(const string& type) {
     Symbol* sym = symbolTable.lookup(type);
 
     if (sym) {
-        if (!sym->isTypedef) { // NEW: Check this first
-            cout << "  Found symbol: name='" << sym->name << "', type='" << sym->type << "', isTypedef=0\n";
-            cout << "  Returning stored type (FIXED): '" << sym->type << "'\n";
-             string fullAliasedType =sym->type;
-               for (int i = 0; i < sym->pointerDepth; i++) {
-        fullAliasedType += "*";
-    }
-            return fullAliasedType;
+        // If this symbol is a typedef name, resolve to its aliased type.
+        if (sym->isTypedef) {
+            cout << "  Resolving typedef '" << type << "' -> '" << sym->aliasedType << "'\n";
+            string resolved = resolveTypedef(sym->aliasedType);
+
+            // Append this typedef's pointer depth
+            for (int i = 0; i < sym->pointerDepth; i++) {
+                resolved += "*";
+            }
+
+            return resolved;
         }
-
-      if (sym->isTypedef) {
-    cout << "  Resolving typedef '" << type << "' -> '" << sym->aliasedType << "'\n";
-    string resolved = resolveTypedef(sym->aliasedType);
-
-    // Append this typedef's pointer depth
-    for (int i = 0; i < sym->pointerDepth; i++) {
-        resolved += "*";
-    }
-
-    return resolved;
-}
-
+        // Not a typedef: could be a tag name or ordinary symbol. Do not substitute
+        // with sym->type (which may be just "struct"/"union"/"enum"). Preserve the input
+        // type token. This ensures we don't lose tag names like 'struct S'.
     } else {
         cout << "  Symbol not found in table\n";
     }
 
     cout << "  Returning original type: '" << type << "'\n";
-    return type;  // Not a typedef, return as-is (e.g., 'int')
+    return type;  // Not a typedef, return as-is (e.g., 'int' or tag reference)
 }
 
 bool SemanticAnalyzer::isConstantIndex(Node* indexNode, int& value) {
@@ -2784,8 +2897,8 @@ void SemanticAnalyzer::checkSwitchStatement(Node* node) {
     
     if (exprType.empty()) return; // Skip if type couldn't be determined
     
-    // Check if the expression type is an integer type
-    if (!isIntegerType(exprType)) {
+    // Check if the expression type is an integer type or enum
+    if (!isIntegerType(exprType) && exprType.rfind("enum ", 0) != 0) {
         addError("Switch quantity not an integer (got '" + exprType + "')");
     }
     
