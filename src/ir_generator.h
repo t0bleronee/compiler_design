@@ -9,6 +9,46 @@
 #include<map>
 #include <set>
 #include <algorithm>  // Add this header
+// Undefine parser token macros that may collide with TACOp enumerators
+#ifdef EQ
+#undef EQ
+#endif
+#ifdef NE
+#undef NE
+#endif
+#ifdef LT
+#undef LT
+#endif
+#ifdef LE
+#undef LE
+#endif
+#ifdef GT
+#undef GT
+#endif
+#ifdef GE
+#undef GE
+#endif
+#ifdef AND
+#undef AND
+#endif
+#ifdef OR
+#undef OR
+#endif
+#ifdef NOT
+#undef NOT
+#endif
+#ifdef ASSIGN
+#undef ASSIGN
+#endif
+#ifdef GOTO
+#undef GOTO
+#endif
+#ifdef RETURN
+#undef RETURN
+#endif
+#ifdef CONST
+#undef CONST
+#endif
 struct CaseInfo {
     std::string value;      // Case constant value
     std::string label;      // Label for this case
@@ -98,6 +138,9 @@ private:
 std::string currentContinueLabel;
      std::map<std::string, int> enumConstants; 
          std::set<std::string> staticVariables;
+    // Unique naming for symbols to respect scope shadowing
+    std::map<Symbol*, std::string> symbolUniqueNames;
+    int symbolNameCounter = 0;
 public:
     IRGenerator(SymbolTable& symTab);
     
@@ -109,6 +152,8 @@ public:
     void writeToFile(const std::string& filename) const;
     
 private:
+        // Resolve a stable, unique IR name for an identifier node using its attached Symbol
+        std::string getUniqueNameFor(Node* idNode, const std::string& fallback);
 
   void generateParameterHandling(Node* paramList);
     std::string findParameterName(Node* paramDecl);
@@ -120,6 +165,7 @@ private:
     // AST traversal helpers
     void traverseAST(Node* node);
     bool hasStructBody(Node* node);
+    bool hasEnumBody(Node* node);
     std::string findIdentifier(Node* node);
 
 
@@ -191,6 +237,8 @@ int getMemberOffset(Node* structNode, const std::string& memberName);
 
 int getStructSize(Symbol* structSym);
 int getMemberAlignment(const std::string& typeName);
+    // Resolve the struct/union type string of an lvalue expression (IDENTIFIER, member access, ptr member, array element)
+    std::string resolveStructTypeFromLValue(Node* node);
 
 // Add to private section of IRGenerator class
 std::string generateMultiDimArrayAddress(Node* arrayNode);
