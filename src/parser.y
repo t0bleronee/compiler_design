@@ -1365,6 +1365,16 @@ int main(int argc, char** argv) {
     }
     
     SymbolTable symTab;
+    // Register common built-in typedefs before lexing/parsing so the lexer
+    // can recognize them as TYPE_NAME tokens and the semantic analyzer can resolve them.
+    // Treat 'string' as an alias for 'char*'.
+    typedef_names.insert("string");
+    // Add a typedef symbol for 'string' → 'char*' so resolveTypedef works.
+    // Use aliasedType "char*" and mark as typedef; base 'type' is arbitrary here.
+    symTab.addSymbol("string", "char", nullptr, /*isFunction=*/false, /*params=*/{},
+                     /*isArray=*/false, /*arrayDims=*/{}, /*pointerDepth=*/0,
+                     /*isStruct=*/false, /*isEnum=*/false, /*isUnion=*/false,
+                     /*isTypedef=*/true, /*aliasedType=*/"char*");
     printf("Starting syntax analysis...\n");
     printf("%-40s | %s\n", "TOKEN", "LEXEME");
     printf("------------------------------------------|----------\n");
@@ -1387,38 +1397,45 @@ int main(int argc, char** argv) {
         cout << "AST image generated: ast.png" << endl;
         
         
-        cout << "\n=== STARTING SEMANTIC ANALYSIS ===" << endl;
-        
-        // Semantic Analysis
-        SemanticAnalyzer semanticAnalyzer(symTab);
-        bool semanticSuccess = semanticAnalyzer.buildSymbolTable(root);
-        
-        cout << "=== SEMANTIC ANALYSIS COMPLETE ===\n" << endl;
-        
-        // ✅ NEW: IR Generation only if semantics are valid
-        if (semanticSuccess && !semanticAnalyzer.hasErrors()) {
-            cout << "\n=== GENERATING TAC IR ===" << endl;
+        // If parser recorded any syntax errors, stop here and report properly.
+        if (errors.hasErrors()) {
+            cout << "❌ Syntax errors detected - skipping semantic analysis and IR generation" << endl;
+            errors.printErrors();
+            result = 1;
+        } else {
+            cout << "\n=== STARTING SEMANTIC ANALYSIS ===" << endl;
             
-            IRGenerator irGenerator(symTab);
-            bool irSuccess = irGenerator.generateIR(root);
+            // Semantic Analysis
+            SemanticAnalyzer semanticAnalyzer(symTab);
+            bool semanticSuccess = semanticAnalyzer.buildSymbolTable(root);
             
-            if (irSuccess) {
-                // Print to console
-                irGenerator.printIR();
+            cout << "=== SEMANTIC ANALYSIS COMPLETE ===\n" << endl;
+            
+            // ✅ NEW: IR Generation only if semantics are valid
+            if (semanticSuccess && !semanticAnalyzer.hasErrors()) {
+                cout << "\n=== GENERATING TAC IR ===" << endl;
                 
-                // Write to file
-                irGenerator.writeToFile("output.3ac");
+                IRGenerator irGenerator(symTab);
+                bool irSuccess = irGenerator.generateIR(root);
                 
-                cout << "✅ TAC IR generation successful" << endl;
-                cout << "📄 TAC output written to: output.3ac" << endl;
+                if (irSuccess) {
+                    // Print to console
+                    irGenerator.printIR();
+                    
+                    // Write to file
+                    irGenerator.writeToFile("output.3ac");
+                    
+                    cout << "✅ TAC IR generation successful" << endl;
+                    cout << "📄 TAC output written to: output.3ac" << endl;
+                } else {
+                    cout << "❌ TAC IR generation failed" << endl;
+                    result = 1;
+                }
             } else {
-                cout << "❌ TAC IR generation failed" << endl;
+                cout << "❌ Semantic errors detected - skipping IR generation" << endl;
+                semanticAnalyzer.printErrors();
                 result = 1;
             }
-        } else {
-            cout << "❌ Semantic errors detected - skipping IR generation" << endl;
-            semanticAnalyzer.printErrors();
-            result = 1;
         }
     }
 
