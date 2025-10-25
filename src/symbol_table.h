@@ -35,6 +35,7 @@ bool isTypedef = false;
     
     
 std::map<std::string, std::string> structMembers;  // member name -> type
+std::vector<std::string> structMemberOrder;        // declaration order of members
 std::map<std::string, int> enumValues;             // enumerator name -> value
 
     
@@ -83,3 +84,4 @@ bool isEmptyScopes() const {
 };
 
 #endif
+
