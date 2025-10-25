@@ -468,8 +468,7 @@ type_specifier
     | BOOL      { $$ = new Node("TYPE_SPECIFIER", "bool"); }
     | struct_or_union_specifier { $$ = $1; }
     | enum_specifier            { $$ = $1; }
-    | TYPE_NAME                 {  $$ = new Node("TYPE_NAME", std::string($1)); 
-        free($1);  }
+    | TYPE_NAME                 {  $$ = new Node("TYPE_NAME", std::string($1)); }
     
     ;
 
@@ -697,11 +696,9 @@ parameter_declaration
 identifier_list
     : IDENTIFIER {
         $$ = new Node("IDENTIFIER", std::string($1));
-        free($1);
     }
     | identifier_list COMMA IDENTIFIER {
         Node* idNode = new Node("IDENTIFIER", std::string($3));
-        free($3);
         $$ = $1;
         $$->addChild(idNode);
     }
@@ -843,7 +840,6 @@ statement
 labeled_statement
     : IDENTIFIER COLON statement {
         Node* labelNode = new Node("IDENTIFIER", std::string($1));
-        free($1);
 
         $$ = new Node("LABELED_STMT");
         $$->addChild(labelNode);
@@ -976,7 +972,6 @@ range_based_for
         $$->addChild($1); // type
        
           Node* labelNode = new Node("IDENTIFIER", std::string($2));
-        free($2);
          $$->addChild(labelNode); // variable
         $$->addChild($4); // iterable
     }
@@ -984,7 +979,6 @@ range_based_for
         $$ = new Node("RANGE_FOR_REF");
         $$->addChild($1); // type
          Node* labelNode = new Node("IDENTIFIER", std::string($3));
-        free($3);
          $$->addChild(labelNode); // variable
         $$->addChild($5); // iterable
     }
@@ -993,7 +987,6 @@ jump_statement
     : GOTO IDENTIFIER SEMICOLON {
         $$ = new Node("GOTO_STMT");
        Node* labelNode = new Node("IDENTIFIER", std::string($2));
-        free($2);
          $$->addChild(labelNode); // variable
     }
     | CONTINUE SEMICOLON {
@@ -1301,14 +1294,14 @@ primary_expression
     ;
 
 constant
-    : INTEGER_CONSTANT { $$ = new Node("INTEGER_CONSTANT", std::string($1)); free($1); }
-| FLOAT_CONSTANT { $$ = new Node("FLOAT_CONSTANT", std::string($1)); free($1); }
-| CHAR_LITERAL { $$ = new Node("CHAR_LITERAL", std::string($1)); free($1); }
-| BOOL_LITERAL { $$ = new Node("BOOL_LITERAL", std::string($1)); free($1); }
-| HEX_INT_LITERAL { $$ = new Node("HEX_INT_LITERAL", std::string($1)); free($1); }
-| OCTAL_INT_LITERAL { $$ = new Node("OCTAL_INT_LITERAL", std::string($1)); free($1); }
-| BINARY_INT_LITERAL { $$ = new Node("BINARY_INT_LITERAL", std::string($1)); free($1); }
-| HEX_FLOAT_LITERAL { $$ = new Node("HEX_FLOAT_LITERAL", std::string($1)); free($1); }
+    : INTEGER_CONSTANT { $$ = new Node("INTEGER_CONSTANT", std::string($1)); }
+| FLOAT_CONSTANT { $$ = new Node("FLOAT_CONSTANT", std::string($1)); }
+| CHAR_LITERAL { $$ = new Node("CHAR_LITERAL", std::string($1)); }
+| BOOL_LITERAL { $$ = new Node("BOOL_LITERAL", std::string($1)); }
+| HEX_INT_LITERAL { $$ = new Node("HEX_INT_LITERAL", std::string($1)); }
+| OCTAL_INT_LITERAL { $$ = new Node("OCTAL_INT_LITERAL", std::string($1)); }
+| BINARY_INT_LITERAL { $$ = new Node("BINARY_INT_LITERAL", std::string($1)); }
+| HEX_FLOAT_LITERAL { $$ = new Node("HEX_FLOAT_LITERAL", std::string($1)); }
 
 constant_expression
     : conditional_expression { $$ = $1; }
