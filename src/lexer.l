@@ -9,6 +9,9 @@
 #include "symbol_table.h"
 using namespace std;
 
+// Controlled by parser.y main
+extern bool g_showTokens;
+
 
 std::unordered_set<std::string> typedef_names;
 
@@ -27,7 +30,9 @@ int after_equal = 0;
 int open_braces = 0;
 
 void printToken(const char* token, const char* lexeme) {
-    printf("%-40s | %s\n", token, lexeme);
+    if (g_showTokens) {
+        printf("%-40s | %s\n", token, lexeme);
+    }
 }
 #define YY_USER_ACTION \
     { \
@@ -136,18 +141,18 @@ DELIMITER   [()\[\]{},;]
 {SINGLE_LINE_COMMENT} {  }
 
 
-{PP_DEFINE}      { printf("%s\tpreprocessor_define\n", yytext); }
-{PP_UNDEF}       { printf("%s\tpreprocessor_undef\n", yytext); }
-{PP_IF}          { printf("%s\tpreprocessor_if\n", yytext); }
-{PP_ELIF}        { printf("%s\tpreprocessor_elif\n", yytext); }
-{PP_ELSE}        { printf("%s\tpreprocessor_else\n", yytext); }
-{PP_ENDIF}       { printf("%s\tpreprocessor_endif\n", yytext); }
-{PP_IFDEF}       { printf("%s\tpreprocessor_ifdef\n", yytext); }
-{PP_IFNDEF}      { printf("%s\tpreprocessor_ifndef\n", yytext); }
-{PP_ERROR}       { printf("%s\tpreprocessor_error\n", yytext); }
-{PP_WARNING}     { printf("%s\tpreprocessor_warning\n", yytext); }
-{PP_PRAGMA}      { printf("%s\tpreprocessor_pragma\n", yytext); }
-{PP_INCLUDE}     { printf("%s\tpreprocessor_include\n", yytext); }
+{PP_DEFINE}      { if (g_showTokens) printf("%s\tpreprocessor_define\n", yytext); }
+{PP_UNDEF}       { if (g_showTokens) printf("%s\tpreprocessor_undef\n", yytext); }
+{PP_IF}          { if (g_showTokens) printf("%s\tpreprocessor_if\n", yytext); }
+{PP_ELIF}        { if (g_showTokens) printf("%s\tpreprocessor_elif\n", yytext); }
+{PP_ELSE}        { if (g_showTokens) printf("%s\tpreprocessor_else\n", yytext); }
+{PP_ENDIF}       { if (g_showTokens) printf("%s\tpreprocessor_endif\n", yytext); }
+{PP_IFDEF}       { if (g_showTokens) printf("%s\tpreprocessor_ifdef\n", yytext); }
+{PP_IFNDEF}      { if (g_showTokens) printf("%s\tpreprocessor_ifndef\n", yytext); }
+{PP_ERROR}       { if (g_showTokens) printf("%s\tpreprocessor_error\n", yytext); }
+{PP_WARNING}     { if (g_showTokens) printf("%s\tpreprocessor_warning\n", yytext); }
+{PP_PRAGMA}      { if (g_showTokens) printf("%s\tpreprocessor_pragma\n", yytext); }
+{PP_INCLUDE}     { if (g_showTokens) printf("%s\tpreprocessor_include\n", yytext); }
 
 
 {STRING_LITERAL}            { printToken("STRING LITERAL", yytext); 
@@ -350,5 +355,6 @@ DELIMITER   [()\[\]{},;]
 
 
 %%
+
 
 
