@@ -4,7 +4,25 @@
 #include <functional>
 #include <cctype>
 
+
+// Helper: find the base IDENTIFIER inside nested ARRAY nodes
+Node* IRGenerator::findIdentifierInArray(Node* arrayNode) {
+    if (!arrayNode) return nullptr;
+    Node* current = arrayNode;
+    while (current && current->name == "ARRAY") {
+        if (current->children.empty()) break;
+        Node* first = current->children[0];
+        if (!first) break;
+        if (first->name == "IDENTIFIER") return first;
+        current = first;
+    }
+    return nullptr;
+}
+
 using namespace std;
+
+// Global IR debug toggle. Set to true to enable verbose IR generation logs.
+static const bool kIrDebug = false;
 
 // TACInstruction methods
 void TACInstruction::print(ostream& out) const {
@@ -92,28 +110,25 @@ string TACInstruction::toString() const {
                     case TACOp::BIT_XOR: opStr = "^"; break;
                     case TACOp::SHL: opStr = "<<"; break;
                     case TACOp::SHR: opStr = ">>"; break;
-                     // case TACOp::NOT: opStr = "!"; break;
-                        //case TACOp::NEG: opStr = "-"; break;
                     default: opStr = "?";
                 }
                 ss << result << " = " << operand1 << " " << opStr << " " << operand2;
             }
             break;
             
-        // Unary operations
-       
-case TACOp::NEG: case TACOp::NOT: case TACOp::BIT_NOT:
-    {
-        string opStr;
-        switch(opcode) {
-            case TACOp::NEG: opStr = "-"; break;
-            case TACOp::NOT: opStr = "!"; break;
-            case TACOp::BIT_NOT: opStr = "~"; break;
-            default: opStr = "?";
-        }
-        ss << result << " = " << opStr << operand1;
-    }
-    break;
+        // Unary operations       
+        case TACOp::NEG: case TACOp::NOT: case TACOp::BIT_NOT:
+            {
+                string opStr;
+                switch(opcode) {
+                    case TACOp::NEG: opStr = "-"; break;
+                    case TACOp::NOT: opStr = "!"; break;
+                    case TACOp::BIT_NOT: opStr = "~"; break;
+                    default: opStr = "?";
+                }
+                ss << result << " = " << opStr << operand1;
+            }
+            break;
             
         // Memory operations
         case TACOp::LOAD:
@@ -137,20 +152,20 @@ case TACOp::NEG: case TACOp::NOT: case TACOp::BIT_NOT:
             ss << operand1 << "[" << operand2 << "] = " << result;
             break;
         case TACOp::MEMBER_ACCESS:
-    ss << result << " = " << operand1 << "." << operand2;
-    break;
+            ss << result << " = " << operand1 << "." << operand2;
+            break;
 
-case TACOp::MEMBER_STORE:
-    ss << operand1 << "." << operand2 << " = " << result;
-    break;
+        case TACOp::MEMBER_STORE:
+            ss << operand1 << "." << operand2 << " = " << result;
+            break;
 
-case TACOp::PTR_MEMBER_ACCESS:
-    ss << result << " = " << operand1 << "->" << operand2;
-    break;
+        case TACOp::PTR_MEMBER_ACCESS:
+            ss << result << " = " << operand1 << "->" << operand2;
+            break;
 
-case TACOp::PTR_MEMBER_STORE:
-    ss << operand1 << "->" << operand2 << " = " << result;
-    break;    
+        case TACOp::PTR_MEMBER_STORE:
+            ss << operand1 << "->" << operand2 << " = " << result;
+            break;    
         default:
             ss << "UNKNOWN_OP";
     }
@@ -163,6 +178,66 @@ case TACOp::PTR_MEMBER_STORE:
 IRGenerator::IRGenerator(SymbolTable& symTab) 
     : symbolTable(symTab), tempCounter(0), labelCounter(0), 
     currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
+
+// Basic utilities
+void IRGenerator::printIR(std::ostream& out) const {
+    for (const auto& inst : instructions) {
+        inst.print(out);
+    }
+}
+
+void IRGenerator::writeToFile(const std::string& filename) const {
+    std::string outFile = filename.empty() ? std::string("output.3ac") : filename;
+    std::ofstream ofs(outFile);
+    if (!ofs) {
+        std::cerr << "Failed to open IR output file: " << outFile << std::endl;
+        return;
+    }
+    printIR(ofs);
+}
+
+std::string IRGenerator::createTemp() {
+    return std::string("t") + std::to_string(++tempCounter);
+}
+
+std::string IRGenerator::createLabel(const std::string& prefix) {
+    return prefix + std::string("_") + std::to_string(++labelCounter);
+}
+
+// Helpers used by traverse/statement generation
+bool IRGenerator::hasStructBody(Node* node) {
+    if (!node) return false;
+    // Heuristic: look for an explicit member list node or braces content
+    std::function<bool(Node*)> anyStructMembers = [&](Node* n) -> bool {
+        if (!n) return false;
+        if (n->name == "STRUCT_DECLARATION_LIST" || n->name == "STRUCT_DECLARATION" ||
+            n->name == "MEMBER_LIST" || n->name == "MEMBER_DECLARATION") return true;
+        for (auto c : n->children) if (anyStructMembers(c)) return true;
+        return false;
+    };
+    return anyStructMembers(node);
+}
+
+bool IRGenerator::hasEnumBody(Node* node) {
+    if (!node) return false;
+    std::function<bool(Node*)> anyEnumers = [&](Node* n) -> bool {
+        if (!n) return false;
+        if (n->name == "ENUMERATOR_LIST" || n->name == "ENUMERATOR") return true;
+        for (auto c : n->children) if (anyEnumers(c)) return true;
+        return false;
+    };
+    return anyEnumers(node);
+}
+
+std::string IRGenerator::findIdentifier(Node* node) {
+    if (!node) return "";
+    if (node->name == "IDENTIFIER") return node->lexeme;
+    for (auto c : node->children) {
+        std::string r = findIdentifier(c);
+        if (!r.empty()) return r;
+    }
+    return "";
+}
 
 namespace {
 
@@ -432,6 +507,14 @@ void IRGenerator::generateStatement(Node* node) {
             generateExpression(node->children[0]);
         }
     }
+    else if (node->name == "PRINTF") {
+        // Explicit handling for printf statements
+        generatePrintfStatement(node);
+    }
+    else if (node->name == "SCANF") {
+        // Explicit handling for scanf statements
+        generateScanfStatement(node);
+    }
     else if (node->name == "ASSIGN_EXPR" || node->name == "FUNC_CALL") {
         generateExpression(node);
     }
@@ -524,85 +607,6 @@ void IRGenerator::generateStatement(Node* node) {
         }
     }
 }
-// Helper to check if struct/union has a body (is a definition vs declaration)
-bool IRGenerator::hasStructBody(Node* node) {
-    if (!node) return false;
-    
-    for (auto child : node->children) {
-        if (child->name == "STRUCT_DECL_LIST" || child->name == "DECLARATION") {
-            return true;  // Has body - it's a definition
-        }
-    }
-    return false;  // Just a declaration/usage
-}
-
-// Helper to check if enum has a body (definition with enumerators) vs mere usage
-bool IRGenerator::hasEnumBody(Node* node) {
-    if (!node) return false;
-    for (auto child : node->children) {
-        if (child->name == "ENUMERATOR_LIST") {
-            return true; // Has body - it's a definition
-        }
-    }
-    return false; // Just a declaration/usage
-}
-
-// Helper to find identifier in a subtree
-string IRGenerator::findIdentifier(Node* node) {
-    if (!node) return "";
-    
-    if (node->name == "IDENTIFIER") {
-        return node->lexeme;
-    }
-    
-    for (auto child : node->children) {
-        string id = findIdentifier(child);
-        if (!id.empty()) return id;
-    }
-    
-    return "";
-}
-string IRGenerator::createTemp() {
-    return "t" + to_string(tempCounter++);
-}
-
-string IRGenerator::createLabel(const string& prefix) {
-    return prefix + to_string(labelCounter++);
-}
-
-void IRGenerator::printIR(ostream& out) const {
-    out << "\n=== Three Address Code (TAC) ===" << endl;
-    for (const auto& instr : instructions) {
-        instr.print(out);
-    }
-}
-
-void IRGenerator::writeToFile(const string& filename) const {
-    ofstream file(filename);
-    if (file.is_open()) {
-        for (const auto& instr : instructions) {
-            file << instr.toString() << endl;
-        }
-        file.close();
-        cout << "TAC written to " << filename << endl;
-    }
-}
-
-// Find the base IDENTIFIER inside nested ARRAY nodes
-Node* IRGenerator::findIdentifierInArray(Node* arrayNode) {
-    if (!arrayNode) return nullptr;
-    Node* current = arrayNode;
-    while (current && current->name == "ARRAY") {
-        if (current->children.empty()) break;
-        Node* first = current->children[0];
-        if (!first) break;
-        if (first->name == "IDENTIFIER") return first;
-        current = first;
-    }
-    return nullptr;
-}
-
-
 string IRGenerator::generateExpression(Node* node) {
     if (!node) return "";
     
@@ -617,12 +621,29 @@ string IRGenerator::generateExpression(Node* node) {
        return lastTemp;
    }
 
-   if (node->name == "IDENTIFIER") {
+    if (node->name == "IDENTIFIER") {
     // Check if it's an enum constant
     if (enumConstants.find(node->lexeme) != enumConstants.end()) {
         string temp = createTemp();
         instructions.emplace_back(TACOp::CONST, temp,to_string(enumConstants[node->lexeme]));
         return temp;
+    }
+    // Function identifiers decay to function addresses in expressions
+    if (node->symbol && node->symbol->isFunction) {
+        return node->lexeme; // use function label/name as address
+    }
+    // References hold addresses; reading a reference as rvalue
+    // - scalar refs: LOAD through address
+    // - array refs: return the address directly (decays to pointer)
+    if (node->symbol && node->symbol->isReference) {
+        string addrVar = getUniqueNameFor(node, node->lexeme);
+        if (node->symbol->isArray) {
+            return addrVar;
+        } else {
+            string temp = createTemp();
+            instructions.emplace_back(TACOp::LOAD, temp, addrVar);
+            return temp;
+        }
     }
     // Use unique name per bound symbol (handles shadowing)
     return getUniqueNameFor(node, node->lexeme);
@@ -786,6 +807,10 @@ else if (node->name == "SIZEOF" || node->name == "SIZEOF_TYPE") {
             // ✅ FIX: Special case for &arr[i]
             if (operandNode->name == "ARRAY_ACCESS") {
                 return generateArrayAddress(operandNode);
+            }
+            // ✅ NEW: &function is same as function pointer value
+            if (operandNode->name == "IDENTIFIER" && operandNode->symbol && operandNode->symbol->isFunction) {
+                return generateExpression(operandNode);
             }
             // ✅ NEW: Special case for &(*expr) — returns the pointer value of expr
             if (operandNode->name == "UNARY_OP" && operandNode->children.size() >= 2) {
@@ -1008,18 +1033,15 @@ string IRGenerator::generateAssignment(Node* node) {
     
     if (lhs->name == "IDENTIFIER") {
         string rhsTemp = generateExpression(rhs);
-        
-        // Optimize: if RHS is a constant, assign directly without temp
-        if (rhs->name == "INTEGER_CONSTANT" || rhs->name == "FLOAT_CONSTANT" || 
-            rhs->name == "CHAR_LITERAL" || rhs->name == "BOOL_LITERAL") {
-            string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
-            instructions.emplace_back(TACOp::ASSIGN, lhsName, rhs->lexeme);
-            return lhsName;
-        } else {
-            string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
-            instructions.emplace_back(TACOp::ASSIGN, lhsName, rhsTemp);
+        string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
+        // If LHS is a reference, store through its address
+        if (lhs->symbol && lhs->symbol->isReference) {
+            instructions.emplace_back(TACOp::STORE, lhsName, rhsTemp);
             return lhsName;
         }
+        // Always use the temp from generateExpression for consistency
+        instructions.emplace_back(TACOp::ASSIGN, lhsName, rhsTemp);
+        return lhsName;
     }
     
     return "";
@@ -1030,17 +1052,54 @@ string IRGenerator::generateFunctionCall(Node* node) {
     if (!node || node->children.empty()) return "";
     
     Node* funcNode = node->children[0];
-    string funcName = (funcNode->name == "IDENTIFIER") ? funcNode->lexeme : "";
     
-    // Track function calls
-    functionCallCounts[funcName]++;
-    
-    // Detect self-recursion
-    if (funcName == currentFunction) {
-        cout << "DEBUG: Recursive call detected in " << currentFunction << endl;
+    // Unwrap EXPR_LIST if present
+    if (funcNode->name == "EXPR_LIST" && !funcNode->children.empty()) {
+        funcNode = funcNode->children[0];
     }
     
-    if (funcName.empty()) return "";
+    string callOperand;     // can be function name or temp/unique name holding address
+    vector<bool> paramIsRef; // per-arg reference flags
+    string debugName = "<expr>";
+    
+    // Determine callee info
+    if (funcNode->name == "IDENTIFIER") {
+        debugName = funcNode->lexeme;
+        Symbol* calleeSym = symbolTable.lookuph(funcNode->lexeme);  // Use lookuph to search scope history
+        if (!calleeSym) return "";
+        if (calleeSym->isFunction) {
+            callOperand = funcNode->lexeme; // direct call by name
+            paramIsRef = calleeSym->paramIsReference;
+        } else if (calleeSym->isFunctionPointer) {
+            // Indirect call via function pointer stored in a variable
+            callOperand = getUniqueNameFor(funcNode, funcNode->lexeme);
+            paramIsRef = calleeSym->funcPtrParamIsReference;
+        } else {
+            return "";
+        }
+    } else if (funcNode->name == "UNARY_OP" && funcNode->children.size() == 2 && funcNode->children[0]->name == "*") {
+        // (*fp)(...)
+        Node* inner = funcNode->children[1];
+        if (inner && inner->name == "IDENTIFIER") {
+            debugName = inner->lexeme;
+            Symbol* calleeSym = symbolTable.lookuph(inner->lexeme);  // Use lookuph to search scope history
+            if (!calleeSym || !calleeSym->isFunctionPointer) return "";
+            callOperand = getUniqueNameFor(inner, inner->lexeme);
+            paramIsRef = calleeSym->funcPtrParamIsReference;
+        } else {
+            // Fallback: evaluate expression to a temp as callee address (limited support)
+            callOperand = generateExpression(funcNode);
+        }
+    } else {
+        // Unsupported callee
+        return "";
+    }
+    
+    // Track function calls (only for named functions)
+    functionCallCounts[debugName]++;
+    if (debugName == currentFunction) {
+        cout << "DEBUG: Recursive call detected in " << currentFunction << endl;
+    }
     
     // ✅ FIX: Evaluate ALL arguments FIRST in left-to-right order
     // This ensures side effects happen in correct sequence
@@ -1050,50 +1109,39 @@ string IRGenerator::generateFunctionCall(Node* node) {
         Node* argList = node->children[1];
         
         cout << "DEBUG: Evaluating " << argList->children.size() 
-             << " arguments for " << funcName << " in left-to-right order" << endl;
-        
-        // Step 1: Evaluate all arguments and store in temps (left-to-right)
+             << " arguments for " << debugName << " in left-to-right order" << endl;
+        // Step 1+2 combined: For each argument, either compute address (for ref) or value
         for (size_t i = 0; i < argList->children.size(); i++) {
             Node* arg = argList->children[i];
-            
-            cout << "DEBUG: Evaluating argument " << i << endl;
-            
-            // Generate expression - this may have side effects (i++, function calls, etc.)
-            string argTemp = generateExpression(arg);
-            
-            // If the expression result is not already a temp, copy it to preserve value
-            // This is important for cases like: f(x, x++) where x changes between args
-            if (!argTemp.empty()) {
-                // Check if it's already a temporary or a constant
-                bool isTemp = (argTemp[0] == 't' && isdigit(argTemp[1]));
-                bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
-                               (argTemp[0] == '-' && isdigit(argTemp[1])));
-                
-                if (!isTemp && !isConst) {
-                    // It's a variable - copy to temp to preserve current value
-                    string preservedTemp = createTemp();
-                    instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
-                    evaluatedArgs.push_back(preservedTemp);
-                    
-                    cout << "DEBUG: Preserved variable " << argTemp 
-                         << " in " << preservedTemp << endl;
-                } else {
-                    evaluatedArgs.push_back(argTemp);
+            bool passByRef = (i < paramIsRef.size() && paramIsRef[i]);
+            string toPass;
+            if (passByRef) {
+                // For references, pass the address of the lvalue
+                toPass = generateLValueAddress(arg);
+            } else {
+                // Evaluate expression to a value (with side effects)
+                string argTemp = generateExpression(arg);
+                if (!argTemp.empty()) {
+                    bool isTemp = (argTemp[0] == 't' && (argTemp.size() == 1 || isdigit(argTemp[1])));
+                    bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
+                                   (argTemp[0] == '-' && argTemp.size()>1 && isdigit(argTemp[1])));
+                    if (!isTemp && !isConst) {
+                        string preservedTemp = createTemp();
+                        instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
+                        toPass = preservedTemp;
+                    } else {
+                        toPass = argTemp;
+                    }
                 }
             }
-        }
-        
-        // Step 2: Emit PARAM instructions for all evaluated args
-        // (Arguments are now evaluated, side effects complete)
-        for (size_t i = 0; i < evaluatedArgs.size(); i++) {
-            cout << "DEBUG: Emitting param " << i << ": " << evaluatedArgs[i] << endl;
-            instructions.emplace_back(TACOp::PARAM, "", evaluatedArgs[i]);
+            cout << "DEBUG: Emitting param " << i << ": " << toPass << endl;
+            instructions.emplace_back(TACOp::PARAM, "", toPass);
         }
     }
     
-    // Step 3: Emit the CALL instruction
+    // Step 3: Emit the CALL instruction (direct or indirect)
     string resultTemp = createTemp();
-    instructions.emplace_back(TACOp::CALL, resultTemp, funcName);
+    instructions.emplace_back(TACOp::CALL, resultTemp, callOperand);
     
     return resultTemp;
 }
@@ -1159,6 +1207,16 @@ void IRGenerator::generateDeclaration(Node* node) {
                                 declaredSize = stoi(arrayNodeCandidate->children[1]->lexeme);
                             }
                             cout << "DEBUG: Array declaration with init: " << arrayName << endl;
+                            // Guard local static array initialization to run once
+                            string endLabel_guard;
+                            string flagName_guard;
+                            bool guarded_static_array = false;
+                            if (isStatic && !currentFunction.empty()) {
+                                guarded_static_array = true;
+                                endLabel_guard = createLabel("static_init_end");
+                                flagName_guard = arrayName + "__inited";
+                                instructions.emplace_back(TACOp::IF_GOTO, endLabel_guard, flagName_guard);
+                            }
                             
                             // Compute base address & element size
                             string baseAddr = createTemp();
@@ -1298,6 +1356,12 @@ void IRGenerator::generateDeclaration(Node* node) {
                                     }
                                 }
                                 // Done handling string literal init
+                                if (guarded_static_array) {
+                                    string oneTempG = createTemp();
+                                    instructions.emplace_back(TACOp::CONST, oneTempG, "1");
+                                    instructions.emplace_back(TACOp::ASSIGN, flagName_guard, oneTempG);
+                                    instructions.emplace_back(TACOp::LABEL, endLabel_guard);
+                                }
                                 continue;
                             }
 
@@ -1406,6 +1470,12 @@ void IRGenerator::generateDeclaration(Node* node) {
 
                                 emitNested(initNode, 0, 0);
                             }
+                            if (guarded_static_array) {
+                                string oneTempG = createTemp();
+                                instructions.emplace_back(TACOp::CONST, oneTempG, "1");
+                                instructions.emplace_back(TACOp::ASSIGN, flagName_guard, oneTempG);
+                                instructions.emplace_back(TACOp::LABEL, endLabel_guard);
+                            }
                             continue;
                         }
                     }
@@ -1450,6 +1520,16 @@ void IRGenerator::generateDeclaration(Node* node) {
                                         // Base address of the aggregate
                                         string baseAddr = createTemp();
                                         instructions.emplace_back(TACOp::ADDRESS, baseAddr, varName);
+                                        // Guard local static struct initialization
+                                        string endLabel_guard2;
+                                        string flagName_guard2;
+                                        bool guarded_static_struct = false;
+                                        if (isStatic && !currentFunction.empty()) {
+                                            guarded_static_struct = true;
+                                            endLabel_guard2 = createLabel("static_init_end");
+                                            flagName_guard2 = varName + "__inited";
+                                            instructions.emplace_back(TACOp::IF_GOTO, endLabel_guard2, flagName_guard2);
+                                        }
                                         // Iterate members in the stored order (map order for now)
                                         size_t idx = 0;
                                         for (const auto& member : structSym->structMembers) {
@@ -1468,6 +1548,12 @@ void IRGenerator::generateDeclaration(Node* node) {
                                             }
                                             instructions.emplace_back(TACOp::STORE, memberAddr, valueTemp);
                                             idx++;
+                                        }
+                                        if (guarded_static_struct) {
+                                            string oneTempG2 = createTemp();
+                                            instructions.emplace_back(TACOp::CONST, oneTempG2, "1");
+                                            instructions.emplace_back(TACOp::ASSIGN, flagName_guard2, oneTempG2);
+                                            instructions.emplace_back(TACOp::LABEL, endLabel_guard2);
                                         }
                                         // Skip generic scalar assignment handling
                                         continue;
@@ -1500,16 +1586,53 @@ void IRGenerator::generateDeclaration(Node* node) {
                         staticVariables.insert(varName);
                         cout << "DEBUG: Static variable: " << varName << endl;
                     }
-                    
+
                     // Generate initialization if present
                     if (!varName.empty() && initNode->name != "EMPTY") {
-                        string initTemp = generateExpression(initNode);
-                        if (!initTemp.empty()) {
-                            instructions.emplace_back(TACOp::ASSIGN, varName, initTemp);
-                            cout << "Generated assignment: " << varName << " = " << initTemp << endl;
+                        // Local static inside a function: initialize once with a guard
+                        if (isStatic && !currentFunction.empty()) {
+                            string endLabel = createLabel("static_init_end");
+                            string flagName = varName + "__inited";
+                            // If flag is true, skip initialization
+                            instructions.emplace_back(TACOp::IF_GOTO, endLabel, flagName);
+
+                            string initTemp = generateExpression(initNode);
+                            if (!initTemp.empty()) {
+                                instructions.emplace_back(TACOp::ASSIGN, varName, initTemp);
+                                cout << "Generated (once) assignment: " << varName << " = " << initTemp << endl;
+                            }
+                            // Set the guard flag to 1
+                            string oneTemp = createTemp();
+                            instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+                            instructions.emplace_back(TACOp::ASSIGN, flagName, oneTemp);
+                            // End label
+                            instructions.emplace_back(TACOp::LABEL, endLabel);
+                        } else {
+                            // Non-static or global/static at file scope: assign normally
+                            string initTemp = generateExpression(initNode);
+                            if (!initTemp.empty()) {
+                                instructions.emplace_back(TACOp::ASSIGN, varName, initTemp);
+                                cout << "Generated assignment: " << varName << " = " << initTemp << endl;
+                            }
                         }
                     } else if (!varName.empty()) {
-                        cout << "DEBUG: Uninitialized variable " << varName << endl;
+                        // Handle uninitialized local statics: zero-initialize once
+                        if (isStatic && !currentFunction.empty()) {
+                            string endLabel = createLabel("static_init_end");
+                            string flagName = varName + "__inited";
+                            instructions.emplace_back(TACOp::IF_GOTO, endLabel, flagName);
+                            // Assign 0 once
+                            string zeroTemp = createTemp();
+                            instructions.emplace_back(TACOp::CONST, zeroTemp, "0");
+                            instructions.emplace_back(TACOp::ASSIGN, varName, zeroTemp);
+                            // Mark initialized
+                            string oneTemp = createTemp();
+                            instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+                            instructions.emplace_back(TACOp::ASSIGN, flagName, oneTemp);
+                            instructions.emplace_back(TACOp::LABEL, endLabel);
+                        } else {
+                            cout << "DEBUG: Uninitialized variable " << varName << endl;
+                        }
                     }
                 }
             }
@@ -1886,7 +2009,7 @@ string IRGenerator::generatePreIncrement(Node* node) {
     
     Node* operand = node->children[0];
     // Fast path: simple identifier
-    if (operand->name == "IDENTIFIER") {
+    if (operand->name == "IDENTIFIER" && !(operand->symbol && operand->symbol->isReference)) {
         string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
@@ -1915,7 +2038,7 @@ string IRGenerator::generatePreDecrement(Node* node) {
     if (!node || node->children.empty()) return "";
     
     Node* operand = node->children[0];
-    if (operand->name == "IDENTIFIER") {
+    if (operand->name == "IDENTIFIER" && !(operand->symbol && operand->symbol->isReference)) {
         string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
@@ -1943,7 +2066,7 @@ string IRGenerator::generatePostIncrement(Node* node) {
     if (!node || node->children.empty()) return "";
     
     Node* operand = node->children[0];
-    if (operand->name == "IDENTIFIER") {
+    if (operand->name == "IDENTIFIER" && !(operand->symbol && operand->symbol->isReference)) {
         string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
@@ -1973,7 +2096,7 @@ string IRGenerator::generatePostDecrement(Node* node) {
     if (!node || node->children.empty()) return "";
     
     Node* operand = node->children[0];
-    if (operand->name == "IDENTIFIER") {
+    if (operand->name == "IDENTIFIER" && !(operand->symbol && operand->symbol->isReference)) {
         string varName = getUniqueNameFor(operand, operand->lexeme);
         bool isPtr = isPointerType(operand);
         int stepSize = isPtr ? getPointedToSize(operand) : 1;
@@ -2264,7 +2387,7 @@ string IRGenerator::generateTernaryOperator(Node* node) {
 string IRGenerator::generateArrayStore(Node* arrayNode, Node* valueNode) {
     if (!arrayNode || arrayNode->children.size() < 2) return "";
     
-    cout << "DEBUG: Generating array store" << endl;
+    if (kIrDebug) cout << "DEBUG: Generating array store" << endl;
     
     Node* arrayBase = arrayNode->children[0];
     // Unwrap EXPR_LIST for base if present (e.g., from parser wrappers)
@@ -2278,7 +2401,7 @@ string IRGenerator::generateArrayStore(Node* arrayNode, Node* valueNode) {
     
     // Check if this is multi-dimensional array store
     if (arrayBase->name == "ARRAY_ACCESS") {
-        cout << "DEBUG: Multi-dimensional array store" << endl;
+        if (kIrDebug) cout << "DEBUG: Multi-dimensional array store" << endl;
         
         // Get address of arr[i] (sub-array)
         string subArrayAddr = generateMultiDimArrayAddress(arrayBase);
@@ -2346,17 +2469,23 @@ string baseAddr = createTemp();
         Symbol* sym = baseExpr->symbol;
         string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
     if (sym && sym->isArray) {
-        // Array variable: take address of the array object
+        if (sym->isReference) {
+            // Reference to array: baseName already holds base address
+            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
+            if (kIrDebug) cout << "DEBUG: Array store on array REFERENCE IDENTIFIER, using address value" << endl;
+        } else {
+            // Array variable: take address of the array object
             instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
-        cout << "DEBUG: Array store on array IDENTIFIER, using ADDRESS" << endl;
+            if (kIrDebug) cout << "DEBUG: Array store on array IDENTIFIER, using ADDRESS" << endl;
+        }
     } else if (sym && sym->pointerDepth > 0) {
         // Pointer variable: use pointer value as base address
             instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
-        cout << "DEBUG: Array store on pointer IDENTIFIER, using pointer value" << endl;
+        if (kIrDebug) cout << "DEBUG: Array store on pointer IDENTIFIER, using pointer value" << endl;
     } else {
         // Fallback: treat as taking address (unlikely)
             instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
-        cout << "DEBUG: Array store on IDENTIFIER, default ADDRESS" << endl;
+        if (kIrDebug) cout << "DEBUG: Array store on IDENTIFIER, default ADDRESS" << endl;
     }
 }
 else if (baseExpr->name == "ARRAY_ACCESS") {
@@ -2419,7 +2548,7 @@ else {
     // Store value
     instructions.emplace_back(TACOp::STORE, finalAddr, valueTemp);
     
-    cout << "DEBUG: Array store complete - STORE at address " << finalAddr << endl;
+    if (kIrDebug) cout << "DEBUG: Array store complete - STORE at address " << finalAddr << endl;
     
     return valueTemp;
 }
@@ -2439,7 +2568,7 @@ string IRGenerator::generateArrayAccess(Node* node) {
     
     // Check if base is itself an array access (multi-dimensional)
     if (baseExpr->name == "ARRAY_ACCESS") {
-        cout << "DEBUG: Multi-dimensional array access detected" << endl;
+        if (kIrDebug) cout << "DEBUG: Multi-dimensional array access detected" << endl;
         
         string subArrayAddr = generateMultiDimArrayAddress(baseExpr);
         
@@ -2497,17 +2626,23 @@ if (baseExpr->name == "IDENTIFIER") {
     Symbol* sym = baseExpr->symbol;
     string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
     if (sym && sym->isArray) {
-        // Array variable: address of array object
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
-        cout << "DEBUG: Array access on array IDENTIFIER, using ADDRESS" << endl;
+        if (sym->isReference) {
+            // Reference to array: variable already holds base address
+            instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
+            if (kIrDebug) cout << "DEBUG: Array access on array REFERENCE IDENTIFIER, using address value" << endl;
+        } else {
+            // Array variable: address of array object
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
+            if (kIrDebug) cout << "DEBUG: Array access on array IDENTIFIER, using ADDRESS" << endl;
+        }
     } else if (sym && sym->pointerDepth > 0) {
         // Pointer variable: use its value
-        instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
-        cout << "DEBUG: Array access on pointer IDENTIFIER, using pointer value" << endl;
+    instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
+    if (kIrDebug) cout << "DEBUG: Array access on pointer IDENTIFIER, using pointer value" << endl;
     } else {
         // Fallback
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
-        cout << "DEBUG: Array access on IDENTIFIER, default ADDRESS" << endl;
+    instructions.emplace_back(TACOp::ADDRESS, baseAddr, baseName);
+    if (kIrDebug) cout << "DEBUG: Array access on IDENTIFIER, default ADDRESS" << endl;
     }
 }
 else if (baseExpr->name == "ARRAY_ACCESS") {
@@ -2570,7 +2705,7 @@ else {
     // Load value
     instructions.emplace_back(TACOp::LOAD, resultTemp, elemAddr);
     
-    cout << "DEBUG: Array access complete - LOAD from address " << elemAddr << endl;
+    if (kIrDebug) cout << "DEBUG: Array access complete - LOAD from address " << elemAddr << endl;
     
     return resultTemp;
 }
@@ -3592,15 +3727,16 @@ std::string IRGenerator::resolveStructTypeFromLValue(Node* node) {
 }
 
 int IRGenerator::getMemberAlignment(const string& typeName) {
-    cout << "DEBUG align: type='" << typeName << "'" << endl;
+    static const bool kIrDebug = false;
+    if (kIrDebug) cout << "DEBUG align: type='" << typeName << "'" << endl;
     // Pointers align to 8 (spellings with * or typedef pointers)
     if (typeName.find("*") != string::npos) return 8;
     // Arrays: alignment is alignment of element type
     auto lb = typeName.find('[');
     if (lb != string::npos) {
         string base = typeName.substr(0, lb);
-        int a = getMemberAlignment(base);
-        cout << " -> align array base '" << base << "' = " << a << endl;
+    int a = getMemberAlignment(base);
+    if (kIrDebug) cout << " -> align array base '" << base << "' = " << a << endl;
         return a;
     }
     if (!typeName.empty()) {
@@ -3609,10 +3745,10 @@ int IRGenerator::getMemberAlignment(const string& typeName) {
     }
 
     // Base type alignments (simplified - match size for basic types)
-    if (typeName == "char" || typeName == "bool") { cout << " -> align 1" << endl; return 1; }
-    if (typeName == "short") { cout << " -> align 2" << endl; return 2; }
-    if (typeName == "int" || typeName == "float") { cout << " -> align 4" << endl; return 4; }
-    if (typeName == "long" || typeName == "double") { cout << " -> align 8" << endl; return 8; }
+    if (typeName == "char" || typeName == "bool") { if (kIrDebug) cout << " -> align 1" << endl; return 1; }
+    if (typeName == "short") { if (kIrDebug) cout << " -> align 2" << endl; return 2; }
+    if (typeName == "int" || typeName == "float") { if (kIrDebug) cout << " -> align 4" << endl; return 4; }
+    if (typeName == "long" || typeName == "double") { if (kIrDebug) cout << " -> align 8" << endl; return 8; }
 
     // For struct/union or typedefs to them, use max member alignment
     string baseType = typeName;
@@ -3635,10 +3771,10 @@ int IRGenerator::getMemberAlignment(const string& typeName) {
             int memberAlign = getMemberAlignment(member.second);
             maxAlign = max(maxAlign, memberAlign);
         }
-        cout << " -> align struct/union tag '" << baseType << "' = " << maxAlign << endl;
+        if (kIrDebug) cout << " -> align struct/union tag '" << baseType << "' = " << maxAlign << endl;
         return maxAlign;
     }
-    cout << " -> default align 4" << endl;
+    if (kIrDebug) cout << " -> default align 4" << endl;
     return 4;  // Default alignment
 }
 
@@ -3711,8 +3847,7 @@ int IRGenerator::getStructSize(Symbol* structSym) {
 
 string IRGenerator::generateMultiDimArrayAddress(Node* arrayNode) {
     if (!arrayNode || arrayNode->children.size() < 2) return "";
-    
-    cout << "DEBUG: generateMultiDimArrayAddress" << endl;
+    if (kIrDebug) cout << "DEBUG: generateMultiDimArrayAddress" << endl;
     
     Node* arrayBase = arrayNode->children[0];
     Node* indexExprNode = arrayNode->children[1];
@@ -3743,7 +3878,7 @@ string IRGenerator::generateMultiDimArrayAddress(Node* arrayNode) {
     int dimIndex = getDimensionIndex(arrayNode);
     int subArraySize = getSubArraySizeForDimension(arrayBase, dimIndex);
     
-    cout << "DEBUG: Dimension index = " << dimIndex << ", sub-array size = " << subArraySize << endl;
+    if (kIrDebug) cout << "DEBUG: Dimension index = " << dimIndex << ", sub-array size = " << subArraySize << endl;
     
     // Generate: offset = index * subArraySize
     string indexTemp = generateExpression(indexExpr);
@@ -3781,7 +3916,7 @@ int IRGenerator::getDimensionIndex(Node* arrayAccessNode) {
 }
 
 int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
-    cout << "=== DEBUG getSubArraySizeForDimension, dimIndex = " << dimIndex << " ===" << endl;
+    if (kIrDebug) cout << "=== DEBUG getSubArraySizeForDimension, dimIndex = " << dimIndex << " ===" << endl;
     
     // Find base identifier
     Node* base = arrayNode;
@@ -3799,11 +3934,13 @@ int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
     // Base element size: if element type is a pointer, each element is pointer-sized
     int elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
     
-    cout << "DEBUG: Array " << base->lexeme << " has " << dimensions.size() << " dimensions: ";
-    for (int d : dimensions) cout << d << " ";
-    cout << endl;
-    cout << "DEBUG: Base element size = " << elemSize << endl;
-    cout << "DEBUG: Indexing dimension " << dimIndex << endl;
+    if (kIrDebug) {
+        cout << "DEBUG: Array " << base->lexeme << " has " << dimensions.size() << " dimensions: ";
+        for (int d : dimensions) cout << d << " ";
+        cout << endl;
+        cout << "DEBUG: Base element size = " << elemSize << endl;
+        cout << "DEBUG: Indexing dimension " << dimIndex << endl;
+    }
     
     // For dimension dimIndex, we need to multiply by all dimensions AFTER dimIndex
     // For arr[3][4]:
@@ -3812,11 +3949,11 @@ int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
     
     int subArraySize = elemSize;
     for (size_t i = dimIndex + 1; i < dimensions.size(); i++) {
-        cout << "DEBUG: Multiplying by dimensions[" << i << "] = " << dimensions[i] << endl;
+    if (kIrDebug) cout << "DEBUG: Multiplying by dimensions[" << i << "] = " << dimensions[i] << endl;
         subArraySize *= dimensions[i];
     }
     
-    cout << "DEBUG: Final sub-array size = " << subArraySize << endl;
+    if (kIrDebug) cout << "DEBUG: Final sub-array size = " << subArraySize << endl;
     return subArraySize;
 }
 
@@ -4380,8 +4517,12 @@ string IRGenerator::generateLValueAddress(Node* lvalue) {
     if (!lvalue) return "";
     // Identifier -> &var
     if (lvalue->name == "IDENTIFIER") {
-        string addr = createTemp();
         string varName = getUniqueNameFor(lvalue, lvalue->lexeme);
+        // If it's a reference, the variable already holds the address
+        if (lvalue->symbol && lvalue->symbol->isReference) {
+            return varName;
+        }
+        string addr = createTemp();
         instructions.emplace_back(TACOp::ADDRESS, addr, varName);
         return addr;
     }
@@ -4434,6 +4575,10 @@ int IRGenerator::getIncrementStepForLValue(Node* lvalue) {
     // Identifier: if the variable itself is a pointer, step by pointed-to size; else 1
     if (lvalue->name == "IDENTIFIER") {
         Symbol* sym = lvalue->symbol;
+        // References: treat as underlying scalar for step purposes (1)
+        if (sym && sym->isReference) {
+            return 1;
+        }
         if (sym && sym->pointerDepth > 0) {
             return getBaseTypeSize(sym->type);  // size of what the pointer points to
         }
@@ -4472,4 +4617,6 @@ int IRGenerator::getIncrementStepForLValue(Node* lvalue) {
     // Member values: conservatively treat as scalar (1). For pointer members, they will be handled via identifier path when accessed directly.
     return 1;
 }
+
+
 
