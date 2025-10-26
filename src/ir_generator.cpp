@@ -164,6 +164,130 @@ IRGenerator::IRGenerator(SymbolTable& symTab)
     : symbolTable(symTab), tempCounter(0), labelCounter(0), 
     currentFunction(""), currentBreakLabel(""), currentContinueLabel("") {}
 
+namespace {
+
+static inline bool isHex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static inline int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return 0;
+}
+
+static unsigned char decodeCharLiteralIR(const std::string& literal) {
+    if (literal.size() < 3) return 0;
+    size_t q = literal.find('\'');
+    if (q == std::string::npos) q = literal.find('"');
+    if (q == std::string::npos || q + 1 >= literal.size()) return 0;
+    size_t p = q + 1;
+    if (literal[p] != '\\') return static_cast<unsigned char>(literal[p]);
+    if (p + 1 >= literal.size()) return 0;
+    char e = literal[p + 1];
+    if (e == 'x') {
+        unsigned int v = 0; bool any = false; size_t i = p + 2;
+        while (i < literal.size() && isHex(literal[i])) { any = true; v = (v << 4) | (unsigned)hexVal(literal[i]); ++i; }
+        return any ? (unsigned char)(v & 0xFF) : 0;
+    }
+    if (e == 'u') {
+        unsigned int v = 0; size_t i = p + 2;
+        for (int k = 0; k < 4 && i < literal.size(); ++k, ++i) { if (!isHex(literal[i])) return 0; v = (v << 4) | (unsigned)hexVal(literal[i]); }
+        return (unsigned char)(v & 0xFF);
+    }
+    if (e == 'U') {
+        unsigned int v = 0; size_t i = p + 2;
+        for (int k = 0; k < 8 && i < literal.size(); ++k, ++i) { if (!isHex(literal[i])) return 0; v = (v << 4) | (unsigned)hexVal(literal[i]); }
+        return (unsigned char)(v & 0xFF);
+    }
+    if (e >= '0' && e <= '7') {
+        unsigned int v = 0; size_t i = p + 1; int cnt = 0;
+        while (i < literal.size() && cnt < 3 && literal[i] >= '0' && literal[i] <= '7') { v = (v << 3) | (unsigned)(literal[i] - '0'); ++i; ++cnt; }
+        return (unsigned char)(v & 0xFF);
+    }
+    switch (e) {
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '0': return '\0';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        case 'a': return '\a';
+        case '?': return '?';
+        default: return (unsigned char)e;
+    }
+}
+
+static std::string stripQuotes(const std::string& s) {
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') || (s.front() == '\'' && s.back() == '\''))) {
+        return s.substr(1, s.size() - 2);
+    }
+    // Also handle optional prefix like L"..." or u8"..." or u"..."
+    size_t first = s.find('"');
+    if (first != std::string::npos && s.back() == '"' && first + 1 < s.size()) {
+        return s.substr(first + 1, s.size() - first - 2);
+    }
+    return s;
+}
+
+static std::vector<unsigned char> decodeCString(const std::string& rawWithQuotes) {
+    std::string raw = stripQuotes(rawWithQuotes);
+    std::vector<unsigned char> out;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        unsigned char c = raw[i];
+        if (c != '\\') { out.push_back(c); continue; }
+        if (i + 1 >= raw.size()) { out.push_back('\\'); break; }
+        char e = raw[++i];
+        switch (e) {
+            case '\\': out.push_back('\\'); break;
+            case '\'': out.push_back('\''); break;
+            case '"': out.push_back('"'); break;
+            case 'n': out.push_back('\n'); break;
+            case 't': out.push_back('\t'); break;
+            case 'r': out.push_back('\r'); break;
+            case '0': out.push_back('\0'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'v': out.push_back('\v'); break;
+            case 'a': out.push_back('\a'); break;
+            case '?': out.push_back('?'); break;
+            case 'x': {
+                unsigned int v = 0; bool any = false;
+                while (i + 1 < raw.size() && isHex(raw[i+1])) { any = true; v = (v << 4) | (unsigned)hexVal(raw[++i]); }
+                out.push_back(any ? (unsigned char)(v & 0xFF) : (unsigned char)0);
+                break;
+            }
+            case 'u': {
+                unsigned int v = 0; int k = 0; while (k < 4 && i + 1 < raw.size() && isHex(raw[i+1])) { v = (v << 4) | (unsigned)hexVal(raw[++i]); ++k; }
+                out.push_back((unsigned char)(v & 0xFF));
+                break;
+            }
+            case 'U': {
+                unsigned int v = 0; int k = 0; while (k < 8 && i + 1 < raw.size() && isHex(raw[i+1])) { v = (v << 4) | (unsigned)hexVal(raw[++i]); ++k; }
+                out.push_back((unsigned char)(v & 0xFF));
+                break;
+            }
+            default: {
+                if (e >= '0' && e <= '7') {
+                    unsigned int v = (unsigned)(e - '0'); int cnt = 1;
+                    while (cnt < 3 && i + 1 < raw.size() && raw[i+1] >= '0' && raw[i+1] <= '7') { v = (v << 3) | (unsigned)(raw[++i] - '0'); ++cnt; }
+                    out.push_back((unsigned char)(v & 0xFF));
+                } else {
+                    out.push_back((unsigned char)e);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+}
+
 // Produce a unique IR name for an identifier using its bound Symbol
 std::string IRGenerator::getUniqueNameFor(Node* idNode, const std::string& fallback) {
     if (!idNode) return fallback;
@@ -354,9 +478,18 @@ void IRGenerator::generateStatement(Node* node) {
     else if (node->name == "WHILE_STMT") {
         generateWhileStatement(node);
     }
+    else if (node->name == "DO_WHILE_STMT") {
+        generateDoWhileStatement(node);
+    }
+    else if (node->name == "UNTIL_STMT") {
+        generateUntilStatement(node);
+    }
     else if (node->name == "FOR_STMT_2" || node->name == "FOR_STMT_3") {
-    generateForStatement(node);
-}
+        generateForStatement(node);
+    }
+    else if (node->name == "SWITCH_STMT") {
+        generateSwitchStatement(node);
+    }
     else if (node->name == "UNARY_OP") {
         // Unary operations as statements: evaluate for side effects only
         if (!node->children.empty()) {
@@ -371,15 +504,18 @@ void IRGenerator::generateStatement(Node* node) {
     else if (node->name == "RETURN_STMT") {
         generateReturnStatement(node);
     }
-else if (node->name == "CONTINUE_STMT") {
-    generateContinueStatement();
-}
-else if (node->name == "GOTO_STMT") {
-    generateGotoStatement(node);
-}
-else if (node->name == "LABELED_STMT" || node->name == "LABEL") {
-    generateLabeledStatement(node);
-}
+    else if (node->name == "BREAK_STMT") {
+        generateBreakStatement();
+    }
+    else if (node->name == "CONTINUE_STMT") {
+        generateContinueStatement();
+    }
+    else if (node->name == "GOTO_STMT") {
+        generateGotoStatement(node);
+    }
+    else if (node->name == "LABELED_STMT" || node->name == "LABEL") {
+        generateLabeledStatement(node);
+    }
     else {
         // For other statement types, process children
         cout << "DEBUG: Falling back to processing children for " << node->name << endl;
@@ -494,7 +630,12 @@ string IRGenerator::generateExpression(Node* node) {
     else if (node->name == "INTEGER_CONSTANT" || node->name == "FLOAT_CONSTANT" || 
              node->name == "CHAR_LITERAL" || node->name == "BOOL_LITERAL") {
         string temp = createTemp();
-        instructions.emplace_back(TACOp::CONST, temp, node->lexeme);
+        if (node->name == "CHAR_LITERAL") {
+            unsigned char ch = decodeCharLiteralIR(node->lexeme);
+            instructions.emplace_back(TACOp::CONST, temp, to_string((unsigned int)ch));
+        } else {
+            instructions.emplace_back(TACOp::CONST, temp, node->lexeme);
+        }
         return temp;
     }
     else if (node->name == "STRING_LITERAL") {
@@ -1109,27 +1250,8 @@ void IRGenerator::generateDeclaration(Node* node) {
                                 } else if (declaredSize > 0) {
                                     totalElements = declaredSize;
                                 }
-                                // Extract string contents without quotes and handle a few escapes
-                                string raw = initNode->lexeme;
-                                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
-                                    raw = raw.substr(1, raw.size() - 2);
-                                }
-                                string decoded;
-                                for (size_t i = 0; i < raw.size(); ++i) {
-                                    char c = raw[i];
-                                    if (c == '\\' && i + 1 < raw.size()) {
-                                        char n = raw[i+1];
-                                        if (n == 'n') { decoded.push_back('\n'); i++; continue; }
-                                        if (n == 't') { decoded.push_back('\t'); i++; continue; }
-                                        if (n == 'r') { decoded.push_back('\r'); i++; continue; }
-                                        if (n == '0') { decoded.push_back('\0'); i++; continue; }
-                                        if (n == '"') { decoded.push_back('"'); i++; continue; }
-                                        if (n == '\\') { decoded.push_back('\\'); i++; continue; }
-                                        // Fallback: keep as-is
-                                    }
-                                    decoded.push_back(c);
-                                }
-                                int writeCount = static_cast<int>(decoded.size());
+                                auto decodedVec = decodeCString(initNode->lexeme);
+                                int writeCount = static_cast<int>(decodedVec.size());
                                 // Emit characters up to array size - 1 (reserve for null), if size known
                                 int limit = totalElements > 0 ? max(0, totalElements - 1) : writeCount;
                                 int actualChars = (totalElements > 0) ? min(writeCount, limit) : writeCount;
@@ -1141,7 +1263,7 @@ void IRGenerator::generateDeclaration(Node* node) {
                                     instructions.emplace_back(TACOp::CONST, idxTemp, to_string(i));
                                     instructions.emplace_back(TACOp::MUL, offTemp, idxTemp, elemSizeTemp);
                                     instructions.emplace_back(TACOp::ADD, addrTemp, baseAddr, offTemp);
-                                    instructions.emplace_back(TACOp::CONST, valTemp, to_string(static_cast<unsigned char>(decoded[i])));
+                                    instructions.emplace_back(TACOp::CONST, valTemp, to_string(static_cast<unsigned char>(decodedVec[i])));
                                     instructions.emplace_back(TACOp::STORE, addrTemp, valTemp);
                                 }
                                 // Null-terminate if space allows
@@ -1253,29 +1375,12 @@ void IRGenerator::generateDeclaration(Node* node) {
                                             } else if (child->name == "STRING_LITERAL" && elemSize == 1 && dimIdx == (int)dims.size() - 2) {
                                                 // Handle string literal initializing a whole char row
                                                 int rowLen = dims[dimIdx + 1];
-                                                string raw = child->lexeme;
-                                                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
-                                                    raw = raw.substr(1, raw.size() - 2);
-                                                }
-                                                string decoded;
-                                                for (size_t k = 0; k < raw.size(); ++k) {
-                                                    char c = raw[k];
-                                                    if (c == '\\' && k + 1 < raw.size()) {
-                                                        char n = raw[k+1];
-                                                        if (n == 'n') { decoded.push_back('\n'); ++k; continue; }
-                                                        if (n == 't') { decoded.push_back('\t'); ++k; continue; }
-                                                        if (n == 'r') { decoded.push_back('\r'); ++k; continue; }
-                                                        if (n == '0') { decoded.push_back('\0'); ++k; continue; }
-                                                        if (n == '"') { decoded.push_back('"'); ++k; continue; }
-                                                        if (n == '\\') { decoded.push_back('\\'); ++k; continue; }
-                                                    }
-                                                    decoded.push_back(c);
-                                                }
+                                                auto decodedVec = decodeCString(child->lexeme);
                                                 int startElem = baseElem + processed * stride; // row start
-                                                int actualChars = rowLen > 0 ? std::min((int)decoded.size(), std::max(0, rowLen - 1)) : (int)decoded.size();
+                                                int actualChars = rowLen > 0 ? std::min((int)decodedVec.size(), std::max(0, rowLen - 1)) : (int)decodedVec.size();
                                                 for (int j = 0; j < actualChars; ++j) {
                                                     string chTemp = createTemp();
-                                                    instructions.emplace_back(TACOp::CONST, chTemp, to_string((unsigned char)decoded[j]));
+                                                    instructions.emplace_back(TACOp::CONST, chTemp, to_string((unsigned char)decodedVec[j]));
                                                     emitStoreAtIndex(startElem + j, chTemp);
                                                 }
                                                 // Null terminate if room
@@ -1741,22 +1846,38 @@ void IRGenerator::generateDoWhileStatement(Node* node) {
     cout << "DEBUG: Generating do-while statement" << endl;
     
     string startLabel = createLabel("do_start");
+    string condLabel = createLabel("do_cond");
     string endLabel = createLabel("do_end");
-    
+
+    // Save previous labels
+    string prevBreakLabel = currentBreakLabel;
+    string prevContinueLabel = currentContinueLabel;
+
+    // Set current labels for break/continue
+    currentBreakLabel = endLabel;
+    currentContinueLabel = condLabel;
+
     // Loop body label
     instructions.emplace_back(TACOp::LABEL, startLabel);
-    
+
     // Generate loop body (child 0)
     generateStatement(node->children[0]);
-    
+
+    // Condition check label (targets continue)
+    instructions.emplace_back(TACOp::LABEL, condLabel);
+
     // Generate condition (child 1)
     string condTemp = generateExpression(node->children[1]);
-    
+
     // If condition is true, jump back to start
     instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
-    
+
     // End label
     instructions.emplace_back(TACOp::LABEL, endLabel);
+
+    // Restore previous labels
+    currentBreakLabel = prevBreakLabel;
+    currentContinueLabel = prevContinueLabel;
 }
 
 
@@ -1981,6 +2102,10 @@ void IRGenerator::generateSwitchStatement(Node* node) {
                             // Unknown identifier in case (error, but use as-is)
                             info.value = caseName;
                         }
+                    } else if (caseValueNode->name == "CHAR_LITERAL") {
+                        // Decode char literal to numeric for robust IR
+                        unsigned char ch = decodeCharLiteralIR(caseValueNode->lexeme);
+                        info.value = to_string((unsigned int)ch);
                     } else {
                         // INTEGER_CONSTANT or other literal
                         info.value = caseValueNode->lexeme;
@@ -4347,3 +4472,4 @@ int IRGenerator::getIncrementStepForLValue(Node* lvalue) {
     // Member values: conservatively treat as scalar (1). For pointer members, they will be handled via identifier path when accessed directly.
     return 1;
 }
+
