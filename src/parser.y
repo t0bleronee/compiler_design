@@ -14,6 +14,9 @@
 #include <functional>
 using namespace std;
 
+// Global flag to control token printing from the lexer
+bool g_showTokens = true;
+
 extern int yylex();
 extern int yyparse();
 extern FILE* yyin;
@@ -183,6 +186,8 @@ void registerTypedefNames(Node* declSpec, Node* initDeclList) {
 %type <node> parameter_type_list
 %type <node> parameter_list
 %type <node> parameter_declaration
+%type <node> ref_declarator
+%type <node> ref_direct_declarator
 %type <node> identifier_list
 
 %type <node> initializer
@@ -686,9 +691,41 @@ parameter_declaration
         $$->addChild(new Node("&"));
         $$->addChild($3);
     }
+    | declaration_specifiers AMP {
+        $$ = new Node("PARAM_DECL");
+        $$->addChild($1);
+        $$->addChild(new Node("&"));
+    }
+    // Support parenthesized reference declarators like: int (&a)[N]
+    | declaration_specifiers ref_declarator {
+        $$ = new Node("PARAM_DECL");
+        $$->addChild($1);
+        $$->addChild(new Node("&"));
+        $$->addChild($2);
+    }
     | declaration_specifiers { 
         $$ = new Node("PARAM_DECL");
         $$->addChild($1);
+    }
+    ;
+
+// Reference declarator forms limited to parenthesized '&' followed by inner declarator,
+// with optional array suffixes (e.g., int (&a)[3][4]). We strip the '&' here and return
+// the inner declarator tree so the caller can mark the parameter as a reference.
+ref_declarator
+    : ref_direct_declarator { $$ = $1; }
+    ;
+
+ref_direct_declarator
+    : LPAREN AMP declarator RPAREN { $$ = $3; }
+    | ref_direct_declarator LBRACKET RBRACKET {
+        $$ = new Node("ARRAY");
+        $$->addChild($1);
+    }
+    | ref_direct_declarator LBRACKET constant_expression RBRACKET {
+        $$ = new Node("ARRAY");
+        $$->addChild($1);
+        $$->addChild($3);
     }
     ;
 
@@ -1355,8 +1392,52 @@ void yyerror(const char* msg) {
 
 
 int main(int argc, char** argv) {
-    if (argc > 1) {
-        FILE* file = fopen(argv[1], "r");
+    // CLI options
+    string inputPath;
+    string irOut = "output.3ac";
+    bool showAST = true;
+    bool genDOT = true;
+    bool printIR = true;
+
+    // Parse simple CLI flags
+    for (int i = 1; i < argc; ++i) {
+        string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            printf("Usage: %s [options] [input-file]\n", argv[0]);
+            printf("Options:\n");
+            printf("  --no-tokens         Disable token stream printing\n");
+            printf("  --no-ast            Disable AST printing\n");
+            printf("  --no-dot            Do not generate ast.dot/png\n");
+            printf("  --no-ir-print       Do not print TAC to stdout\n");
+            printf("  -o <file>           Write TAC to <file> (default: output.3ac)\n");
+            printf("  -h, --help          Show this help\n");
+            return 0;
+        } else if (arg == "--no-tokens") {
+            g_showTokens = false;
+        } else if (arg == "--no-ast") {
+            showAST = false;
+        } else if (arg == "--no-dot") {
+            genDOT = false;
+        } else if (arg == "--no-ir-print") {
+            printIR = false;
+        } else if (arg == "-o") {
+            if (i + 1 < argc) {
+                irOut = argv[++i];
+            } else {
+                fprintf(stderr, "Missing filename after -o\n");
+                return 1;
+            }
+        } else if (!arg.empty() && arg[0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+            return 1;
+        } else {
+            // Positional input file (first non-flag)
+            inputPath = arg;
+        }
+    }
+
+    if (!inputPath.empty()) {
+        FILE* file = fopen(inputPath.c_str(), "r");
         if (!file) {
             perror("Error opening file");
             return 1;
@@ -1375,26 +1456,36 @@ int main(int argc, char** argv) {
                      /*isArray=*/false, /*arrayDims=*/{}, /*pointerDepth=*/0,
                      /*isStruct=*/false, /*isEnum=*/false, /*isUnion=*/false,
                      /*isTypedef=*/true, /*aliasedType=*/"char*");
-    printf("Starting syntax analysis...\n");
-    printf("%-40s | %s\n", "TOKEN", "LEXEME");
-    printf("------------------------------------------|----------\n");
+    if (g_showTokens) {
+        printf("Starting syntax analysis...\n");
+        printf("%-40s | %s\n", "TOKEN", "LEXEME");
+        printf("------------------------------------------|----------\n");
+    }
     
     int result = yyparse();
     
     if (root) {
-        cout << "\nPrinting AST:\n";
-        root->printTree();
+        if (showAST) {
+            cout << "\nPrinting AST:\n";
+            root->printTree();
+        }
 
-        ofstream out("ast.dot");
-        int nodeId = 0;
-        out << "digraph AST {" << endl;
-        root->generateDOT(out, nodeId);
-        out << "}" << endl;
-        out.close();
+        if (genDOT) {
+            ofstream out("ast.dot");
+            int nodeId = 0;
+            out << "digraph AST {" << endl;
+            root->generateDOT(out, nodeId);
+            out << "}" << endl;
+            out.close();
 
-        cout << "DOT file generated: ast.dot" << endl;
-        system("dot -Tpng ast.dot -o ast.png");
-        cout << "AST image generated: ast.png" << endl;
+            cout << "DOT file generated: ast.dot" << endl;
+            int dot_rc = system("dot -Tpng ast.dot -o ast.png");
+            if (dot_rc == 0) {
+                cout << "AST image generated: ast.png" << endl;
+            } else {
+                cout << "Note: Skipping AST PNG generation (Graphviz 'dot' not available or failed)\n";
+            }
+        }
         
         
         // If parser recorded any syntax errors, stop here and report properly.
@@ -1419,14 +1510,16 @@ int main(int argc, char** argv) {
                 bool irSuccess = irGenerator.generateIR(root);
                 
                 if (irSuccess) {
-                    // Print to console
-                    irGenerator.printIR();
+                    // Print to console if requested
+                    if (printIR) {
+                        irGenerator.printIR();
+                    }
                     
-                    // Write to file
-                    irGenerator.writeToFile("output.3ac");
+                    // Write to file (honor -o)
+                    irGenerator.writeToFile(irOut);
                     
                     cout << "✅ TAC IR generation successful" << endl;
-                    cout << "📄 TAC output written to: output.3ac" << endl;
+                    cout << "📄 TAC output written to: " << irOut << endl;
                 } else {
                     cout << "❌ TAC IR generation failed" << endl;
                     result = 1;
@@ -1439,16 +1532,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("------------------------------------------|----------\n");
-    printf("\n\n");
+    if (g_showTokens) {
+        printf("------------------------------------------|----------\n");
+        printf("\n\n");
+    }
     if (result == 0) {
         printf("✅ Compilation completed successfully\n");
     } else {
         printf("❌ Compilation failed\n");
     }
-    
-    
-    if (argc > 1) {
+    if (!inputPath.empty()) {
         fclose(yyin);
     }
     return result;
