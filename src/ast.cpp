@@ -103,3 +103,4 @@ std::string setAbstractDeclaratorType(Node* node, const std::string &type) {
     if (node) node->setType(type);
     return type;
 }
+
