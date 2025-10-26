@@ -2,6 +2,8 @@
 #include <iostream>
 #include<functional>
 #include<set>
+#include<unordered_set>
+#include<stdexcept>
 
 using namespace std;
 
@@ -9,6 +11,7 @@ SemanticAnalyzer::SemanticAnalyzer(SymbolTable& symTab)
     : symbolTable(symTab), currentFunctionReturnType(""), currentFunctionName(""), loopDepth(0), switchDepth(0) {
     currentFunctionLabels.clear();
     pendingGotoStatements.clear();
+    enumConstants.clear();
 }
 // Main entry
 bool SemanticAnalyzer::buildSymbolTable(Node* root) {
@@ -17,6 +20,7 @@ bool SemanticAnalyzer::buildSymbolTable(Node* root) {
       cout << "DEBUG: Before enterScope, active scopes = " << symbolTable.getCurrentScopeLevel() << "\n";
         // Ensure a global scope is available for all top-level declarations/definitions
         symbolTable.enterScope();  // Global scope
+    enumConstants.clear();
     
 
     cout << "\n=== Building Symbol Table ===\n";
@@ -354,6 +358,8 @@ Node *nodee=NULL;
     string returnType;
     vector<string> paramTypes;
     Node* funcDeclNode = nullptr;
+    Node* funcDeclContainer = nullptr; // The DECLARATOR or FUNCTION_DECL node holding the function declarator
+    int returnPtrDepth = 0;            // Number of '*' on the function return type declarator
     bool hasStatic = false;
     bool hasTypeSpec = false;
 
@@ -369,17 +375,95 @@ Node *nodee=NULL;
                 }
             }
         }
-        else if (child->name == "FUNCTION_DECL") {
-            funcDeclNode = child;
-            // Get function name from first child (IDENTIFIER)
-            if (!child->children.empty() && child->children[0]->name == "IDENTIFIER") {
-           nodee=child->children[0];
-                funcName = child->children[0]->lexeme;
+        else if (child->name == "FUNCTION_DECL" || child->name == "DECLARATOR") {
+            // Helper: find the deepest FUNCTION_DECL node inside this subtree
+            std::function<Node*(Node*)> findFuncDecl = [&](Node* n) -> Node* {
+                if (!n) return nullptr;
+                if (n->name == "FUNCTION_DECL") return n;
+                for (auto gc : n->children) {
+                    Node* res = findFuncDecl(gc);
+                    if (res) return res;
+                }
+                return nullptr;
+            };
+
+            Node* found = (child->name == "FUNCTION_DECL") ? child : findFuncDecl(child);
+            if (found) {
+                funcDeclNode = found;
+                funcDeclContainer = child; // Save the root where we found the function declarator
+                // Find the IDENTIFIER node within the FUNCTION_DECL subtree
+                std::function<Node*(Node*)> findIdent = [&](Node* n) -> Node* {
+                    if (!n) return nullptr;
+                    if (n->name == "IDENTIFIER") return n;
+                    for (auto gc : n->children) {
+                        Node* res = findIdent(gc);
+                        if (res) return res;
+                    }
+                    return nullptr;
+                };
+                Node* id = findIdent(funcDeclNode);
+                if (id) {
+                    nodee = id;
+                    funcName = id->lexeme;
+                }
+
+                // Count pointer depth contributed by declarator prefix (e.g., char* func())
+                if (funcDeclContainer) {
+                    std::function<int(Node*)> countPointerStars = [&](Node* node) -> int {
+                        if (!node) return 0;
+                        int total = (node->name == "POINTER") ? 1 : 0;
+                        for (auto childPtr : node->children) {
+                            total += countPointerStars(childPtr);
+                        }
+                        return total;
+                    };
+
+                    std::function<int(Node*, int)> findPointerDepth =
+                        [&](Node* current, int depthAccum) -> int {
+                            if (!current) return -1;
+                            if (current == funcDeclNode) {
+                                return depthAccum;
+                            }
+
+                            int workingDepth = depthAccum;
+                            for (auto child : current->children) {
+                                if (child == funcDeclNode) {
+                                    return workingDepth;
+                                }
+
+                                if (child->name == "POINTER") {
+                                    int foundInPointer = findPointerDepth(child, workingDepth + 1);
+                                    if (foundInPointer != -1) {
+                                        return foundInPointer;
+                                    }
+                                    workingDepth += countPointerStars(child);
+                                } else {
+                                    int found = findPointerDepth(child, workingDepth);
+                                    if (found != -1) {
+                                        return found;
+                                    }
+                                }
+                            }
+                            return -1;
+                        };
+
+                    int depth = findPointerDepth(funcDeclContainer, 0);
+                    if (depth >= 0) {
+                        returnPtrDepth = depth;
+                    }
+                }
             }
         }
     }
+// Build the full return type by applying any '*' depth from the declarator
+std::string fullReturnType = returnType;
+for (int i = 0; i < returnPtrDepth; ++i) fullReturnType += "*";
+cout << "DEBUG processFunction: func='" << (funcName.empty() ? string("<unnamed>") : funcName)
+    << "' baseReturn='" << returnType << "' ptrDepth=" << returnPtrDepth
+    << " fullReturn='" << fullReturnType << "'\n";
+
 currentFunctionName = funcName;
-currentFunctionReturnType = returnType;
+currentFunctionReturnType = fullReturnType;
 
 if (funcName.empty()) {
         addError("Function name missing");
@@ -414,7 +498,7 @@ if (funcName.empty()) {
 
  
 // Add function to symbol table with parameters
-    bool added = symbolTable.addSymbol(funcName, returnType, nodee, true, paramTypes);
+    bool added = symbolTable.addSymbol(funcName, fullReturnType, nodee, true, paramTypes);
     
   
     if (!added) {
@@ -445,7 +529,7 @@ for (auto child : node->children) {
         if (returnType != "void") {
             if (!allPathsReturn(child)) {
                 addError("Function '" + funcName + "' with non-void return type '" + 
-                         returnType + "' does not return a value on all control paths");
+                         fullReturnType + "' does not return a value on all control paths");
             }
         }
         
@@ -910,24 +994,56 @@ if (actualArgs != expectedParams) {
     return;  // Don't check types if count is wrong
 }
 
-// Check argument types
+// Check argument types (strict for function calls: disallow narrowing)
 for (size_t i = 0; i < actualArgs; i++) {
-  if (funcSym->paramTypes.size() <= i) {
-  cout<<"HI"<<endl;
+    if (funcSym->paramTypes.size() <= i) {
         break;  // Already reported count mismatch above
     }
     string argType = getExpressionType(argNodes[i]);
     string paramType = funcSym->paramTypes[i];
-    cout<<"HI00"<<endl;
-    cout<<argType<<endl;
-    cout<<paramType<<endl;
-    // Check type compatibility
-    if (!areTypesCompatible(argType, paramType, "=")) {
-        addError("Type mismatch for argument " + to_string(i + 1) + 
-                 " of function '" + funcName + "': expected '" + paramType + 
+
+    if (!areFunctionArgCompatible(argType, paramType)) {
+        addError("Type mismatch for argument " + to_string(i + 1) +
+                 " of function '" + funcName + "': expected '" + paramType +
                  "', but got '" + argType + "'");
     }
 }
+}
+
+// Strict function-argument compatibility policy:
+// - Exact match: OK
+// - Numeric vs numeric:
+//   - Disallow float/double -> integer params (narrowing)
+//   - Disallow double -> float (narrowing)
+//   - Allow others (e.g., int->float/double, int->long, float->double)
+// - Otherwise, fall back to the general assignment compatibility
+bool SemanticAnalyzer::areFunctionArgCompatible(const string& argType, const string& paramType) {
+    if (argType.empty() || paramType.empty()) return true; // unknown types: skip
+    if (argType == paramType) return true;
+
+    auto isFloatType = [](const string& t) {
+        return t == "float" || t == "double";
+    };
+
+    // Both numeric types?
+    if (isNumericType(argType) && isNumericType(paramType)) {
+        bool argIsFloat = isFloatType(argType);
+        bool paramIsFloat = isFloatType(paramType);
+        bool argIsInt = isIntegerType(argType);
+        bool paramIsInt = isIntegerType(paramType);
+
+        // Disallow any float/double -> integer parameter
+        if (argIsFloat && paramIsInt) return false;
+
+        // Disallow double -> float
+        if (argType == "double" && paramType == "float") return false;
+
+        // Otherwise permit (includes int->float/double, int->long, float->double, etc.)
+        return true;
+    }
+
+    // Non-numeric cases: reuse the general compatibility (assignment-like)
+    return areTypesCompatible(paramType, argType, "=");
 }
 
 void SemanticAnalyzer::checkIdentifier(Node* node) {
@@ -1041,7 +1157,31 @@ void SemanticAnalyzer::checkReturnStatement(Node* node) {
             addError("Function '" + currentFunctionName + "' with return type '" + 
                      currentFunctionReturnType + "' must return a value");
         }
-        // Optional: Add type checking here later
+        // Type checking for non-void returns
+        if (hasReturnValue) {
+            // Unwrap EXPR_LIST to get the actual returned expression
+            Node* expr = node->children[0];
+            if (expr && expr->name == "EXPR_LIST" && !expr->children.empty()) {
+                expr = expr->children[0];
+            }
+
+            std::string retExprType = getExpressionType(expr);
+            std::string funcRetType = currentFunctionReturnType;
+
+            // Special rule: returning integer to pointer is only allowed for literal 0 (NULL)
+            if (isPointerType(funcRetType) && isIntegerType(retExprType)) {
+                bool isNullConstant = (expr && expr->name == "INTEGER_CONSTANT" && expr->lexeme == "0");
+                if (!isNullConstant) {
+                    addError("Return type mismatch in function '" + currentFunctionName +
+                             "': expected '" + funcRetType + "', but got '" + retExprType + "'");
+                    return;
+                }
+                // else OK: returning 0 to pointer type
+            } else if (!areTypesCompatible(funcRetType, retExprType, "=")) {
+                addError("Return type mismatch in function '" + currentFunctionName +
+                         "': expected '" + funcRetType + "', but got '" + retExprType + "'");
+            }
+        }
     }
 }
 
@@ -1107,53 +1247,237 @@ vector<int> SemanticAnalyzer::extractArrayDimensions(Node* arrayNode, string& va
     return dimensions;
 }
 
-int SemanticAnalyzer::evaluateConstantExpression(Node* node) {
-    if (!node) return -1;
-    
-    if (node->name == "INTEGER_CONSTANT") {
-        return stoi(node->lexeme);
+namespace {
+
+static inline bool isHex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static inline int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return 0;
+}
+
+long long decodeCharLiteral(const std::string& literal) {
+    if (literal.size() < 3) return 0;
+
+    // Find first single quote (handles optional prefixes like L, u, U)
+    size_t firstQuote = literal.find('\'');
+    if (firstQuote == std::string::npos) {
+        // Fallback: try double quote (shouldn't happen for char, but be defensive)
+        firstQuote = literal.find('"');
     }
-    
-    // Handle unary minus: -5
+    if (firstQuote == std::string::npos || firstQuote + 1 >= literal.size()) return 0;
+
+    // Extract content between quotes (lexer guarantees exactly one CHAR_CONTENT)
+    size_t pos = firstQuote + 1;
+    if (literal[pos] != '\\') {
+        return static_cast<unsigned char>(literal[pos]);
+    }
+
+    // Escape sequence decoding
+    if (pos + 1 >= literal.size()) return 0;
+    char e = literal[pos + 1];
+    // Hex: \x[1+ hex]
+    if (e == 'x') {
+        size_t i = pos + 2;
+        unsigned int val = 0;
+        bool any = false;
+        while (i < literal.size() && isHex(literal[i])) {
+            any = true;
+            val = (val << 4) | (unsigned)hexVal(literal[i]);
+            ++i;
+        }
+        return any ? static_cast<long long>(val & 0xFF) : 0;
+    }
+    // Unicode: \uXXXX or \UXXXXXXXX (truncate to 8-bit char semantics)
+    if (e == 'u') {
+        unsigned int val = 0;
+        size_t i = pos + 2;
+        for (int k = 0; k < 4 && i < literal.size(); ++k, ++i) {
+            if (!isHex(literal[i])) return 0;
+            val = (val << 4) | (unsigned)hexVal(literal[i]);
+        }
+        return static_cast<long long>(val & 0xFF);
+    }
+    if (e == 'U') {
+        unsigned int val = 0;
+        size_t i = pos + 2;
+        for (int k = 0; k < 8 && i < literal.size(); ++k, ++i) {
+            if (!isHex(literal[i])) return 0;
+            val = (val << 4) | (unsigned)hexVal(literal[i]);
+        }
+        return static_cast<long long>(val & 0xFF);
+    }
+    // Octal: \[0-7]{1,3}
+    if (e >= '0' && e <= '7') {
+        unsigned int val = 0;
+        size_t i = pos + 1;
+        int count = 0;
+        while (i < literal.size() && count < 3 && literal[i] >= '0' && literal[i] <= '7') {
+            val = (val << 3) | (unsigned)(literal[i] - '0');
+            ++i; ++count;
+        }
+        return static_cast<long long>(val & 0xFF);
+    }
+
+    // Standard single-char escapes
+    switch (e) {
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '0': return '\0';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        case 'a': return '\a';
+        case '?': return '?';
+        default: return static_cast<unsigned char>(e);
+    }
+}
+
+}
+
+bool SemanticAnalyzer::tryEvaluateConstantExpression(Node* node, long long& value) {
+    if (!node) return false;
+
+    if (node->name == "CONSTANT_EXPR" && !node->children.empty()) {
+        return tryEvaluateConstantExpression(node->children.back(), value);
+    }
+
+    if (node->name == "EXPR_LIST" && !node->children.empty()) {
+        return tryEvaluateConstantExpression(node->children.back(), value);
+    }
+
+    if (node->name == "INTEGER_CONSTANT") {
+        value = stoll(node->lexeme);
+        return true;
+    }
+
+    if (node->name == "CHAR_LITERAL") {
+        value = decodeCharLiteral(node->lexeme);
+        return true;
+    }
+
+    if (node->name == "BOOL_LITERAL") {
+        value = (node->lexeme == "true") ? 1 : 0;
+        return true;
+    }
+
+    if (node->name == "IDENTIFIER") {
+        auto it = enumConstants.find(node->lexeme);
+        if (it != enumConstants.end()) {
+            value = it->second;
+            return true;
+        }
+        return false;
+    }
+
     if (node->name == "UNARY_OP" && node->children.size() == 2) {
         Node* op = node->children[0];
         Node* operand = node->children[1];
-        
+        long long operandValue = 0;
+        if (!tryEvaluateConstantExpression(operand, operandValue)) {
+            return false;
+        }
         if (op->name == "-") {
-            int val = evaluateConstantExpression(operand);
-            return (val == -1) ? -1 : -val;
+            value = -operandValue;
+            return true;
         }
-        else if (op->name == "+") {
-            return evaluateConstantExpression(operand);
+        if (op->name == "+") {
+            value = operandValue;
+            return true;
         }
+        if (op->name == "!") {
+            value = operandValue == 0;
+            return true;
+        }
+        if (op->name == "~") {
+            value = ~operandValue;
+            return true;
+        }
+        return false;
     }
-    
-    // Handle binary operations: 3 + 2, 10 - 5, etc.
+
+    auto evalBinary = [&](Node* lhs, Node* rhs, const std::function<long long(long long, long long)>& op) {
+        long long leftVal = 0;
+        long long rightVal = 0;
+        if (!tryEvaluateConstantExpression(lhs, leftVal) ||
+            !tryEvaluateConstantExpression(rhs, rightVal)) {
+            return false;
+        }
+        value = op(leftVal, rightVal);
+        return true;
+    };
+
     if (node->name == "ADD_EXPR" && node->children.size() == 2) {
-        int left = evaluateConstantExpression(node->children[0]);
-        int right = evaluateConstantExpression(node->children[1]);
-        return (left == -1 || right == -1) ? -1 : left + right;
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a + b; });
     }
-    
     if (node->name == "SUB_EXPR" && node->children.size() == 2) {
-        int left = evaluateConstantExpression(node->children[0]);
-        int right = evaluateConstantExpression(node->children[1]);
-        return (left == -1 || right == -1) ? -1 : left - right;
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a - b; });
     }
-    
     if (node->name == "MUL_EXPR" && node->children.size() == 2) {
-        int left = evaluateConstantExpression(node->children[0]);
-        int right = evaluateConstantExpression(node->children[1]);
-        return (left == -1 || right == -1) ? -1 : left * right;
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a * b; });
     }
-    
     if (node->name == "DIV_EXPR" && node->children.size() == 2) {
-        int left = evaluateConstantExpression(node->children[0]);
-        int right = evaluateConstantExpression(node->children[1]);
-        return (left == -1 || right == -1 || right == 0) ? -1 : left / right;
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) {
+                              if (b == 0) {
+                                  throw std::runtime_error("Division by zero in constant expression");
+                              }
+                              return a / b;
+                          });
     }
-    
-    // Can't evaluate - non-constant expression
+    if (node->name == "MOD_EXPR" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) {
+                              if (b == 0) {
+                                  throw std::runtime_error("Modulo by zero in constant expression");
+                              }
+                              return a % b;
+                          });
+    }
+    if (node->name == "BIT_AND" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a & b; });
+    }
+    if (node->name == "BIT_OR" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a | b; });
+    }
+    if (node->name == "BIT_XOR" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a ^ b; });
+    }
+    if (node->name == "LSHIFT_EXPR" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a << b; });
+    }
+    if (node->name == "RSHIFT_EXPR" && node->children.size() == 2) {
+        return evalBinary(node->children[0], node->children[1],
+                          [](long long a, long long b) { return a >> b; });
+    }
+
+    return false;
+}
+
+int SemanticAnalyzer::evaluateConstantExpression(Node* node) {
+    try {
+        long long value = 0;
+        if (tryEvaluateConstantExpression(node, value)) {
+            return static_cast<int>(value);
+        }
+    } catch (const std::exception&) {
+        return -1;
+    }
     return -1;
 }
 void SemanticAnalyzer::checkArrayAccess(Node* node) {
@@ -1741,6 +2065,9 @@ void SemanticAnalyzer::processEnum(Node* node) {
                 enumeratorNodes[enumerator->lexeme] = enumerator;
                 currentValue = value + 1;  // Next enumerator gets next value
             }
+            for (const auto& pair : values) {
+                enumConstants[pair.first] = pair.second;
+            }
             
             
             if (existingSym) {
@@ -1753,6 +2080,7 @@ void SemanticAnalyzer::processEnum(Node* node) {
                     // ✅ ADD THIS: Create scope for enum constants
                     //symbolTable.enterScope();
                     for (const auto& pair : values) {
+                        enumConstants[pair.first] = pair.second;
                        Node* enumNode = enumeratorNodes[pair.first];  // ✅ GET CORRECT NODE!
                        string enumConstType = "enum " + enumName;
                         if (!symbolTable.addSymbol(pair.first, enumConstType, enumNode)) {
@@ -1792,6 +2120,7 @@ void SemanticAnalyzer::processEnum(Node* node) {
                     // Add enum constants to scope
                     //symbolTable.enterScope();
                     for (const auto& pair : values) {
+                        enumConstants[pair.first] = pair.second;
                         string enumConstType = "enum " + enumName;
                         if (!symbolTable.addSymbol(pair.first, enumConstType, node)) {
                             addError("Redefinition of enumerator '" + pair.first + "'");
@@ -2009,20 +2338,23 @@ bool SemanticAnalyzer::areTypesCompatible(const string& type1, const string& typ
         
         // Exact match
         if (type1 == type2) return true;
-        
-        // Both numeric types
+
+        bool type1IsEnum = type1.rfind("enum ", 0) == 0;
+        bool type2IsEnum = type2.rfind("enum ", 0) == 0;
+        if (type1IsEnum || type2IsEnum) {
+            if (type1IsEnum && type2IsEnum) {
+                return type1 == type2;
+            }
+            if (type1IsEnum && isIntegerType(type2)) return true;
+            if (type2IsEnum && isIntegerType(type1)) return true;
+            return false;
+        }
+
+        // Both numeric types (non-enum)
         if (isNumericType(type1) && isNumericType(type2)) return true;
-        
-         if ((type1.find("enum ") == 0 && isIntegerType(type2)) || (type2.find("enum ") == 0 && isIntegerType(type1))) {
-        return true;
-    }
-    
-    // Enum to enum of same type
-    if (type1.find("enum ") == 0 && type2.find("enum ") == 0) {
-        return type1 == type2;  // Same enum type
-    }
+
         // Pointer assignments
-       if (isPointerType(type1) && isPointerType(type2)) {
+        if (isPointerType(type1) && isPointerType(type2)) {
     // ✅ Check if pointer depths match
     int depth1 = countPointerLevel(type1);
     int depth2 = countPointerLevel(type2);
@@ -2973,10 +3305,6 @@ void SemanticAnalyzer::checkConditionExpression(Node* node) {
         addError("Invalid use of floating-point type '" + condType + "' in condition (use explicit comparison, e.g., " + condType + " != 0.0)");
         return;
     }
-    if (condType == "char") {
-        addError("Invalid use of character type in condition (use explicit comparison, e.g., char != '\\0')");
-        return;
-    }
     if (!isValid) {
         addError("Invalid type '" + condType + "' in condition (requires boolean, integer, or pointer type)");
     }
@@ -3075,31 +3403,58 @@ void SemanticAnalyzer::checkSwitchStatement(Node* node) {
 
 void SemanticAnalyzer::checkCaseLabels(Node* switchNode) {
     if (!switchNode) return;
-    
-    for (auto child : switchNode->children) {
-        if (child->name == "CASE_ELEMENT") {
-            // CASE_ELEMENT should have: [0] = case expression, [1] = statement
-            if (!child->children.empty()) {
-                Node* caseExpr = child->children[0];
-                
-                // Check if case expression is a constant integer
-                if (!isConstantIntegerExpression(caseExpr)) {
+
+    std::unordered_set<long long> seenValues;
+    std::unordered_set<std::string> seenIdentifiers;
+    bool defaultSeen = false;
+
+    std::function<void(Node*)> visit = [&](Node* node) {
+        if (!node) return;
+
+        if (node->name == "CASE_ELEMENT" && !node->children.empty()) {
+            Node* caseExpr = node->children[0];
+            long long value = 0;
+
+            if (!tryEvaluateConstantExpression(caseExpr, value)) {
+                if (caseExpr->name == "IDENTIFIER") {
+                    const std::string& ident = caseExpr->lexeme;
+                    if (!enumConstants.count(ident)) {
+                        addError("Case label must be a constant integer expression");
+                    } else if (!seenIdentifiers.insert(ident).second) {
+                        addError("Duplicate case label '" + ident + "'");
+        
+                    }
+                } else {
                     addError("Case label must be a constant integer expression");
                 }
+                return;
             }
+
+            if (!seenValues.insert(value).second) {
+                addError("Duplicate case label with value " + std::to_string(value));
+            }
+            return;
         }
-    }
+
+        if (node->name == "DEFAULT_ELEMENT") {
+            if (defaultSeen) {
+                addError("Duplicate default label in switch statement");
+            }
+            defaultSeen = true;
+            return;
+        }
+
+        for (auto child : node->children) {
+            visit(child);
+        }
+    };
+
+    visit(switchNode);
 }
 
 bool SemanticAnalyzer::isConstantIntegerExpression(Node* node) {
-    if (!node) return false;
-    
-    // Check if it's a simple integer constant
-    if (node->name == "INTEGER_CONSTANT") return true;
-    
-    // Check if it's a constant expression that evaluates to integer
-    int value = evaluateConstantExpression(node);
-    return value != -1; // -1 indicates non-constant or evaluation failure
+    long long value = 0;
+    return tryEvaluateConstantExpression(node, value);
 }
 
 
@@ -3460,10 +3815,15 @@ void SemanticAnalyzer::checkScanfStatement(Node* node) {
                 addError("Undeclared identifier in scanf: '" + arg->lexeme + "'");
                 continue;
             }
-            
-            // scanf requires address - plain identifier is wrong
-            addError("scanf argument " + to_string(i + 1) + 
-                     " ('" + arg->lexeme + "') must be a pointer (use & operator)");
+
+            checkIdentifier(arg);
+
+            bool treatsAsPointer = sym->pointerDepth > 0 || sym->isArray;
+            if (!treatsAsPointer) {
+                addError("scanf argument " + to_string(i + 1) +
+                         " ('" + arg->lexeme + "') must be a pointer (use & operator)");
+            }
+            continue;
         }
         // Check if it's an address-of expression (which is correct)
         else if (arg->name == "UNARY_OP") {
