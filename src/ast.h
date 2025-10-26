@@ -43,3 +43,4 @@ std::string setAbstractDirectDeclaratorType(Node* node, const std::string &type)
 std::string setAbstractDeclaratorType(Node* node, const std::string &type);
 
 #endif // AST_H
+
