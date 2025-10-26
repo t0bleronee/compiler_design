@@ -7,6 +7,7 @@
 #include <string>
 #include<algorithm>
 #include <map>
+#include <unordered_map>
 
 
 class SemanticAnalyzer {
@@ -19,6 +20,7 @@ private:
     int switchDepth;      
     std::map<std::string, Node*> currentFunctionLabels;  
     std::vector<std::pair<std::string, Node*>> pendingGotoStatements; 
+    std::unordered_map<std::string, long long> enumConstants; 
 
 
 public:
@@ -47,11 +49,14 @@ private:
      
       void checkIdentifier(Node* node);
     void checkFunctionCall(Node* node);
+    // Strict function-argument compatibility (disallows narrowing like float->int, double->float)
+    bool areFunctionArgCompatible(const std::string& argType, const std::string& paramType);
     bool isDeclarationContext(Node* node);
     void checkReturnStatement(Node* node);
 void analyzeDeclarator(Node* node, std::string& name, int& pointerDepth, bool& isArray, std::vector<int>& arrayDims);
 std::vector<int> extractArrayDimensions(Node* arrayNode, std::string& varName);
 int evaluateConstantExpression(Node* node);
+bool tryEvaluateConstantExpression(Node* node, long long& value);
 void checkArrayAccess(Node* node);
 void checkUnaryOperation(Node* node);
 std::string getExpressionType(Node* node);
@@ -127,3 +132,4 @@ bool isEnumDefinition(Node* enumSpecNode);
 
 
 #endif
+
