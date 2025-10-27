@@ -88,7 +88,7 @@ CHAR_CONTENT  ({ESCAPE_HEX}|{ESCAPE_OCT}|{ESCAPE_CHAR}|{ESCAPE_UNICODE}|[^\\\'\n
 CHAR_LITERAL   {CHAR_PREFIX}\'({CHAR_CONTENT})\'
 
 
-KEYWORD    (int|float|double|char|bool|void|short|long|signed|unsigned|if|else|switch|case|default|for|while|do|break|continue|return|goto|auto|static|class|struct|union|enum|template|typename|this|namespace|friend|virtual|override|explicit|inline|try|catch|throw|const|sizeof|typedef|typeid|new|delete|nullptr|constexpr|array|vector|using|cout|cin)
+KEYWORD    (int|float|double|char|bool|void|short|long|signed|unsigned|if|else|switch|case|default|for|while|do|break|continue|return|goto|auto|static|class|struct|union|enum|template|typename|this|namespace|friend|virtual|override|explicit|inline|try|catch|throw|const|sizeof|typedef|typeid|new|delete|nullptr|constexpr|array|vector|using|cout|cin|NULL)
 
 ALTERNATIVE_OPERATOR  (and|or|not|xor|bitand|bitor|compl|and_eq|or_eq|xor_eq|not_eq)
 
@@ -242,7 +242,7 @@ DELIMITER   [()\[\]{},;]
 "virtual"		{ printToken("KEYWORD", yytext); return VIRTUAL; }
 "void"			{ printToken("KEYWORD", yytext); return VOID; }
 "while"			{ printToken("KEYWORD", yytext); return WHILE; }
-
+"NULL"          { printToken("KEYWORD", yytext); return NULL_KEYWORD; }
 "until"     { printToken("KEYWORD", yytext); return UNTIL; }
 "done"      { printToken("KEYWORD", yytext); return DONE; }
 
@@ -289,6 +289,12 @@ DELIMITER   [()\[\]{},;]
     if (typedef_names.find(std::string(yytext)) != typedef_names.end()) {
         printToken("TYPE_NAME", yytext);
         return TYPE_NAME;
+    }
+    // Recognize built-in varargs macro-like identifier 'va_arg' as a distinct token
+    if (strcmp(yytext, "va_arg") == 0) {
+        // Keep the token stream readable but return a special token for the parser
+        printToken("IDENTIFIER", yytext);
+        return VA_ARG;
     }
  
     printToken("IDENTIFIER", yytext); 
@@ -355,6 +361,4 @@ DELIMITER   [()\[\]{},;]
 
 
 %%
-
-
 
