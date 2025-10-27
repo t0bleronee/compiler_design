@@ -1,0 +1,85 @@
+#include <stdio.h>
+
+int counter = 0;
+
+int check_limit(int x) {
+    printf("Checking limit: x = %d\n", x);
+    return x >= 5;
+}
+
+int main() {
+    int i = 0;
+    int sum = 0;
+    int flag = 0;
+
+    printf("=== UNTIL LOOP TEST START ===\n");
+
+    // Basic until loop
+    until (i >= 3) {
+        printf("Loop1 iteration: i = %d\n", i);
+        i++;
+    }
+
+    // Until loop with break and continue
+    i = 0;
+    until (i >= 5) {
+        i++;
+        if (i == 2) {
+            printf("Continue at i = 2\n");
+            continue;
+        }
+        if (i == 4) {
+            printf("Breaking at i = 4\n");
+            break;
+        }
+        printf("Processing i = %d\n", i);
+    }
+
+    // Nested until loops
+    int outer = 0, inner = 0;
+    until (outer >= 2) {
+        printf("Outer loop #%d\n", outer);
+        inner = 0;
+        until (inner >= 3) {
+            printf("  Inner loop #%d\n", inner);
+            inner++;
+        }
+        outer++;
+    }
+
+    // Until with function condition
+    int val = 0;
+    until (check_limit(val)) {
+        printf("Val = %d (inside function-based condition)\n", val);
+        val++;
+    }
+
+    // Until with compound condition and side effects
+    int a = 0, b = 0;
+    until ((a++ >= 3) || (++b > 2)) {
+        printf("Compound condition check: a=%d, b=%d\n", a, b);
+    }
+
+    // Until loop with goto and label
+    int x = 0;
+label_restart:
+    until (x > 2) {
+        printf("Goto-style until: x = %d\n", x);
+        x++;
+        if (x == 2 && !flag) {
+            printf("Restarting via goto...\n");
+            flag = 1;
+            goto label_restart;
+        }
+    }
+
+    // Until that never runs due to immediate break
+    int stop = 0;
+    until (stop) {
+        printf("Entered immediate-break until\n");
+        break;  // simulate early termination
+    }
+
+    printf("=== UNTIL LOOP TEST COMPLETE ===\n");
+    return 0;
+}

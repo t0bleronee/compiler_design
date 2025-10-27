@@ -1,0 +1,117 @@
+#include <stdio.h>
+
+enum Color { RED = 1, GREEN, BLUE };
+
+int main() {
+    int x = 2;
+    char ch = 'b';
+    enum Color c = GREEN;
+
+    printf("Main switch test begins\n");
+
+    switch (x + 1) {                // Expression in switch
+        case 1:
+            printf("Case 1 hit\n");
+            break;
+
+        case 2 :               // GCC extension (range)
+            printf("Case 2–4 range matched\n");
+            // Fall through on purpose
+
+        case 5:
+            printf("Fallthrough to case 5\n");
+            if (x == 2) break;
+            printf("Skipped due to break\n");
+            break;
+
+        case 6:
+            printf("Case 6 (will not execute)\n");
+            break;
+
+        default:
+            printf("Default case\n");
+    }
+
+    // Nested switch inside loop
+    for (int i = 0; i < 3; i++) {
+        switch (i) {
+            case 0:
+                printf("Inner switch: i = 0\n");
+                break;
+            case 1:
+                printf("Inner switch: i = 1\n");
+                switch (ch) {
+                    case 'a':
+                        printf("Nested char case a\n");
+                        break;
+                    case 'b':
+                    case 'c':
+                        printf("Nested char case b/c fallthrough\n");
+                        break;
+                    default:
+                        printf("Nested char default\n");
+                }
+                break;
+            default:
+                printf("Inner switch default\n");
+        }
+    }
+
+    // Switch with enum and constant folding
+    switch (c + 1 - 1) {
+        case RED:
+            printf("Color is RED\n");
+            break;
+        case GREEN:
+            printf("Color is GREEN\n");
+            break;
+        case BLUE:
+            printf("Color is BLUE\n");
+            break;
+        default:
+            printf("Unknown color\n");
+    }
+
+    // Switch with shadowed variables and blocks
+    int val = 3;
+    switch (val) {
+        case 1:
+            printf("Case 1\n");
+            break;
+        case 2:
+            val = 100; 
+            printf("Shadowed val = %d\n", val);
+            break;
+        case 3:
+           
+            printf("Case 3 with inner var temp ");
+            // Intentional fallthrough
+        
+        case 4:
+            printf("Fallthrough into case 4\n");
+            break;
+        default:
+            printf("Final default\n");
+    }
+
+    // Switch with goto and labels (edge case)
+    int test = 1;
+label_start:
+    switch (test) {
+        case 0:
+            printf("Switch-goto: case 0\n");
+            break;
+        case 1:
+            printf("Switch-goto: case 1\n");
+            test = 2;
+            goto label_start;   // loops once
+        case 2:
+            printf("Switch-goto: case 2\n");
+            break;
+        default:
+            printf("Switch-goto: default\n");
+    }
+
+    printf("Switch tests complete.\n");
+    return 0;
+}

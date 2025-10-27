@@ -1,0 +1,24 @@
+// Test cases for union — Semantic Analysis
+#include <stdio.h>
+
+union Data {
+    int i;
+    float f;
+    char c;
+};
+
+int main() {
+
+    union Data d;
+    d.i = 100;      // set int field
+    d.f = 3.14;     // overwrites int — expected union behavior
+    d.c = 'X';      // overwrites float
+
+    // ======== SEMANTIC ERROR CASES (commented) ========
+
+     //d = 10;                     // ERROR: cannot assign int to union directly
+    // union Data d4 = "ABC";      // ERROR: invalid type for union init
+
+    printf("Union tests done\n");
+    return 0;
+}

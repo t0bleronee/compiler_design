@@ -1,0 +1,45 @@
+// Test cases for 1D Arrays — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    // 1) Declarations
+    int a1[5];                     // declared, uninitialized
+    int a2[3] = {10,20,30};        // full initialization
+    char c1[6] = {'H','e','l','l','o','\0'};
+    char c2[] = "World";           // string literal → null automatically
+
+    // 2) Partial initialization
+    int a4[6] = {5,6};             // others auto → 0
+    float f1[4] = {1.1,2.2};       // rest = 0.0
+
+    // 3) Access + assignment
+    a1[0] = 100;
+    a1[4] = a2[1] + 50;
+    int x = a2[2];                 // read
+    float y = f1[0] + 10;          // valid mix
+
+    // 4) Using array in expression
+    int sum = a2[0] + a2[1] + a2[2];
+    float avg = (a2[0] + a2[1]) / 2.0;
+
+    // 5) Pointer + array decay
+    int *p = a2;                   // ok: array decays to pointer
+    int z = *(p + 1);              // same as a2[1]
+
+    // 6) Loop traversal example
+    for(int i=0;i<5;i++){
+        a1[i] = i * 10;
+    }
+
+    // ========= SEMANTIC ERROR CASES (commented) =========
+     //a1[5] = 10;                 // ERROR: out-of-bounds
+    // a1[-1] = 10;                // ERROR: invalid index
+    // a1 = a2;                    // ERROR: arrays not assignable
+    // f1[1] = "Hi";               // ERROR: assigning string to float element
+    // char k = a1;                // ERROR: array cannot be used as scalar
+    // int t = &a1 % &a2;          // ERROR: arithmetic on addresses
+
+    printf("1D array tests done\n");
+    return 0;
+}

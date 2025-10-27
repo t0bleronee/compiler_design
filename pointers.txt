@@ -1,0 +1,37 @@
+// Test cases for SINGLE POINTERS
+#include <stdio.h>
+
+int main() {
+
+    // ===== Valid Pointer Declarations =====
+    int x = 10, y = 20;
+    int *p = &x;            // initialization with address
+    printf("%d\n", *p);     // valid dereference
+    *p = 50;                // write via pointer
+
+    float f = 3.14;
+    float *pf = &f;
+
+    char c = 'A';
+    char *pc = &c;
+    
+    // ===== Null Pointer =====
+    int *pn = NULL;         // safe null pointer
+    if (pn == NULL) { }     // valid comparison
+
+    // ===== Pointer Re-assignment =====
+    p = &y;                 // now points to y
+
+    // ===== Uninitialized pointer =====
+    int *pu;                // declared but NOT initialized
+
+    // ===== INVALID SEMANTIC CASES (commented) =====
+     // int *pr = &f;            // ERROR: assigning float* to int*
+    // char *ps = &x;           // ERROR: assigning int* to char*
+    // int m = "text";          // ERROR: cannot assign char* to int
+    // int *pstr = "hello";     // ERROR: string literal to int*
+    // int *p2 = 25;            // ERROR: assigning integer to pointer
+
+    printf("Single pointer tests done\n");
+    return 0;
+}

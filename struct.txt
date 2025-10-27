@@ -1,0 +1,40 @@
+// Test cases for STRUCTURES — Semantic Analysis
+#include <stdio.h>
+
+// 1) Define a struct
+struct Student {
+    int roll;
+    float marks;
+    char grade;
+};
+
+int main() {
+
+    // ===== Declaration & Initialization =====
+    struct Student s1 = {101, 89.5, 'A'};
+    struct Student s2;               // uninitialized
+    s2.roll = 102;                   // assign field
+    s2.marks = 75.0;
+    s2.grade = 'B';
+
+    // ===== Accessing members =====
+    int r = s1.roll;
+    float m = s2.marks;
+
+    printf("S1: %d %f %c\n", s1.roll, s1.marks, s1.grade);
+
+    // ===== Structure pointer =====
+    struct Student *ps = &s1;
+    ps->marks = 95.0;                // using -> operator
+
+    // ========= SEMANTIC ERROR CASES (commented) =========
+
+    // s1 = 10;                         // ERROR: struct cannot be assigned from int
+    // int x = s1;                      // ERROR: cannot assign struct to int
+    // s1.roll = "hello";               // ERROR: type mismatch: string to int
+    // struct Student s4;
+    //ps.roll = 10;                    // ERROR: must use ps->roll OR (*ps).roll
+  
+    printf("Structure tests completed\n");
+    return 0;
+}

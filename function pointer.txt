@@ -1,0 +1,17 @@
+//function pointers
+int mul(int a, int b) {
+    return a * b;
+}
+
+int main() {
+    // Single-level function pointer
+    int (*fp)(int, int) = mul;
+    
+    // Double-level function pointer  
+    int (**fpp)(int, int) = &fp;
+    
+    // Triple-level function pointer
+    int (*fppp)(int, int) = &fpp;
+    
+    return 0;
+}

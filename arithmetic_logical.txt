@@ -1,0 +1,49 @@
+//Test cases — Arithmetic & Logical Operators
+#include <stdio.h>
+
+int main() {
+    //Declarations 
+    int a = 12, b = 5;
+    float f1 = 4.5, f2 = 1.5;
+    char c1 = 'X', c2 = 'Y';
+    int *p = &a;
+    int *q = &b;
+
+    // Valid Arithmetic
+    int i_add = a + b;          // int + int
+    float f_add = f1 + f2;      // float + float
+    float mix = a + f1;         // int + float => float
+    int i_mod = a % b;          // modulus with int only
+    int i_mul = a * b;
+    int i_sub = a - b;
+    int i_div = a / b;
+
+    // Valid Logical
+    int l1 = (a > b) && (f1 < f2);   // logical AND
+    int l2 = (a == b) || (f1 != f2); // logical OR
+    int l3 = !(a < b);               // logical NOT
+
+    // Valid Relational 
+    int r1 = a > b;
+    int r2 = f1 <= f2;
+    int r3 = a == b;
+
+    //  Valid Bitwise
+    int b1 = a & b;
+    int b2 = a | b;
+    int b3 = a ^ b;
+    int b4 = a << 1;
+    int b5 = b >> 1;
+    int b6 = ~a;
+
+    // Invalid / Semantic Error Candidates 
+    //float fmod = f1 % f2;              // ERROR: % not allowed on floats
+    // int bad3 = p % q;                  // modulus on pointers
+   
+    // ---------- Increment/Decrement ----------
+    int pre = ++a;
+    int post = b--;
+    
+    printf("Completed valid arithmetic/logical operations.\n");
+    return 0;
+}
