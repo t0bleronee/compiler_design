@@ -1,6 +1,8 @@
 # Compiler settings
 CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++11 -g -Isrc
+# Enable AddressSanitizer to catch heap errors and double-frees during tests
+# You can disable by overriding CXXFLAGS from the environment if needed.
+CXXFLAGS = -Wall -Wextra -std=c++11 -g -Isrc 
 
 YACC = bison
 YACCFLAGS = -d -v
@@ -34,7 +36,7 @@ all: $(TARGET)
 
 # Build the compiler
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -ll
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 
 # Generate parser from yacc file
@@ -81,3 +83,9 @@ distclean: clean
 	rm -f ~ .bak core
 
 .PHONY: all test clean distclean
+
+# Run CLI regression tests
+cli-test: $(TARGET)
+	bash cli_tests.sh
+
+.PHONY: cli-test
