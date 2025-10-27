@@ -136,7 +136,10 @@ void registerTypedefNames(Node* declSpec, Node* initDeclList) {
 %token<node> OVERRIDE PRIVATE PUBLIC PROTECTED RETURN SHORT SIGNED SIZEOF STATIC STRUCT SWITCH SCANF PRINTF
 %token<node> TEMPLATE THIS THROW TRY TYPEDEF TYPEID TYPENAME UNION
 %token<node> UNSIGNED USING VECTOR VIRTUAL VOID WHILE
+%token<node> NULL_KEYWORD
 %token<strval> TYPE_NAME
+// Varargs built-ins
+%token<node> VA_ARG
 
 // Operators
 %token<node> AND OR NOT XOR BITAND BITOR COMPL
@@ -655,7 +658,10 @@ parameter_type_list
         $$->addChild($1); 
         $$->addChild(new Node("ELLIPSIS"));
     }
-
+    | ELLIPSIS {
+        $$ = new Node("PARAM_TYPE_LIST"); 
+        $$->addChild(new Node("ELLIPSIS"));
+    }
     ;
 
 parameter_list
@@ -938,18 +944,27 @@ case_list
     }
     ;
 
+
 case_element
     : CASE constant_expression COLON statement_list {
         $$ = new Node("CASE_ELEMENT");
         $$->addChild($2);
         $$->addChild($4);
     }
+    | CASE constant_expression COLON {
+        $$ = new Node("CASE_ELEMENT");
+        $$->addChild($2);
+        $$->addChild(new Node("STATEMENT_LIST"));  // Empty statement list
+    }
     | DEFAULT COLON statement_list {
         $$ = new Node("DEFAULT_ELEMENT");
         $$->addChild($3);
     }
+    | DEFAULT COLON {
+        $$ = new Node("DEFAULT_ELEMENT");
+        $$->addChild(new Node("STATEMENT_LIST"));  // Empty statement list
+    }
     ;
-
 
 statement_list
     : statement { 
@@ -1314,6 +1329,11 @@ postfix_expression
         $$ = new Node("POST_DEC");
         $$->addChild($1);
     }
+    | VA_ARG LPAREN assignment_expression COMMA type_name RPAREN {
+        $$ = new Node("VA_ARG");
+        $$->addChild($3); // va_list expression
+        $$->addChild($5); // type name
+    }
     ;
 
 argument_expression_list
@@ -1326,8 +1346,10 @@ argument_expression_list
 primary_expression
     : IDENTIFIER { $$ = new Node("IDENTIFIER", std::string($1));  }
     | constant { $$ = $1; }
-| STRING_LITERAL { $$ = new Node("STRING_LITERAL", std::string($1));  }
+    | STRING_LITERAL { $$ = new Node("STRING_LITERAL", std::string($1));  }
     | LPAREN expression RPAREN { $$ = $2; }
+    | NULLPTR { $$ = new Node("NULLPTR_CONSTANT", "nullptr"); }
+    | NULL_KEYWORD { $$ = new Node("NULL_CONSTANT", "null"); }  
     ;
 
 constant
@@ -1456,6 +1478,12 @@ int main(int argc, char** argv) {
                      /*isArray=*/false, /*arrayDims=*/{}, /*pointerDepth=*/0,
                      /*isStruct=*/false, /*isEnum=*/false, /*isUnion=*/false,
                      /*isTypedef=*/true, /*aliasedType=*/"char*");
+    // Minimal varargs support: treat 'va_list' as a known typedef name (alias to int)
+    typedef_names.insert("va_list");
+    symTab.addSymbol("va_list", "int", nullptr, /*isFunction=*/false, /*params=*/{},
+                     /*isArray=*/false, /*arrayDims=*/{}, /*pointerDepth=*/0,
+                     /*isStruct=*/false, /*isEnum=*/false, /*isUnion=*/false,
+                     /*isTypedef=*/true, /*aliasedType=*/"int");
     if (g_showTokens) {
         printf("Starting syntax analysis...\n");
         printf("%-40s | %s\n", "TOKEN", "LEXEME");
