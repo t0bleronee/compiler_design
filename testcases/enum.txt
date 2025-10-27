@@ -1,0 +1,21 @@
+// Test cases for enum — Semantic Analysis
+#include <stdio.h>
+
+enum Color { RED = 1, GREEN, BLUE };
+enum Status { OK = 0, FAIL = 1 };
+
+int main() {
+
+    enum Color c = RED;
+    enum Status s = OK;
+
+    int x = GREEN;       // implicit int conversion allowed
+    c = BLUE;            // valid enum assignment
+
+    // ========== SEMANTIC ERROR CASES (commented) ==========
+
+     // c = "RED";                  // ERROR: string to enum
+    
+    printf("Enum tests done\n");
+    return 0;
+}

@@ -1,0 +1,28 @@
+// Test cases for Multi-Dimensional Arrays — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    // ======== VALID DECLARATIONS ========
+    int a[3][4] = {                // full init
+        {1,2,3,4},
+        {5,6,7,8},
+        {9,10,11,12}
+    };
+
+    // ======== VALID USE ========
+    int x = a[1][2];               // get element
+    a[0][3] = 99;                  // assign
+            
+    printf("x = %d\n", x);
+
+    // ======== SEMANTIC ERROR CASES (commented) ========
+
+    // int d[][] = {{1,2},{3,4}};       // ERROR: both dims cannot be omitted
+    // int e[2][] = {{1,2},{3,4}};      // ERROR: inner dimension cannot be omitted
+     // x = a[3][1];                     // ERROR: index out of bound (semantic check possible)
+     //a[0][1.5] = 10;                  // ERROR: index must be integer
+
+    printf("Multi-dimensional array tests done\n");
+    return 0;
+}

@@ -1,0 +1,25 @@
+// Test cases for Multilevel Pointers — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    int x = 10;
+    int *p = &x;        // single pointer
+    int **pp = &p;      // double pointer
+    int ***ppp = &pp;   // triple pointer
+
+    // usage
+    ***ppp = 50;        // assign through triple pointer
+
+    printf("x = %d\n", x);
+
+    // ======== SEMANTIC ERROR CASES (commented) ========
+
+    // int **q = &x;          // ERROR: &x is int*, not int**
+    // int ***r = &p;         // ERROR: &p is int**, not int***
+    // p = &pp;               // ERROR: &pp is int***, p is int*
+    // *pp = &pp;             // ERROR: assigning int*** to int*
+ 
+    printf("Multilevel pointer tests done\n");
+    return 0;
+}

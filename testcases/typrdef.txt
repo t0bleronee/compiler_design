@@ -1,0 +1,40 @@
+// Test cases for typedef
+#include <stdio.h>
+
+// ===== BASIC TYPEDEF ALIASES =====
+typedef int INTEGER;
+typedef float REAL;
+typedef char* STRING;
+
+// ===== STRUCT + TYPEDEF =====
+typedef struct {
+    int x;
+    float y;
+} Point;
+
+// ===== FUNCTION POINTER typedef =====
+typedef int (*BinOp)(int,int);
+int sum(int a,int b){ return a+b; }
+
+int main() {
+
+    // ----- Using basic typedefs -----
+    INTEGER a = 10;
+    REAL f = 3.14;
+    STRING name = "hello";
+    Point p1 = {5, 2.5};
+
+    // ----- Using typedef fn pointer -----
+    BinOp op = sum;
+    int r = op(2,3);
+
+    // ===== SEMANTIC ERROR CASES (commented) =====
+
+    // typedef int;                // ERROR: missing alias name
+    // INTEGER a2 = "hi";          // ERROR: assigning string to int
+    // REAL r1 = name;             // ERROR: char* to float
+    // STRING s1 = 100;            // ERROR: int to char*
+   
+    printf("typedef tests complete\n");
+    return 0;
+}

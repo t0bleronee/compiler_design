@@ -1,0 +1,71 @@
+//  Test Cases — FOR LOOP
+#include <stdio.h>
+
+int main() {
+
+    int a = 5, b = 10;
+    float f = 3.3;
+    char c = 'X';
+    int *p = &a;
+
+    // ----------- SIMPLE FOR -----------
+    for (int i = 0; i < 3; i++) {
+        printf("i = %d\n", i);
+    }
+
+    // ----------- FOR WITHOUT INIT (valid) -----------
+    int j = 0;
+    for (; j < 2; j++) {
+        printf("j = %d\n", j);
+    }
+
+    // ----------- FOR WITHOUT CONDITION (infinite logically) -----------
+    for (int k = 0; ; k++) {
+        printf("k running once\n");
+        break;
+    }
+
+    // ----------- FOR WITHOUT INCREMENT PART -----------
+    for (int x = 2; x > 0; ) {
+        printf("x = %d\n", x);
+        x--;
+    }
+
+    // ----------- COMPLEX CONDITION IN FOR -----------
+    for (int t = 0; (t < b && f > 0) || c != 0; t++) {
+        printf("complex loop\n");
+        break;
+    }
+
+    // ----------- BREAK & CONTINUE in FOR -----------
+    for (int m = 0; m < 5; m++) {
+        if (m == 2) continue;
+        if (m == 4) break;
+        printf("m = %d\n", m);
+    }
+
+    // ----------- Pointer / Char as Condition -----------
+    for (int z = 0; p; z++) {      // pointer used as condition
+        printf("Pointer non-null\n");
+        break;
+    }
+
+    for (int z = 0; c; z++) {      // char as condition
+        printf("Char true once\n");
+        break;
+    }
+
+    // ----------- Scope inside FOR -----------
+    for (int q = 0; q < 1; q++) {
+        int local = 999;
+        printf("%d\n", local);
+    }
+    // printf("%d\n", local);  // ERROR: out of scope
+
+    // ----------- INTENTIONAL SEMANTIC ERROR CANDIDATES -----------
+    printf("FOR loop testing completed\n");
+    return 0;
+
+   // ---------- ERRORS ----------
+   //for();  //ERROR
+}

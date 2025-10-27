@@ -1,0 +1,59 @@
+#include <stdio.h>
+
+int main() {
+
+    int a = -5, b = 10, z = 0;
+    float f1 = 3.14, f2 = 0.0;
+    char ch = 0;
+    int *p = &b;
+    int *q = NULL;
+
+    //IF 
+    if (a < 0) {
+        printf("a is negative\n");
+    }
+
+    // IF-ELSE 
+    if (b == 10) {
+        printf("b equals 10\n");
+    } else {
+        printf("b is not 10\n");
+    }
+
+    // IF-ELSE IF-ELSE
+    if (a > 100) {
+        printf("Huge number\n");
+    } else if (a > 0) {
+        printf("Positive\n");
+    } else if (a == 0) {
+        printf("Zero\n");
+    } else {
+        printf("Negative\n");
+    }
+
+    //  Nested Conditions 
+    if (b > 0) {
+        if (p != NULL) {
+            printf("b positive and p valid\n");
+        } else {
+            printf("b positive but p null (unlikely)\n");
+        }
+    }
+
+    //  Composite Condition 
+    if ((a < 0 && b > 0) || f1 != 0.0) {
+        printf("Mixed logical condition true\n");
+    }
+
+    // Different Types as Conditions 
+    if (f2) {                  // float zero = false
+        printf("f2 true\n");
+    }
+    if (ch) {                 // char zero = false
+        printf("char true\n");
+    }
+    if (q) {                  // pointer NULL = false
+        printf("q not null\n");
+    }
+    return 0;
+}

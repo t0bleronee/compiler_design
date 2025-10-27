@@ -1,0 +1,91 @@
+// Test cases for WHILE loops — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    int a = 5, b = 0;
+    float f = 3.14;
+    char ch = 'Z';
+    int* p = &a;
+
+    // 1) Basic while loop
+    while (a > 0) {
+        printf("a = %d\n", a);
+        a--;
+    }
+
+    // 2) While with else-like behavior using flag
+    int cond = 0;
+    while (cond) {
+        printf("This will not run\n");
+    }
+    if (!cond) {
+        printf("While was skipped\n");
+    }
+
+    // 3) While with complex condition
+    a = 3; b = 2;
+    while ((a > 0 && b > 0) || f > 1.0f) {
+        printf("Inside complex while\n");
+        a--; b--; f -= 1.5f;
+    }
+
+    // 4) Nested while loops
+    int x = 2, y;
+    while (x > 0) {
+        y = 2;
+        while (y > 0) {
+            printf("Nested: x=%d, y=%d\n", x, y);
+            y--;
+        }
+        x--;
+    }
+
+    // 5) Using break inside while
+    int n = 10;
+    while (n--) {
+        if (n == 5) break;
+        printf("Break demo: n = %d\n", n);
+    }
+
+    // 6) Using continue inside while
+    n = 5;
+    while (n--) {
+        if (n == 2) continue;
+        printf("Continue demo: n = %d\n", n);
+    }
+
+    // 7) Infinite loop with manual break
+    int count = 0;
+    while (1) {
+        if (count == 3) break;
+        printf("Infinite loop break count = %d\n", count);
+        count++;
+    }
+
+    // 8) Condition using pointer / char / float
+    while (p) {          // pointer as condition
+        printf("Pointer is non-zero\n");
+        p = NULL;
+    }
+
+    while (ch) {         // char as condition
+        printf("Char condition true\n");
+        ch = 0;
+    }
+
+    f = 0.0;
+    while (f) {          // float as condition (will not run)
+        printf("Float loop\n");
+    }
+
+    // 9) Variable scope in loop
+    int t = 3;
+    while (t--) {
+        int temp = 100;  // scope limited to loop block
+        printf("Temp = %d\n", temp);
+    }
+    // printf("%d", temp); // ERROR: temp not in scope
+
+    return 0;
+}

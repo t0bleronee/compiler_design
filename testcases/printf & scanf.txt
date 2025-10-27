@@ -1,0 +1,40 @@
+// Test cases for printf / scanf — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    int a = 10;
+    float f = 3.14;
+    char c = 'A';
+    char str[20] = "Hello";
+
+    // ===== VALID PRINTF CASES =====
+    printf("Integer: %d\n", a);
+    printf("Float: %f\n", f);
+    printf("Char: %c\n", c);
+    printf("String: %s\n", str);
+    printf("Mixed: %d %f %c %s\n", a, f, c, str);
+
+    // ===== VALID SCANF CASES =====
+    scanf("%d", &a);
+    scanf("%f", &f);
+    scanf("%c", &c);
+    scanf("%s", str);       // str decays to pointer automatically
+
+    // ===== MULTIPLE READ =====
+    scanf("%d %f", &a, &f);
+
+    // ======== SEMANTIC ERRORS (commented) ========
+
+    // printf("%d", f);            // ERROR: %d expects int, got float
+    // printf("%f", a);            // ERROR: %f expects double, got int
+    // printf("%c", str);          // ERROR: %c expects char, got char*
+    // printf("Value: %d %d", a);  // ERROR: missing second argument
+    // scanf("%d", a);             // ERROR: needs address-of int → &a
+    // scanf("%f", &a);            // ERROR: %f expects float*, got int*
+    // scanf("%s", &f);            // ERROR: %s expects char*, got float*
+    // scanf("%d %f", &a);         // ERROR: missing second argument
+   
+    printf("Printf / Scanf tests done\n");
+    return 0;
+}

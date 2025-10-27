@@ -1,0 +1,48 @@
+// Test cases for Function Calls with Arguments
+#include <stdio.h>
+
+// ======= Function Declarations =======
+int sum(int a, int b) {
+    return a + b;
+}
+
+float avg(int a, float b) {
+    return (a + b) / 2;
+}
+
+void printChar(char c) {
+    printf("Char = %c\n", c);
+}
+
+int noArgs() {
+    return 100;
+}
+
+int main() {
+
+    int x = 10, y = 20;
+    float f = 5.5;
+    char ch = 'A';
+
+    // ======= VALID FUNCTION CALLS =======
+    int s1 = sum(x, y);            // int, int → int
+    float a1 = avg(x, f);          // (int,float) → float
+    printChar(ch);                 // char passed
+    int n = noArgs();              // no argument function
+
+    // Direct call without storing
+    printf("Sum = %d\n", sum(5, 7));
+
+
+    // ======= SEMANTIC ERROR CASES (commented) =======
+
+    // sum(10);                    // ERROR: missing argument
+    // sum(10, 20, 30);            // ERROR: too many arguments
+    // sum(f, y);                  // ERROR: float passed to int parameter
+    // avg(x, "hi");               // ERROR: string to float parameter
+    // int r = printChar('B');     // ERROR: assigning void to int
+    // noArgs(10);                 // ERROR: passing argument to no-param fn
+
+    printf("Function call tests done\n");
+    return 0;
+}

@@ -1,0 +1,90 @@
+// Test cases for DO-WHILE loops — Semantic Analysis
+#include <stdio.h>
+
+int main() {
+
+    int a = 3, b = 0;
+    float f = 4.2;
+    char c = 'K';
+    int *ptr = &a;
+
+    // 1) Basic do-while (runs at least once)
+    do {
+        printf("Basic: a = %d\n", a);
+        a--;
+    } while (a > 0);
+
+    // 2) do-while that fails condition but still executes once
+    do {
+        printf("This prints even if condition false\n");
+    } while (0);
+
+    // 3) Complex condition in do-while
+    a = 2; b = 1; f = 3.5;
+    do {
+        printf("Complex loop: a=%d, b=%d, f=%.1f\n", a, b, f);
+        a--; b--; f -= 2.0f;
+    } while ((a >= 0 && b >= 0) || f > 1.0f);
+
+    // 4) Nested do-while
+    int x = 2, y;
+    do {
+        y = 2;
+        do {
+            printf("Nested do: x=%d y=%d\n", x, y);
+            y--;
+        } while (y >= 0);
+        x--;
+    } while (x >= 0);
+
+    // 5) break inside do-while
+    int n = 5;
+    do {
+        if (n == 3) break;
+        printf("Break demo: n=%d\n", n);
+        n--;
+    } while (n > 0);
+
+    // 6) continue inside do-while
+    n = 5;
+    do {
+        n--;
+        if (n == 2) continue;
+        printf("Continue demo: n=%d\n", n);
+    } while (n > 0);
+
+    // 7) Infinite do-while with manual break
+    int cnt = 0;
+    do {
+        printf("Infinite style cnt=%d\n", cnt);
+        if (cnt == 2) break;
+        cnt++;
+    } while (1);
+
+    // 8) Conditions with different types
+    do {
+        printf("Pointer condition once\n");
+        ptr = NULL;
+    } while (ptr);
+
+    do {
+        printf("Char condition once: %c\n", c);
+        c = 0;
+    } while (c);
+
+    f = 0.0;
+    do {
+        printf("Float condition won't repeat\n");
+    } while (f);
+
+    // 9) Scope test inside do-while block
+    int t = 2;
+    do {
+        int temp = 200;     // Block scoped
+        printf("Temp = %d\n", temp);
+        t--;
+    } while (t > 0);
+    // printf("%d", temp); // ERROR: not in scope
+
+    return 0;
+}

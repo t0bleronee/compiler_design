@@ -1,0 +1,26 @@
+// Test cases for static keyword 
+#include <stdio.h>
+
+// ======= static global variable =======
+static int g1 = 10;    // allowed: internal linkage
+
+// ======= static inside function =======
+void counterFn() {
+    static int count = 0;   // retains value across calls
+    count++;
+    printf("count = %d\n", count);
+}
+
+int main() {
+
+    static int a = 5;       // static local var
+    int b = 10;
+
+    // calling function with static local
+    counterFn();
+    counterFn();  // prints incremented value
+
+    printf("Static tests done\n");
+    return 0;
+}
+

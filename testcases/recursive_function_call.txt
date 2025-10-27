@@ -1,0 +1,39 @@
+// Test cases for Recursive Function Calls — Semantic Analysis
+#include <stdio.h>
+
+// ======= SIMPLE RECURSION =======
+int fact(int n) {
+    if (n <= 1)
+        return 1;
+    return n * fact(n - 1);   // recursive call
+}
+
+// ======= MUTUAL (INDIRECT) RECURSION =======
+int isOdd(int x);   // forward declaration
+
+int isEven(int x) {
+    if (x == 0) return 1;
+    return isOdd(x - 1);   // calls other function
+}
+
+int isOdd(int x) {
+    if (x == 0) return 0;
+    return isEven(x - 1);  // calls back
+}
+
+// ======= MAIN =======
+int main() {
+    int a = fact(5);          // valid recursion
+    printf("fact = %d\n", a);
+
+    int b = isEven(4);        // mutual recursion test
+    printf("isEven(4) = %d\n", b);
+
+    // ===== SEMANTIC ERROR CASES (commented) =====
+    // int wrong = fact(2.5);     // ERROR: float passed to int parameter
+    // isEven("hi");              // ERROR: string to int fn
+    // int x = isOdd();           // ERROR: missing argument
+   
+    printf("Recursive function tests done\n");
+    return 0;
+}
