@@ -59,6 +59,8 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
     sym->isUnion = isUnion;
     sym->isTypedef = isTypedef;
     sym->aliasedType = aliasedType;
+        // Reference flags default (can be set by semantic analyzer after add)
+        sym->isReference = false;
     
     // ✅ Get the pointer BEFORE moving
     Symbol* symPtr = sym.get();
@@ -187,10 +189,29 @@ std::string baseType = type.substr(0, type.size() - starCount);
                     std::cout << " params:(";
                     for (size_t i = 0; i < p.second->paramTypes.size(); i++) {
                         std::cout << p.second->paramTypes[i];
+                        if (i < p.second->paramIsReference.size() && p.second->paramIsReference[i]) {
+                            std::cout << "&"; // annotate reference params for debug
+                        }
                         if (i < p.second->paramTypes.size() - 1) std::cout << ", ";
                     }
                     std::cout << ")";
                 }
+                if (p.second->isVariadic) {
+                    std::cout << " variadic";
+                }
+            }
+            // Print function pointer info (debug)
+            if (p.second->isFunctionPointer) {
+                std::cout << " (funcptr -> " << p.second->funcPtrReturnType << "(";
+                for (size_t i = 0; i < p.second->funcPtrParamTypes.size(); ++i) {
+                    std::cout << p.second->funcPtrParamTypes[i];
+                    if (i < p.second->funcPtrParamIsReference.size() && p.second->funcPtrParamIsReference[i]) {
+                        std::cout << "&";
+                    }
+                    if (i + 1 < p.second->funcPtrParamTypes.size()) std::cout << ", ";
+                }
+                if (p.second->funcPtrIsVariadic) std::cout << ", ...";
+                std::cout << "))";
             }
             
             std::cout << "\n";
