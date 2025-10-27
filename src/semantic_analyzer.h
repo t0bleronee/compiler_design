@@ -53,13 +53,16 @@ private:
     bool areFunctionArgCompatible(const std::string& argType, const std::string& paramType);
     bool isDeclarationContext(Node* node);
     void checkReturnStatement(Node* node);
-void analyzeDeclarator(Node* node, std::string& name, int& pointerDepth, bool& isArray, std::vector<int>& arrayDims);
-std::vector<int> extractArrayDimensions(Node* arrayNode, std::string& varName);
+    void checkReturnLocalAddress(Node* expr);
+void analyzeDeclarator(Node* node, std::string& name, int& pointerDepth, bool& isArray, std::vector<int>& arrayDims, bool allowIncomplete = false);
+std::vector<int> extractArrayDimensions(Node* arrayNode, std::string& varName, bool allowIncomplete = false);
 int evaluateConstantExpression(Node* node);
 bool tryEvaluateConstantExpression(Node* node, long long& value);
 void checkArrayAccess(Node* node);
 void checkUnaryOperation(Node* node);
 std::string getExpressionType(Node* node);
+    // Extract a canonical type string from a type_name or SPEC_QUAL_LIST node
+    std::string extractTypeFromTypeName(Node* typeNode);
 void processStruct(Node* node);
 void processEnum(Node* node);
 bool isStructMemberDeclaration(Node* node);
@@ -75,6 +78,11 @@ void checkBitwiseOperation(Node* node);
 bool isNumericType(const std::string& type);
 bool isIntegerType(const std::string& type);
 bool isPointerType(const std::string& type);
+bool isArrayType(const std::string& type);
+std::string getArrayElementType(const std::string& arrayType);
+void validateArrayInitialization(Symbol* arraySym, Node* initList);
+int countInitializerElements(Node* node);
+void checkArrayInitializerSize(Node* initList, const std::vector<int>& dimensions, const std::string& arrayName, size_t dimIndex);
 std::string getResultType(const std::string& type1, const std::string& type2);
 bool areTypesCompatible(const std::string& type1, const std::string& type2, const std::string& operation);
 void checkAssignment(Node* node);
@@ -84,6 +92,7 @@ void checkPointerAssignment(/*Node* node,*/ const std::string& lhsType, const st
 // In the private section of SemanticAnalyzer class:
 void checkPostfixOperation(Node* node);
 void checkPrefixOperation(Node* node);
+void checkSizeof(Node* node);
 bool isLvalue(Node* node);
 
 void checkMemberAccess(Node* node);
@@ -96,6 +105,7 @@ std::string resolveTypedef(const std::string& type);
 bool isConstantIndex(Node* indexNode, int& value);
 
 std::string getBaseTypeFromPointer(const std::string& type);
+std::string getMemberType(const std::string& structTypeName, const std::string& memberName);
 void checkConditionExpression(Node* node);
 
 void processLabel(Node* node);
@@ -131,6 +141,8 @@ int countFormatSpecifiers(const std::string& format);
 bool isStringLiteral(Node* node);
 
 bool isEnumDefinition(Node* enumSpecNode);
+ void checkStaticRedeclaration(const std::string& name, bool isStatic);
+  
 };
 
 
