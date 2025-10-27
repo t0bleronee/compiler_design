@@ -34,6 +34,10 @@ public:
     bool isArray;           // Is this an array?
    std::vector<int> arrayDimensions;         // Size if known, -1 if unknown/dynamic
     int pointerDepth;       // 0 = not pointer, 1 = *, 2 = **, etc.
+    // If this symbol is a pointer and the pointee is an array (e.g., int (*p)[3][3]),
+    // capture the array dimensions of the pointee here. This helps pointer arithmetic
+    // scale correctly by the full aggregate size.
+    std::vector<int> pointeeArrayDimensions;
     
     
     // After pointerDepth, add:
@@ -48,16 +52,20 @@ bool isTypedef = false;
 std::map<std::string, std::string> structMembers;  // member name -> type
 std::vector<std::string> structMemberOrder;        // declaration order of members
 std::map<std::string, int> enumValues;             // enumerator name -> value
-
+ bool isStatic = false;           // ✅ NEW: Track if symbol has static storage
+    bool isExtern = false;           // ✅ NEW: For extern declarations
+    bool isLocal = false;            // ✅ NEW: Track if symbol is local to current function
+ 
+    
     
      Symbol() : name(""), type(""), node(nullptr), isFunction(false), 
          isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) ,isTypedef (false), aliasedType(""), isReference(false),
-         isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false) {}
+         isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false), isLocal(false) {}
            
 Symbol(std::string n, std::string t, Node* nd, bool func=false)
     : name(n), type(t), node(nd), isFunction(func), 
     isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) , isTypedef (false), aliasedType(""), isReference(false),
-    isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false) {}
+    isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false), isLocal(false) {}
 };
 
 struct Scopeh {
@@ -79,7 +87,7 @@ public:
     bool addSymbol(const std::string& name, const std::string& type, Node* node, 
                bool isFunction=false, const std::vector<std::string>& params = {},
                bool isArray=false, const std::vector<int>& arrayDims = {}, 
-               int pointerDepth=0, bool isStruct=false, bool isEnum=false, bool isUnion=false , bool isTypedef = false, std::string aliasedType = "");
+               int pointerDepth=0, bool isStruct=false, bool isEnum=false, bool isUnion=false , bool isTypedef = false, std::string aliasedType = "",bool isStatic=false,bool isExtern=false, bool isVariadic=false);
     Symbol* lookup(const std::string& name);   
      Symbol* lookuph(const std::string& name);   
     Symbol* lookupCurrentScope(const std::string& name); 
