@@ -14,6 +14,20 @@ Node* IRGenerator::findIdentifierInArray(Node* arrayNode) {
         Node* first = current->children[0];
         if (!first) break;
         if (first->name == "IDENTIFIER") return first;
+        // Handle pointer-to-array: ARRAY -> DECLARATOR -> POINTER + IDENTIFIER
+        if (first->name == "DECLARATOR") {
+            // Recursively search for IDENTIFIER in DECLARATOR
+            std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                if (!n) return nullptr;
+                if (n->name == "IDENTIFIER") return n;
+                for (auto c : n->children) {
+                    Node* r = findId(c);
+                    if (r) return r;
+                }
+                return nullptr;
+            };
+            return findId(first);
+        }
         current = first;
     }
     return nullptr;
@@ -58,8 +72,12 @@ string TACInstruction::toString() const {
             break;
             
         case TACOp::CALL:
-            ss << result << " = call " << operand1;
-            break;
+           if (paramCount > 0) {
+            ss << result << " = call " << operand1 << ", " << paramCount;
+              } else {
+                  ss << result << " = call " << operand1;
+              }
+              break;
             
         case TACOp::RETURN:
             if (!operand1.empty()) {
@@ -169,6 +187,15 @@ string TACInstruction::toString() const {
         case TACOp::CAST:
             ss << result << " = (" << operand2 << ")" << operand1;
             break;
+        
+        case TACOp::COMMENT:
+            ss << "# " << result;
+            break;
+        
+        case TACOp::NOP:
+            ss << "nop";
+            break;
+            
         default:
             ss << "UNKNOWN_OP";
     }
@@ -633,7 +660,10 @@ string IRGenerator::generateExpression(Node* node) {
     }
     // Function identifiers decay to function addresses in expressions
     if (node->symbol && node->symbol->isFunction) {
-        return node->lexeme; // use function label/name as address
+        // Generate explicit address-of for clarity in TAC
+        string temp = createTemp();
+        instructions.emplace_back(TACOp::ADDRESS, temp, node->lexeme);
+        return temp;
     }
     // References hold addresses; reading a reference as rvalue
     // - scalar refs: LOAD through address
@@ -662,6 +692,13 @@ string IRGenerator::generateExpression(Node* node) {
         }
         return temp;
     }
+   else if (node->name == "NULLPTR_CONSTANT" || node->name == "NULL_CONSTANT") {
+    // nullptr/null are treated as 0 (null pointer constant)
+    string temp = createTemp();
+    instructions.emplace_back(TACOp::CONST, temp, "0");
+    return temp;
+}
+  
     else if (node->name == "STRING_LITERAL") {
     // Generate a label for this string literal and return its address as a CONST label
     string label = "str" + to_string(++stringLiteralCounter);
@@ -743,6 +780,13 @@ else if (node->name == "COMPOUND_ASSIGN") {
 }
 else if (node->name == "ASSIGN_EXPR") {
     if (node->children.size() >= 3) {
+        if (node->children[1]->name == "OP") {
+            string op = node->children[1]->lexeme;
+            if (op != "=") {
+                cout << "DEBUG: Routing to generateCompoundAssignment for " << op << endl;
+                return generateCompoundAssignment(node);
+            }
+        }
         Node* lhs = node->children[0];
         Node* rhs = node->children[2];
         
@@ -790,6 +834,81 @@ else if (node->name == "ASSIGN_EXPR") {
  
     else if (node->name == "FUNC_CALL") {
         return generateFunctionCall(node);
+    }
+    else if (node->name == "VA_ARG") {
+        // Children: [0] va_list expr, [1] TYPE_NAME or SPEC_QUAL_LIST (requested type)
+        // Generate runtime index tracking for variadic arguments
+        
+        // Extract the va_list variable name (from first child which is an IDENTIFIER)
+        string vaListName = "";
+        if (node->children.size() > 0 && node->children[0]) {
+            if (node->children[0]->name == "IDENTIFIER") {
+                vaListName = getUniqueNameFor(node->children[0], node->children[0]->lexeme);
+            }
+        }
+        
+        // Get requested type
+        string targetType = "int"; // default fallback
+        int pointerDepth = 0;
+        if (node->children.size() >= 2) {
+            Node* typeNode = node->children[1];
+            if (typeNode) {
+                if (typeNode->name == "TYPE_NAME") {
+                    for (auto c : typeNode->children) {
+                        if (!c) continue;
+                        if (c->name == "SPEC_QUAL_LIST") {
+                            targetType = extractTypeFromSpecQualList(c);
+                        } else if (c->name == "POINTER") {
+                            // Count pointer depth - POINTER node itself is one level
+                            function<int(Node*)> countPointers = [&](Node* n) -> int {
+                                if (!n) return 0;
+                                int count = 0;
+                                if (n->name == "POINTER") count = 1;
+                                for (auto child : n->children) {
+                                    count += countPointers(child);
+                                }
+                                return count;
+                            };
+                            pointerDepth = countPointers(c);
+                        }
+                    }
+                } else if (typeNode->name == "SPEC_QUAL_LIST") {
+                    targetType = extractTypeFromSpecQualList(typeNode);
+                }
+            }
+        }
+        
+        // Append pointer stars to type
+        for (int i = 0; i < pointerDepth; i++) {
+            targetType += "*";
+        }
+        
+        // The va_list variable name is now being used as an index tracker
+        // Read current index, fetch param, then increment
+        string indexTemp = createTemp();
+        instructions.emplace_back(TACOp::ASSIGN, indexTemp, vaListName);
+        
+        cout << "DEBUG: va_arg(" << vaListName << ", " << targetType << ") -> param[" << vaListName << "]" << endl;
+        
+        // Generate: result = param[indexTemp]
+        string resultTemp = createTemp();
+        instructions.emplace_back(TACOp::GET_PARAM, resultTemp, indexTemp);
+        
+        // Increment the index for next call: vaListName = vaListName + 1
+        string oneTemp = createTemp();
+        instructions.emplace_back(TACOp::CONST, oneTemp, "1");
+        string newIndexTemp = createTemp();
+        instructions.emplace_back(TACOp::ADD, newIndexTemp, vaListName, oneTemp);
+        instructions.emplace_back(TACOp::ASSIGN, vaListName, newIndexTemp);
+        
+        // Cast to requested type if needed
+        if (targetType != "int") {
+            string castedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, castedTemp, resultTemp, targetType);
+            return castedTemp;
+        }
+        
+        return resultTemp;
     }
     else if (node->name == "ARRAY_ACCESS") {
         return generateArrayAccess(node);
@@ -904,6 +1023,12 @@ else if (node->name == "SIZEOF" || node->name == "SIZEOF_TYPE") {
             instructions.emplace_back(TACOp::NEG, resultTemp, operandTemp);
         } else if (op == "!") {
             string operandTemp = generateExpression(operandNode);
+              string operandType = getExpressionResultType(operandNode);
+    if (operandType != "bool") {
+        string boolOperand = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolOperand, operandTemp, "bool");
+        operandTemp = boolOperand;
+    }
             instructions.emplace_back(TACOp::NOT, resultTemp, operandTemp);
         } else if (op == "~") {
             string operandTemp = generateExpression(operandNode);
@@ -931,6 +1056,15 @@ string IRGenerator::generateLogicalAnd(Node* node) {
     if (!node || node->children.size() < 2) return "";
     
     string leftTemp = generateExpression(node->children[0]);
+     string leftType = getExpressionResultType(node->children[0]);
+    
+     if (leftType != "bool" ) {
+        string leftBool = createTemp();
+        instructions.emplace_back(TACOp::CAST, leftBool, leftTemp, "bool");
+        leftTemp = leftBool;
+        cout << "DEBUG: Logical AND - casting left operand to bool" << endl;
+    }
+    
     string resultTemp = createTemp();
     string falseLabel = createLabel("logical_false");
     string endLabel = createLabel("logical_end");
@@ -940,6 +1074,15 @@ string IRGenerator::generateLogicalAnd(Node* node) {
     
     // Left is true, evaluate right
     string rightTemp = generateExpression(node->children[1]);
+     string rightType = getExpressionResultType(node->children[1]);
+    
+    // Cast right operand to bool if needed
+    if (rightType != "bool") {
+        string rightBool = createTemp();
+        instructions.emplace_back(TACOp::CAST, rightBool, rightTemp, "bool");
+        rightTemp = rightBool;
+        cout << "DEBUG: Logical AND - casting right operand to bool" << endl;
+    }
     instructions.emplace_back(TACOp::ASSIGN, resultTemp, rightTemp);
     instructions.emplace_back(TACOp::GOTO, endLabel);
     
@@ -956,6 +1099,16 @@ string IRGenerator::generateLogicalOr(Node* node) {
     if (!node || node->children.size() < 2) return "";
     
     string leftTemp = generateExpression(node->children[0]);
+    string leftType = getExpressionResultType(node->children[0]);
+    
+    // Cast left operand to bool if needed
+    if (leftType != "bool") {
+        string leftBool = createTemp();
+        instructions.emplace_back(TACOp::CAST, leftBool, leftTemp, "bool");
+        leftTemp = leftBool;
+        cout << "DEBUG: Logical OR - casting left operand to bool" << endl;
+    }
+    
     string resultTemp = createTemp();
     string trueLabel = createLabel("logical_true");
     string endLabel = createLabel("logical_end");
@@ -965,6 +1118,15 @@ string IRGenerator::generateLogicalOr(Node* node) {
     
     // Evaluate right side (only if left is false)
     string rightTemp = generateExpression(node->children[1]);
+      string rightType = getExpressionResultType(node->children[1]);
+    
+    // Cast right operand to bool if needed
+    if (rightType != "bool" ) {
+        string rightBool = createTemp();
+        instructions.emplace_back(TACOp::CAST, rightBool, rightTemp, "bool");
+        rightTemp = rightBool;
+        cout << "DEBUG: Logical OR - casting right operand to bool" << endl;
+    }
     
     // Both are false - result is right side (or 0)
     instructions.emplace_back(TACOp::ASSIGN, resultTemp, rightTemp);
@@ -1019,7 +1181,64 @@ string IRGenerator::generateBinaryExpr(Node* node, TACOp op) {
     
     string leftTemp = generateExpression(leftNode);
     string rightTemp = generateExpression(rightNode);
+     
+    // ✅ ADD THIS SECTION - Validate bitwise/modulo operations
+    if (op == TACOp::MOD || op == TACOp::BIT_AND || op == TACOp::BIT_OR || 
+        op == TACOp::BIT_XOR || op == TACOp::SHL || op == TACOp::SHR) {
+        
+        string leftType = getExpressionResultType(leftNode);
+        string rightType = getExpressionResultType(rightNode);
+        
+        if (leftType == "float" || leftType == "double" ||
+            rightType == "float" || rightType == "double") {
+            cout << "ERROR: Bitwise/modulo operation on floating-point type" << endl;
+            return "";
+        }
+    }
     
+    // ✅ ADD THIS SECTION - Handle comparisons specially
+    if (op == TACOp::EQ || op == TACOp::NE || op == TACOp::LT || 
+        op == TACOp::LE || op == TACOp::GT || op == TACOp::GE) {
+        
+        string leftType = getExpressionResultType(leftNode);
+        string rightType = getExpressionResultType(rightNode);
+        
+        // Determine common comparison type
+        string compareType = "int";
+        if (leftType == "double" || rightType == "double") {
+            compareType = "double";
+        } else if (leftType == "float" || rightType == "float") {
+            compareType = "float";
+        } else if (leftType == "long" || rightType == "long") {
+            compareType = "long";
+        }
+        
+        // Convert both operands to comparison type
+        if (normalizeTypeName(leftType) != compareType) {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, leftTemp, compareType);
+            leftTemp = convertedTemp;
+            cout << "DEBUG: Comparison - converting left: " << leftType 
+                 << " -> " << compareType << endl;
+        }
+        
+        if (normalizeTypeName(rightType) != compareType) {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, rightTemp, compareType);
+            rightTemp = convertedTemp;
+            cout << "DEBUG: Comparison - converting right: " << rightType 
+                 << " -> " << compareType << endl;
+        }
+        
+        // Perform comparison
+        string resultTemp = createTemp();
+        instructions.emplace_back(op, resultTemp, leftTemp, rightTemp);
+        
+        // Convert result to bool
+        string boolResult = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolResult, resultTemp, "bool");
+        return boolResult;
+    }
     // Check if this is pointer arithmetic
     bool leftIsPointer = isPointerType(leftNode);
     bool rightIsPointer = isPointerType(rightNode);
@@ -1037,13 +1256,61 @@ string IRGenerator::generateBinaryExpr(Node* node, TACOp op) {
             return generatePointerArithmetic(rightNode, rightTemp, leftTemp, TACOp::ADD);
         }
     }
-     // ✅ ADD THIS: Apply integer promotion for bool and char operands
+     // Apply integer promotion for bool and char operands
     leftTemp = applyIntegerPromotion(leftTemp, leftNode);
     rightTemp = applyIntegerPromotion(rightTemp, rightNode);
+    
+    // Apply usual arithmetic conversions for mixed-type operations
+    string leftType = getExpressionResultType(leftNode);
+    string rightType = getExpressionResultType(rightNode);
+    
+    // Normalize types
+    leftType = normalizeTypeName(leftType);
+    rightType = normalizeTypeName(rightType);
+    
+    // If types differ, convert to the "wider" type
+    if (leftType != rightType) {
+        // Determine the target type based on usual arithmetic conversions
+        string targetType = "";
+        
+        // Priority: double > float > long > int
+        if (leftType == "double" || rightType == "double") {
+            targetType = "double";
+        } else if (leftType == "float" || rightType == "float") {
+            targetType = "float";
+        } else if (leftType == "long" || rightType == "long") {
+            targetType = "long";
+        } else {
+            targetType = "int";  // Both should be int after promotion
+        }
+        
+        // Convert operands to target type if needed
+        if (leftType != targetType && (leftType == "int" || leftType == "long" || leftType == "float" || leftType == "double")) {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, leftTemp, targetType);
+            leftTemp = convertedTemp;
+            cout << "DEBUG: Arithmetic conversion: " << leftTemp << " (" << leftType 
+                 << ") -> " << convertedTemp << " (" << targetType << ")" << endl;
+        }
+        
+        if (rightType != targetType && (rightType == "int" || rightType == "long" || rightType == "float" || rightType == "double")) {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, rightTemp, targetType);
+            rightTemp = convertedTemp;
+            cout << "DEBUG: Arithmetic conversion: " << rightTemp << " (" << rightType 
+                 << ") -> " << convertedTemp << " (" << targetType << ")" << endl;
+        }
+    }
     
     // Regular arithmetic
     string resultTemp = createTemp();
     instructions.emplace_back(op, resultTemp, leftTemp, rightTemp);
+       if (op == TACOp::EQ || op == TACOp::NE || op == TACOp::LT || 
+        op == TACOp::LE || op == TACOp::GT || op == TACOp::GE) {
+        string boolResult = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolResult, resultTemp, "bool");
+        return boolResult;
+    }
     return resultTemp;
 }
 
@@ -1098,24 +1365,82 @@ string IRGenerator::generateFunctionCall(Node* node) {
     string callOperand;     // can be function name or temp/unique name holding address
     vector<bool> paramIsRef; // per-arg reference flags
     string debugName = "<expr>";
+    bool isIndirectCall = false;  // Track if this is an indirect call
     
     // Determine callee info
     if (funcNode->name == "IDENTIFIER") {
         debugName = funcNode->lexeme;
+        
+        // Handle varargs helpers
+        if (debugName == "va_start") {
+            // va_start(args, last_named_param)
+            // Initialize the va_list variable to the index of the first variadic argument
+            if (node->children.size() > 1) {
+                Node* argList = node->children[1];
+                if (argList && argList->children.size() >= 1) {
+                    Node* vaListArg = argList->children[0];
+                    if (vaListArg && vaListArg->name == "IDENTIFIER") {
+                        string vaListName = getUniqueNameFor(vaListArg, vaListArg->lexeme);
+                        
+                        // Find the function symbol to count named parameters
+                        Symbol* funcSym = symbolTable.lookuph(currentFunction);
+                        int namedParamCount = funcSym ? funcSym->paramTypes.size() : 0;
+                        
+                        // Emit comment for documentation
+                        instructions.emplace_back(TACOp::COMMENT, "va_start(" + vaListName + ")");
+                        
+                        // Generate: vaListName = namedParamCount (starting index)
+                        string indexTemp = createTemp();
+                        instructions.emplace_back(TACOp::CONST, indexTemp, to_string(namedParamCount));
+                        instructions.emplace_back(TACOp::ASSIGN, vaListName, indexTemp);
+                        
+                        cout << "DEBUG: va_start(" << vaListName << ") initialized to " 
+                             << namedParamCount << endl;
+                    }
+                }
+            }
+            return createTemp(); // Return a temp to satisfy expression contexts
+        }
+        
+        if (debugName == "va_end") {
+            // va_end - emit a comment marker for documentation
+            if (node->children.size() > 1) {
+                Node* argList = node->children[1];
+                if (argList && argList->children.size() >= 1) {
+                    Node* vaListArg = argList->children[0];
+                    if (vaListArg && vaListArg->name == "IDENTIFIER") {
+                        string vaListName = getUniqueNameFor(vaListArg, vaListArg->lexeme);
+                        instructions.emplace_back(TACOp::COMMENT, "va_end(" + vaListName + ")");
+                        cout << "DEBUG: va_end(" << vaListName << ") emitted comment" << endl;
+                    }
+                }
+            }
+            return createTemp(); // Return a temp to satisfy expression contexts
+        }
+        
+        if (debugName == "va_copy") {
+            // va_copy - not fully implemented but emit comment
+            instructions.emplace_back(TACOp::COMMENT, "va_copy(...)");
+            return createTemp();
+        }
+        
         Symbol* calleeSym = symbolTable.lookuph(funcNode->lexeme);  // Use lookuph to search scope history
         if (!calleeSym) return "";
         if (calleeSym->isFunction) {
             callOperand = funcNode->lexeme; // direct call by name
             paramIsRef = calleeSym->paramIsReference;
+            isIndirectCall = false;
         } else if (calleeSym->isFunctionPointer) {
             // Indirect call via function pointer stored in a variable
             callOperand = getUniqueNameFor(funcNode, funcNode->lexeme);
             paramIsRef = calleeSym->funcPtrParamIsReference;
+            isIndirectCall = true;
         } else {
             return "";
         }
     } else if (funcNode->name == "UNARY_OP" && funcNode->children.size() == 2 && funcNode->children[0]->name == "*") {
         // (*fp)(...)
+        isIndirectCall = true;
         Node* inner = funcNode->children[1];
         if (inner && inner->name == "IDENTIFIER") {
             debugName = inner->lexeme;
@@ -1127,6 +1452,34 @@ string IRGenerator::generateFunctionCall(Node* node) {
             // Fallback: evaluate expression to a temp as callee address (limited support)
             callOperand = generateExpression(funcNode);
         }
+    } else if (funcNode->name == "ARRAY_ACCESS") {
+        // Function pointer array element: operations[0](...)
+        // The array element holds a function pointer, so we need to dereference it
+        debugName = "<array element>";
+        isIndirectCall = true;
+        
+        // Generate array access to get the function pointer
+        callOperand = generateArrayAccess(funcNode);
+        
+        // Try to get parameter info from the array symbol if available
+        if (funcNode->children.size() > 0 && funcNode->children[0]->name == "IDENTIFIER") {
+            Symbol* arraySym = symbolTable.lookuph(funcNode->children[0]->lexeme);
+            if (arraySym && arraySym->isFunctionPointer) {
+                paramIsRef = arraySym->funcPtrParamIsReference;
+            }
+        }
+    } else if (funcNode->name == "MEMBER_ACCESS" || funcNode->name == "DIRECT_MEMBER" || funcNode->name == "DOT" ||
+               funcNode->name == "PTR_MEMBER_ACCESS" || funcNode->name == "ARROW") {
+        // Struct member function pointer: obj.func_ptr(...) or ptr->func_ptr(...)
+        isIndirectCall = true;
+        debugName = "<member function pointer>";
+        
+        // Generate member access to get the function pointer
+        bool isArrow = (funcNode->name == "PTR_MEMBER_ACCESS" || funcNode->name == "ARROW");
+        callOperand = generateMemberAccess(funcNode, isArrow);
+        
+        // Try to get parameter info from member if available
+        // Note: This would require struct member metadata, which may not be fully implemented
     } else {
         // Unsupported callee
         return "";
@@ -1147,39 +1500,66 @@ string IRGenerator::generateFunctionCall(Node* node) {
         
         cout << "DEBUG: Evaluating " << argList->children.size() 
              << " arguments for " << debugName << " in left-to-right order" << endl;
+       
         // Step 1+2 combined: For each argument, either compute address (for ref) or value
-        for (size_t i = 0; i < argList->children.size(); i++) {
-            Node* arg = argList->children[i];
-            bool passByRef = (i < paramIsRef.size() && paramIsRef[i]);
-            string toPass;
-            if (passByRef) {
-                // For references, pass the address of the lvalue
-                toPass = generateLValueAddress(arg);
-            } else {
-                // Evaluate expression to a value (with side effects)
-                string argTemp = generateExpression(arg);
-                if (!argTemp.empty()) {
-                    bool isTemp = (argTemp[0] == 't' && (argTemp.size() == 1 || isdigit(argTemp[1])));
-                    bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
-                                   (argTemp[0] == '-' && argTemp.size()>1 && isdigit(argTemp[1])));
-                    if (!isTemp && !isConst) {
-                        string preservedTemp = createTemp();
-                        instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
-                        toPass = preservedTemp;
-                    } else {
-                        toPass = argTemp;
-                    }
-                }
+for (size_t i = 0; i < argList->children.size(); i++) {
+    Node* arg = argList->children[i];
+    bool passByRef = (i < paramIsRef.size() && paramIsRef[i]);
+    string toPass;
+    if (passByRef) {
+        toPass = generateLValueAddress(arg);
+    } else {
+        string argTemp = generateExpression(arg);
+        
+        // ✅ NEW: Convert argument to parameter type if function info available
+        if (funcNode->name == "IDENTIFIER" && funcNode->symbol && 
+            funcNode->symbol->isFunction && i < funcNode->symbol->paramTypes.size()) {
+            
+            string expectedType = normalizeTypeName(funcNode->symbol->paramTypes[i]);
+            string actualType = normalizeTypeName(getExpressionResultType(arg));
+            
+            if (expectedType != actualType) {
+                string convertedTemp = createTemp();
+                instructions.emplace_back(TACOp::CAST, convertedTemp, argTemp, expectedType);
+                argTemp = convertedTemp;
+                cout << "DEBUG: Converting argument " << i << ": " 
+                     << actualType << " -> " << expectedType << endl;
             }
-            cout << "DEBUG: Emitting param " << i << ": " << toPass << endl;
-            instructions.emplace_back(TACOp::PARAM, "", toPass);
         }
+        
+        if (!argTemp.empty()) {
+            bool isTemp = (argTemp[0] == 't' && (argTemp.size() == 1 || isdigit(argTemp[1])));
+            bool isConst = (argTemp[0] == '"' || isdigit(argTemp[0]) || 
+                           (argTemp[0] == '-' && argTemp.size()>1 && isdigit(argTemp[1])));
+            if (!isTemp && !isConst) {
+                string preservedTemp = createTemp();
+                instructions.emplace_back(TACOp::ASSIGN, preservedTemp, argTemp);
+                toPass = preservedTemp;
+            } else {
+                toPass = argTemp;
+            }
+        }
+    }
+    cout << "DEBUG: Emitting param " << i << ": " << toPass << endl;
+    instructions.emplace_back(TACOp::PARAM, "", toPass);
+}
     }
     
     // Step 3: Emit the CALL instruction (direct or indirect)
     string resultTemp = createTemp();
-    instructions.emplace_back(TACOp::CALL, resultTemp, callOperand);
-    
+   
+string callTarget = isIndirectCall ? ("*" + callOperand) : callOperand;
+
+// ✅ Count parameters
+int paramCount = 0;
+if (node->children.size() > 1) {
+    Node* argList = node->children[1];
+    paramCount = argList->children.size();
+}
+
+// ✅ Emit CALL with param count
+instructions.emplace_back(TACOp::CALL, resultTemp, callTarget, "", paramCount);
+
     return resultTemp;
 }
 
@@ -1437,10 +1817,31 @@ void IRGenerator::generateDeclaration(Node* node) {
                                 // Emit stores for provided initializers (bounded by totalElements)
                                 int provided = static_cast<int>(flatValues.size());
                                 int emitCount = min(provided, totalElements);
+                            
                                 for (int i = 0; i < emitCount; ++i) {
-                                    string valueTemp = generateExpression(flatValues[i]);
-                                    emitStoreAtIndex(i, valueTemp);
-                                }
+    string valueTemp = generateExpression(flatValues[i]);
+    
+    // ✅ NEW: Convert initializer to array element type
+    if (idNode && idNode->symbol) {
+        string elemType = idNode->symbol->type;
+        if (idNode->symbol->pointerDepth > 0) {
+            elemType = "pointer";
+        }
+        elemType = normalizeTypeName(elemType);
+        
+        string initType = normalizeTypeName(getExpressionResultType(flatValues[i]));
+        
+        if (elemType != initType && elemType != "pointer") {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, valueTemp, elemType);
+            valueTemp = convertedTemp;
+            cout << "DEBUG: Converting array initializer[" << i << "]: " 
+                 << initType << " -> " << elemType << endl;
+        }
+    }
+    
+    emitStoreAtIndex(i, valueTemp);
+}
                                 // Zero-fill remaining elements
                                 emitZeroRange(emitCount, totalElements - emitCount);
                             } else {
@@ -1567,22 +1968,42 @@ void IRGenerator::generateDeclaration(Node* node) {
                                             flagName_guard2 = varName + "__inited";
                                             instructions.emplace_back(TACOp::IF_GOTO, endLabel_guard2, flagName_guard2);
                                         }
-                                        // Iterate members in the stored order (map order for now)
+                                        // Iterate members in DECLARATION order using structMemberOrder
                                         size_t idx = 0;
-                                        for (const auto& member : structSym->structMembers) {
-                                            string memberName = member.first;
+                                        for (const auto& memberName : structSym->structMemberOrder) {
+                                            // Look up member type from structMembers map
+                                            auto it = structSym->structMembers.find(memberName);
+                                            if (it == structSym->structMembers.end()) continue; // Safety check
+                                            string memberType = it->second;  // ✅ Get expected type
+   
                                             int offset = getMemberOffset((varNode->name == "IDENTIFIER") ? varNode : nullptr, memberName);
                                             string memberAddr = createTemp();
                                             string offsetTemp = createTemp();
                                             instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
                                             instructions.emplace_back(TACOp::ADD, memberAddr, baseAddr, offsetTemp);
-                                            string valueTemp;
-                                            if (idx < initNode->children.size()) {
-                                                valueTemp = generateExpression(initNode->children[idx]);
-                                            } else {
-                                                valueTemp = createTemp();
-                                                instructions.emplace_back(TACOp::CONST, valueTemp, "0");
-                                            }
+                                            
+                                            
+                        string valueTemp;
+    if (idx < initNode->children.size()) {
+        valueTemp = generateExpression(initNode->children[idx]);
+        
+        // ✅ NEW: Convert to member type
+        string initType = normalizeTypeName(getExpressionResultType(initNode->children[idx]));
+        memberType = normalizeTypeName(memberType);
+        
+        if (memberType != initType) {
+            string convertedTemp = createTemp();
+            instructions.emplace_back(TACOp::CAST, convertedTemp, valueTemp, memberType);
+            valueTemp = convertedTemp;
+            cout << "DEBUG: Converting struct member '" << memberName 
+                 << "': " << initType << " -> " << memberType << endl;
+        }
+    } else {
+        valueTemp = createTemp();
+        instructions.emplace_back(TACOp::CONST, valueTemp, "0");
+    }
+    
+                                        
                                             instructions.emplace_back(TACOp::STORE, memberAddr, valueTemp);
                                             idx++;
                                         }
@@ -1605,8 +2026,26 @@ void IRGenerator::generateDeclaration(Node* node) {
                     Node* idInDecl = nullptr;
                     if (varNode->name == "IDENTIFIER") {
                         idInDecl = varNode;
-                    } else if (varNode->name == "DECLARATOR") {
-                        // Find IDENTIFIER inside declarator
+                    } else if (varNode->name == "ARRAY") {
+                        // Check if this is a pointer-to-array: int (*p)[N]
+                        // Structure: ARRAY -> DECLARATOR -> POINTER + IDENTIFIER
+                        if (!varNode->children.empty() && varNode->children[0]->name == "DECLARATOR") {
+                            Node* declarator = varNode->children[0];
+                            // Check if it has a POINTER child (making it a pointer variable)
+                            bool hasPointer = false;
+                            for (auto c : declarator->children) {
+                                if (c->name == "POINTER") {
+                                    hasPointer = true;
+                                    break;
+                                }
+                            }
+                            if (hasPointer) {
+                                // This is a pointer-to-array variable, not an array
+                                idInDecl = findIdentifierInArray(varNode);
+                            }
+                        }
+                    } else if (varNode->name == "DECLARATOR" || varNode->name == "FUNCTION_DECL") {
+                        // Find IDENTIFIER inside declarator or function pointer declarator
                         std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
                             if (!n) return nullptr;
                             if (n->name == "IDENTIFIER") return n;
@@ -1697,7 +2136,7 @@ void IRGenerator::generateFunction(Node* node) {
      Node* paramList = nullptr;
     // Find declarator and body in the children
     for (auto child : actualFunctionDef->children) {
-        if (child->name == "FUNCTION_DECL" || child->name == "IDENTIFIER") {
+        if (child->name == "DECLARATOR" || child->name == "FUNCTION_DECL" || child->name == "IDENTIFIER") {
             declarator = child;
              // Look for parameter list in function declarator
             for (auto declChild : child->children) {
@@ -1708,8 +2147,9 @@ void IRGenerator::generateFunction(Node* node) {
         } else if (child->name == "COMPOUND_STMT") {
             body = child;
         } else if (child->name == "DECL_SPECIFIERS") {
-            // This contains the return type, we can ignore for now
-            continue;
+            // Extract return type from DECL_SPECIFIERS (same structure as SPEC_QUAL_LIST)
+            currentFunctionReturnType = extractTypeFromSpecQualList(child);
+            cout << "DEBUG: Function return type: " << currentFunctionReturnType << endl;
         }
     }
     
@@ -1748,6 +2188,7 @@ void IRGenerator::generateFunction(Node* node) {
     instructions.emplace_back(TACOp::FUNC_END, funcName);
     
     currentFunction = "";
+    currentFunctionReturnType = "";
 }
 
 void IRGenerator::generateParameterHandling(Node* paramList) {
@@ -1830,6 +2271,12 @@ void IRGenerator::generateIfStatement(Node* node) {
         // IF without ELSE: condition, then-statement
         if (node->children.size() >= 2) {
             string conditionTemp = generateExpression(node->children[0]);
+             string condType = getExpressionResultType(node->children[0]);
+            if (condType != "bool") {
+                string boolCond = createTemp();
+                instructions.emplace_back(TACOp::CAST, boolCond, conditionTemp, "bool");
+                conditionTemp = boolCond;
+            }
             string endLabel = createLabel("endif");
             
             // If condition is false, jump to end
@@ -1846,6 +2293,12 @@ void IRGenerator::generateIfStatement(Node* node) {
         // IF with ELSE: condition, then-statement, else-statement
         if (node->children.size() >= 3) {
             string conditionTemp = generateExpression(node->children[0]);
+             string condType = getExpressionResultType(node->children[0]);
+            if (condType != "bool") {
+                string boolCond = createTemp();
+                instructions.emplace_back(TACOp::CAST, boolCond, conditionTemp, "bool");
+                conditionTemp = boolCond;
+            }
             string elseLabel = createLabel("else");
             string endLabel = createLabel("endif");
             
@@ -1902,6 +2355,12 @@ void IRGenerator::generateWhileStatement(Node* node) {
     
     // Generate condition and check
     string conditionTemp = generateExpression(node->children[0]);
+     string condType = getExpressionResultType(node->children[0]);
+    if (condType != "bool") {
+        string boolCond = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolCond, conditionTemp, "bool");
+        conditionTemp = boolCond;
+    }
     instructions.emplace_back(TACOp::IF_GOTO, startLabel, conditionTemp);
     
     // End of loop
@@ -1918,6 +2377,26 @@ void IRGenerator::generateReturnStatement(Node* node) {
     
     if (!node->children.empty()) {
         string returnValue = generateExpression(node->children[0]);
+        
+        // Check if we need type conversion for the return value
+        if (!currentFunction.empty() && !currentFunctionReturnType.empty()) {
+            string returnType = normalizeTypeName(currentFunctionReturnType);
+            Node* returnExpr = node->children[0];
+            string exprType = getExpressionResultType(returnExpr);
+            
+            cout << "DEBUG: Return type conversion check - expr: " << exprType 
+                 << " -> function return: " << returnType << endl;
+            
+            // If types differ, insert conversion
+            if (returnType != exprType && returnType != "void" && exprType != "void") {
+                string convertedTemp = createTemp();
+                instructions.emplace_back(TACOp::CAST, convertedTemp, returnValue, returnType);
+                cout << "DEBUG: Return type conversion: " << returnValue << " (" << exprType 
+                     << ") -> " << convertedTemp << " (" << returnType << ")" << endl;
+                returnValue = convertedTemp;
+            }
+        }
+        
         instructions.emplace_back(TACOp::RETURN, "", returnValue);
     } else {
         instructions.emplace_back(TACOp::RETURN);
@@ -1930,6 +2409,15 @@ string IRGenerator::getDeclaratorName(Node* node) {
     
     if (node->name == "IDENTIFIER") {
         return node->lexeme;
+    }
+    
+    // Handle FUNCTION_DECL which contains the function name
+    if (node->name == "FUNCTION_DECL") {
+        for (auto child : node->children) {
+            if (child->name == "IDENTIFIER") {
+                return child->lexeme;
+            }
+        }
     }
     
     for (auto child : node->children) {
@@ -1986,13 +2474,43 @@ void IRGenerator::generateForStatement(Node* node) {
     // Condition label
     instructions.emplace_back(TACOp::LABEL, condLabel);
     
-    // Generate condition
-    if (node->children[1]->name != "EMPTY") {
+   // Generate condition
+cout << "DEBUG: For loop condition check - child[1] name: " << node->children[1]->name << endl;
+
+// Check if condition is empty (either EMPTY or EMPTY_STMT)
+if (node->children[1]->name == "EMPTY" || node->children[1]->name == "EMPTY_STMT") {
+    // Empty condition means infinite loop - unconditional jump
+    cout << "DEBUG: Empty for condition detected, generating infinite loop" << endl;
+    instructions.emplace_back(TACOp::GOTO, startLabel);
+} else {
+    string condTemp = generateExpression(node->children[1]);
+    
+    // Check if expression actually returned a value
+    if (condTemp.empty()) {
+        cout << "DEBUG: Empty condition temp, treating as infinite loop" << endl;
+        instructions.emplace_back(TACOp::GOTO, startLabel);
+    } else {
+        string condType = getExpressionResultType(node->children[1]);
+        if (condType != "bool") {
+            string boolCond = createTemp();
+            instructions.emplace_back(TACOp::CAST, boolCond, condTemp, "bool");
+            condTemp = boolCond;
+        }
+        instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
+    }
+}
+  /*  if (node->children[1]->name != "EMPTY") {
         string condTemp = generateExpression(node->children[1]);
+        string condType = getExpressionResultType(node->children[1]);
+        if (condType != "bool") {
+            string boolCond = createTemp();
+            instructions.emplace_back(TACOp::CAST, boolCond, condTemp, "bool");
+            condTemp = boolCond;
+        }
         instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
     } else {
         instructions.emplace_back(TACOp::GOTO, startLabel);
-    }
+    }*/
     
     // End label
     instructions.emplace_back(TACOp::LABEL, endLabel);
@@ -2030,7 +2548,12 @@ void IRGenerator::generateDoWhileStatement(Node* node) {
 
     // Generate condition (child 1)
     string condTemp = generateExpression(node->children[1]);
-
+     string condType = getExpressionResultType(node->children[1]);
+    if (condType != "bool") {
+        string boolCond = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolCond, condTemp, "bool");
+        condTemp = boolCond;
+    }
     // If condition is true, jump back to start
     instructions.emplace_back(TACOp::IF_GOTO, startLabel, condTemp);
 
@@ -2161,6 +2684,7 @@ string IRGenerator::generatePostDecrement(Node* node) {
     return oldVal;
 }
 
+/*
 string IRGenerator::generateCompoundAssignment(Node* node) {
     if (!node || node->children.size() < 3) return "";
     
@@ -2171,52 +2695,248 @@ string IRGenerator::generateCompoundAssignment(Node* node) {
     if (lhs->name != "IDENTIFIER") return "";
     
     string varName = getUniqueNameFor(lhs, lhs->lexeme);
-    string rhsTemp = generateExpression(rhs);
-    string resultTemp = createTemp();
     
-    // Determine the operation based on operator
+    // ✅ NEW: Get and validate LHS type
+    string lhsType = normalizeTypeName(lhs->symbol ? lhs->symbol->type : "int");
+    
+    // ✅ NEW: Handle bool in compound assignment (treat as int)
+    if (lhsType == "bool") {
+        cout << "WARNING: Compound assignment on bool type, treating as int" << endl;
+        lhsType = "int";
+    }
+    
+    string rhsType = getExpressionResultType(rhs);
+    string rhsTemp = generateExpression(rhs);
+    
+    // ✅ NEW: Get operator
     string opStr = op->lexeme;
     
+    // ✅ NEW: Validate operation type compatibility
+    if (opStr == "%=" || opStr == "&=" || opStr == "|=" || 
+        opStr == "^=" || opStr == "<<=" || opStr == ">>=") {
+        // Bitwise/modulo ops require integer types
+        if (lhsType == "float" || lhsType == "double" ||
+            rhsType == "float" || rhsType == "double") {
+            cout << "ERROR: Bitwise/modulo compound assignment on floating type" << endl;
+            return "";
+        }
+    }
+    
+    // Determine common type for operation
+    string commonType = lhsType;
+    
+    if (rhsType == "double" || lhsType == "double") {
+        commonType = "double";
+    } else if (rhsType == "float" || lhsType == "float") {
+        commonType = "float";
+    } else if (rhsType == "long" || lhsType == "long") {
+        commonType = "long";
+    } else {
+        commonType = "int";
+    }
+    
+    // Convert LHS to common type if needed for operation
+    string lhsOperand = varName;
+    if (lhsType != commonType) {
+        string convertedLhs = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedLhs, varName, commonType);
+        lhsOperand = convertedLhs;
+        cout << "DEBUG: Compound assignment - promoting LHS: " << lhsType 
+             << " -> " << commonType << endl;
+    }
+    
+    // Convert RHS to common type if needed
+    string rhsOperand = rhsTemp;
+    if (rhsType != commonType) {
+        string convertedRhs = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedRhs, rhsTemp, commonType);
+        rhsOperand = convertedRhs;
+        cout << "DEBUG: Compound assignment - promoting RHS: " << rhsType 
+             << " -> " << commonType << endl;
+    }
+    
+    string resultTemp = createTemp();
+    
+    // Perform operation
     if (opStr == "+=") {
-        instructions.emplace_back(TACOp::ADD, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::ADD, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "-=") {
-        instructions.emplace_back(TACOp::SUB, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::SUB, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "*=") {
-        instructions.emplace_back(TACOp::MUL, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::MUL, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "/=") {
-        instructions.emplace_back(TACOp::DIV, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::DIV, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "%=") {
-        instructions.emplace_back(TACOp::MOD, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::MOD, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "&=") {
-        instructions.emplace_back(TACOp::BIT_AND, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::BIT_AND, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "|=") {
-        instructions.emplace_back(TACOp::BIT_OR, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::BIT_OR, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "^=") {
-        instructions.emplace_back(TACOp::BIT_XOR, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::BIT_XOR, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == "<<=") {
-        instructions.emplace_back(TACOp::SHL, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::SHL, resultTemp, lhsOperand, rhsOperand);
     }
     else if (opStr == ">>=") {
-        instructions.emplace_back(TACOp::SHR, resultTemp, varName, rhsTemp);
+        instructions.emplace_back(TACOp::SHR, resultTemp, lhsOperand, rhsOperand);
     }
     else {
         cout << "WARNING: Unknown compound operator: " << opStr << endl;
         return "";
     }
     
+    // Convert result back to LHS type if needed
+    string finalValue = resultTemp;
+    if (commonType != lhsType) {
+        string castedTemp = createTemp();
+        instructions.emplace_back(TACOp::CAST, castedTemp, resultTemp, lhsType);
+        finalValue = castedTemp;
+        cout << "DEBUG: Compound assignment - converting result: " << commonType 
+             << " -> " << lhsType << endl;
+    }
+    
     // Store result back to variable
-    instructions.emplace_back(TACOp::ASSIGN, varName, resultTemp);
+    instructions.emplace_back(TACOp::ASSIGN, varName, finalValue);
+    
+    return varName;
+}*/
+
+
+string IRGenerator::generateCompoundAssignment(Node* node) {
+    if (!node || node->children.size() < 3) return "";
+    
+    Node* lhs = node->children[0];
+    Node* op = node->children[1];
+    Node* rhs = node->children[2];
+    
+    if (lhs->name != "IDENTIFIER") return "";
+    
+    string varName = getUniqueNameFor(lhs, lhs->lexeme);
+    
+    // ✅ Get ORIGINAL LHS type (don't modify yet!)
+    string originalLhsType = normalizeTypeName(lhs->symbol ? lhs->symbol->type : "int");
+    
+    // ✅ Determine OPERATION type (what type to use for the arithmetic)
+    string operationType = originalLhsType;
+    
+    // Handle bool in compound assignment (treat as int FOR OPERATION)
+    if (originalLhsType == "bool" || originalLhsType == "_Bool") {
+        cout << "WARNING: Compound assignment on bool type, treating as int" << endl;
+        operationType = "int";  // ✅ Use int for operation, but keep original type
+    }
+    
+    string rhsType = getExpressionResultType(rhs);
+    string rhsTemp = generateExpression(rhs);
+    
+    // Get operator
+    string opStr = op->lexeme;
+    
+    // Validate operation type compatibility
+    if (opStr == "%=" || opStr == "&=" || opStr == "|=" || 
+        opStr == "^=" || opStr == "<<=" || opStr == ">>=") {
+        // Bitwise/modulo ops require integer types
+        if (operationType == "float" || operationType == "double" ||
+            rhsType == "float" || rhsType == "double") {
+            cout << "ERROR: Bitwise/modulo compound assignment on floating type" << endl;
+            return "";
+        }
+    }
+    
+    // Determine common type for operation
+    string commonType = operationType;  // ✅ Start with operation type, not original
+    
+    if (rhsType == "double" || operationType == "double") {
+        commonType = "double";
+    } else if (rhsType == "float" || operationType == "float") {
+        commonType = "float";
+    } else if (rhsType == "long" || operationType == "long") {
+        commonType = "long";
+    } else {
+        commonType = "int";
+    }
+    
+    // ✅ Convert LHS from ORIGINAL type to common type
+    string lhsOperand = varName;
+    if (originalLhsType != commonType) {  // ✅ Compare ORIGINAL type
+        string convertedLhs = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedLhs, varName, commonType);
+        lhsOperand = convertedLhs;
+        cout << "DEBUG: Compound assignment - promoting LHS: " << originalLhsType 
+             << " -> " << commonType << endl;
+    }
+    
+    // Convert RHS to common type if needed
+    string rhsOperand = rhsTemp;
+    if (rhsType != commonType) {
+        string convertedRhs = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedRhs, rhsTemp, commonType);
+        rhsOperand = convertedRhs;
+        cout << "DEBUG: Compound assignment - promoting RHS: " << rhsType 
+             << " -> " << commonType << endl;
+    }
+    
+    string resultTemp = createTemp();
+    
+    // Perform operation
+    if (opStr == "+=") {
+        instructions.emplace_back(TACOp::ADD, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "-=") {
+        instructions.emplace_back(TACOp::SUB, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "*=") {
+        instructions.emplace_back(TACOp::MUL, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "/=") {
+        instructions.emplace_back(TACOp::DIV, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "%=") {
+        instructions.emplace_back(TACOp::MOD, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "&=") {
+        instructions.emplace_back(TACOp::BIT_AND, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "|=") {
+        instructions.emplace_back(TACOp::BIT_OR, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "^=") {
+        instructions.emplace_back(TACOp::BIT_XOR, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == "<<=") {
+        instructions.emplace_back(TACOp::SHL, resultTemp, lhsOperand, rhsOperand);
+    }
+    else if (opStr == ">>=") {
+        instructions.emplace_back(TACOp::SHR, resultTemp, lhsOperand, rhsOperand);
+    }
+    else {
+        cout << "WARNING: Unknown compound operator: " << opStr << endl;
+        return "";
+    }
+    
+    // ✅ Convert result back to ORIGINAL LHS type
+    string finalValue = resultTemp;
+    if (commonType != originalLhsType) {  // ✅ Compare with ORIGINAL type
+        string castedTemp = createTemp();
+        instructions.emplace_back(TACOp::CAST, castedTemp, resultTemp, originalLhsType);
+        finalValue = castedTemp;
+        cout << "DEBUG: Compound assignment - converting result: " << commonType 
+             << " -> " << originalLhsType << endl;
+    }
+    
+    // Store result back to variable
+    instructions.emplace_back(TACOp::ASSIGN, varName, finalValue);
     
     return varName;
 }
+
 
 void IRGenerator::generateSwitchStatement(Node* node) {
     if (!node || node->children.size() < 2) return;
@@ -2398,6 +3118,12 @@ string IRGenerator::generateTernaryOperator(Node* node) {
     Node* falseExpr = node->children[2];
     
     string condTemp = generateExpression(condition);
+      string condType = getExpressionResultType(condition);
+    if (condType != "bool") {
+        string boolCond = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolCond, condTemp, "bool");
+        condTemp = boolCond;
+    }
     string resultTemp = createTemp();
     string trueLabel = createLabel("ternary_true");
     string falseLabel = createLabel("ternary_false");
@@ -2405,16 +3131,46 @@ string IRGenerator::generateTernaryOperator(Node* node) {
     
     // If condition is false, jump to false branch
     instructions.emplace_back(TACOp::IF_FALSE_GOTO, falseLabel, condTemp);
+     
+    // ✅ NEW: Determine common result type
+    string trueType = getExpressionResultType(trueExpr);
+    string falseType = getExpressionResultType(falseExpr);
+    
+    string resultType = "int";
+    if (trueType == "double" || falseType == "double") {
+        resultType = "double";
+    } else if (trueType == "float" || falseType == "float") {
+        resultType = "float";
+    } else if (trueType == "long" || falseType == "long") {
+        resultType = "long";
+    }
+    
+    cout << "DEBUG: Ternary result type: " << resultType << endl;
     
     // True branch
     instructions.emplace_back(TACOp::LABEL, trueLabel);
     string trueTemp = generateExpression(trueExpr);
+      // ✅ NEW: Convert true branch to result type
+    if (normalizeTypeName(trueType) != resultType) {
+        string convertedTemp = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedTemp, trueTemp, resultType);
+        trueTemp = convertedTemp;
+        cout << "DEBUG: Ternary - converting true branch: " << trueType 
+             << " -> " << resultType << endl;
+    }
     instructions.emplace_back(TACOp::ASSIGN, resultTemp, trueTemp);
     instructions.emplace_back(TACOp::GOTO, endLabel);
     
     // False branch
     instructions.emplace_back(TACOp::LABEL, falseLabel);
     string falseTemp = generateExpression(falseExpr);
+     if (normalizeTypeName(falseType) != resultType) {
+        string convertedTemp = createTemp();
+        instructions.emplace_back(TACOp::CAST, convertedTemp, falseTemp, resultType);
+        falseTemp = convertedTemp;
+        cout << "DEBUG: Ternary - converting false branch: " << falseType 
+             << " -> " << resultType << endl;
+    }
     instructions.emplace_back(TACOp::ASSIGN, resultTemp, falseTemp);
     
     // End
@@ -2709,7 +3465,17 @@ else {
     if (baseExpr->name == "IDENTIFIER" && baseExpr->symbol) {
         Symbol* sym = baseExpr->symbol;
         if (sym->isArray) {
-            elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+            // For multi-dimensional arrays, calculate size of sub-array
+            if (sym->arrayDimensions.size() > 1) {
+                // Calculate: size of inner array = product of remaining dims * base type size
+                int innerSize = getBaseTypeSize(sym->type);
+                for (size_t i = 1; i < sym->arrayDimensions.size(); i++) {
+                    innerSize *= sym->arrayDimensions[i];
+                }
+                elemSize = innerSize;
+            } else {
+                elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+            }
         } else if (sym->pointerDepth > 0) {
             elemSize = getBaseTypeSize(sym->type);
         } else {
@@ -2960,6 +3726,12 @@ void IRGenerator::generateUntilStatement(Node* node) {
     // Generate condition - UNTIL loops while condition is FALSE
     // So we invert: if condition is FALSE (0), jump to start
     string conditionTemp = generateExpression(node->children[0]);
+      string condType = getExpressionResultType(node->children[0]);
+    if (condType != "bool") {
+        string boolCond = createTemp();
+        instructions.emplace_back(TACOp::CAST, boolCond, conditionTemp, "bool");
+        conditionTemp = boolCond;
+    }
     instructions.emplace_back(TACOp::IF_FALSE_GOTO, startLabel, conditionTemp);
     
     // End of loop
@@ -3906,8 +4678,13 @@ string IRGenerator::generateMultiDimArrayAddress(Node* arrayNode) {
     } else if (arrayBase->name == "IDENTIFIER") {
         // Base case: get address of the array variable
         string arrayName = arrayBase->lexeme;
-        baseAddr = createTemp();
-        instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+        // If the identifier is a reference-to-array parameter, it already holds the base address.
+        if (arrayBase->symbol && arrayBase->symbol->isReference) {
+            baseAddr = getUniqueNameFor(arrayBase, arrayName);
+        } else {
+            baseAddr = createTemp();
+            instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+        }
     } else {
         return "";
     }
@@ -4149,6 +4926,20 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                 }
                 cout << "DEBUG: Array element size (considering remaining dims) = " << elemSize << endl;
                 return elemSize;
+            }
+            // Pointer-to-array: scale by full pointee aggregate size
+            if (sym->pointerDepth >= 1 && !sym->pointeeArrayDimensions.empty()) {
+                long long agg = getBaseTypeSize(sym->type);
+                for (int d : sym->pointeeArrayDimensions) {
+                    if (d > 0) agg *= d;
+                }
+                // For multi-level pointers, pointer arithmetic on the outer pointer uses pointer size
+                if (sym->pointerDepth > 1) {
+                    cout << "DEBUG: Multi-level pointer to array, returning pointer size 8" << endl;
+                    return 8;
+                }
+                cout << "DEBUG: Pointer-to-array element size (full aggregate) = " << agg << endl;
+                return static_cast<int>(agg);
             }
             // Pointers: if depth > 1, still a pointer (8); if depth == 1, base type size
             if (sym->pointerDepth > 1) {
@@ -4445,7 +5236,8 @@ void IRGenerator::generatePrintfStatement(Node* node) {
     
     // ✅ Step 3: Emit CALL
     string resultTemp = createTemp();
-    instructions.emplace_back(TACOp::CALL, resultTemp, "printf");
+    int paramCount = evaluatedArgs.size();  // Total count: format string + varargs
+    instructions.emplace_back(TACOp::CALL, resultTemp, "printf", "", paramCount);
     
     cout << "DEBUG: Generated printf with " << evaluatedArgs.size() 
          << " parameters" << endl;
@@ -4504,7 +5296,8 @@ void IRGenerator::generateScanfStatement(Node* node) {
     
     // ✅ Step 3: Emit CALL
     string resultTemp = createTemp();
-    instructions.emplace_back(TACOp::CALL, resultTemp, "scanf");
+    int paramCount = evaluatedArgs.size();  // Total count: format string + varargs
+    instructions.emplace_back(TACOp::CALL, resultTemp, "scanf", "", paramCount);
     
     cout << "DEBUG: Generated scanf with " << evaluatedArgs.size() 
          << " parameters" << endl;
@@ -4788,25 +5581,57 @@ string IRGenerator::handleImplicitConversion(const string& valueTemp, Node* valu
     }
     
     string targetType = normalizeTypeName(targetVarNode->symbol->type);
-    string sourceType = getExpressionResultType(valueNode);  // ← Changed: use helper
+    string sourceType = getExpressionResultType(valueNode);
     
     cout << "DEBUG: Conversion check - source: " << sourceType 
          << " -> target: " << targetType << endl;
+    
+    // ✅ FIX: For float literals, don't convert double->float (they're compatible)
+    if ((sourceType == "double" && targetType == "float") ||
+        (sourceType == "float" && targetType == "double")) {
+        cout << "DEBUG: Float/double are compatible, no conversion needed" << endl;
+        return valueTemp;
+    }
     
     // No conversion needed
     if (targetType == sourceType) {
         return valueTemp;
     }
     
-    // Check if it's a compile-time constant
-    if (isConstantValue(valueTemp)) {
-        return generateConstantCast(valueTemp, targetType);
+    // ✅ FIX: Only do conversions for actual type mismatches
+    // Check if it's a meaningful conversion (not just representation difference)
+    bool needsConversion = false;
+    
+    // Integer <-> Float conversions
+    if ((sourceType == "int" || sourceType == "long" || sourceType == "short" || sourceType == "char") &&
+        (targetType == "float" || targetType == "double")) {
+        needsConversion = true;
+    }
+    else if ((sourceType == "float" || sourceType == "double") &&
+             (targetType == "int" || targetType == "long" || targetType == "short" || targetType == "char")) {
+        needsConversion = true;
+    }
+    // Bool conversions
+    else if (sourceType == "bool" && targetType != "bool") {
+        needsConversion = true;
+    }
+    else if (sourceType != "bool" && targetType == "bool") {
+        needsConversion = true;
+    }
+    // Integer width conversions (optional - can skip for IR)
+    else if ((sourceType == "char" || sourceType == "short") && 
+             (targetType == "int" || targetType == "long")) {
+        needsConversion = false;  // Promotion happens implicitly
     }
     
-    // Generate runtime cast
-    cout << "DEBUG: Runtime conversion: " << sourceType 
-         << " -> " << targetType << endl;
+    if (!needsConversion) {
+        cout << "DEBUG: No meaningful conversion needed" << endl;
+        return valueTemp;
+    }
     
+    cout << "DEBUG: Conversion needed: " << sourceType << " -> " << targetType << endl;
+    
+    // Generate runtime cast
     string resultTemp = createTemp();
     instructions.emplace_back(TACOp::CAST, resultTemp, valueTemp, targetType);
     return resultTemp;
@@ -4815,7 +5640,9 @@ string IRGenerator::handleImplicitConversion(const string& valueTemp, Node* valu
 // Determine the result type of an expression
 string IRGenerator::getExpressionResultType(Node* exprNode) {
     if (!exprNode) return "int";
-    
+       if (exprNode->name == "EXPR_LIST" && !exprNode->children.empty()) {
+        return getExpressionResultType(exprNode->children[0]);
+    }
     // Identifier - use its type
     if (exprNode->name == "IDENTIFIER" && exprNode->symbol) {
         return normalizeTypeName(exprNode->symbol->type);
@@ -4913,9 +5740,10 @@ string IRGenerator::applyIntegerPromotion(const string& valueTemp, Node* valueNo
         return valueTemp;
     }
     
-    // Only promote bool and char to int
+    // Integer promotion: bool, char, short → int (C standard 6.3.1.1)
     if (sourceType != "bool" && sourceType != "char" && 
-        sourceType != "unsigned char" && sourceType != "signed char") {
+        sourceType != "unsigned char" && sourceType != "signed char" &&
+        sourceType != "short" && sourceType != "unsigned short") {
         return valueTemp;
     }
     
