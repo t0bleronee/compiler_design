@@ -105,6 +105,8 @@ enum class TACOp {
     FUNC_END,    // func_end factorial
     
     CAST,
+    COMMENT,     // # comment text
+    NOP,         // no-op
 };
 
 // TAC Instruction
@@ -113,10 +115,10 @@ struct TACInstruction {
     std::string result;
     std::string operand1;
     std::string operand2;
-    
+    int paramCount;
     TACInstruction(TACOp op, const std::string& res = "", 
-                   const std::string& op1 = "", const std::string& op2 = "")
-        : opcode(op), result(res), operand1(op1), operand2(op2) {}
+                   const std::string& op1 = "", const std::string& op2 = "",int pCount = 0)
+        : opcode(op), result(res), operand1(op1), operand2(op2) , paramCount(pCount) {}
     
     void print(std::ostream& out = std::cout) const;
     std::string toString() const;
@@ -136,10 +138,14 @@ private:
     
     // Current function context
     std::string currentFunction;
+    std::string currentFunctionReturnType;  // Track return type of current function
     std::string currentBreakLabel;
 std::string currentContinueLabel;
      std::map<std::string, int> enumConstants; 
          std::set<std::string> staticVariables;
+    
+    // Varargs support: track current parameter index for each va_list variable
+    std::map<std::string, int> vaListIndices;
     // Unique naming for symbols to respect scope shadowing
     std::map<Symbol*, std::string> symbolUniqueNames;
     int symbolNameCounter = 0;
