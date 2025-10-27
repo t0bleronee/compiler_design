@@ -18,6 +18,17 @@ public:
     Node* node;
     bool isFunction;
     std::vector<std::string> paramTypes;
+    bool isVariadic = false; // Function accepts variable arguments (has ...)
+    // Reference support
+    bool isReference = false;               // This symbol denotes a reference (holds an address)
+    std::vector<bool> paramIsReference;     // For function symbols: per-parameter reference flags
+    
+    // Function-pointer support
+    bool isFunctionPointer = false;                     // This symbol is a pointer to function
+    std::string funcPtrReturnType;                      // Return type of the function this pointer points to
+    std::vector<std::string> funcPtrParamTypes;         // Parameter types of the function pointer
+    std::vector<bool> funcPtrParamIsReference;          // Reference flags per parameter for function pointer
+    bool funcPtrIsVariadic = false;                     // Variadic flag for function pointer
     
     // ADD THESE:
     bool isArray;           // Is this an array?
@@ -39,12 +50,14 @@ std::vector<std::string> structMemberOrder;        // declaration order of membe
 std::map<std::string, int> enumValues;             // enumerator name -> value
 
     
-   Symbol() : name(""), type(""), node(nullptr), isFunction(false), 
-           isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) ,isTypedef (false), aliasedType("") {}
+     Symbol() : name(""), type(""), node(nullptr), isFunction(false), 
+         isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) ,isTypedef (false), aliasedType(""), isReference(false),
+         isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false) {}
            
 Symbol(std::string n, std::string t, Node* nd, bool func=false)
     : name(n), type(t), node(nd), isFunction(func), 
-      isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) , isTypedef (false), aliasedType("") {}
+    isArray(false), pointerDepth(0), isStruct(false), isEnum(false),isUnion(false) , isTypedef (false), aliasedType(""), isReference(false),
+    isFunctionPointer(false), funcPtrReturnType(""), funcPtrIsVariadic(false) {}
 };
 
 struct Scopeh {
@@ -84,4 +97,3 @@ bool isEmptyScopes() const {
 };
 
 #endif
-
