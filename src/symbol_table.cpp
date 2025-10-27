@@ -11,12 +11,10 @@ enterScope();
 
 void SymbolTable::enterScope() {
     scopes.push_back(std::map<std::string, Symbol*>());
-    std::cout << "DEBUG enterScope: active scopes = " << scopes.size() << "\n";
 }
 
 void SymbolTable::exitScope() {
     if (!scopes.empty()) {
-     cout << "DEBUG exitScope: saving scope with symbols: ";
         for (const auto& pair : scopes.back()) {
             cout << pair.first << " " ;
         }
@@ -26,7 +24,6 @@ void SymbolTable::exitScope() {
         s.symbols = scopes.back();
         scopeHistory.push_back(s);
         scopes.pop_back();
-        std::cout << "DEBUG exitScope: remaining scopes = " 
                   << scopes.size() << ", history = " << scopeHistory.size() << "\n";
     }
 }
@@ -34,7 +31,7 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
                             bool isFunction, const vector<string>& params,
                             bool isArray, const vector<int>& arrayDims, 
                             int pointerDepth, bool isStruct, bool isEnum, 
-                            bool isUnion, bool isTypedef, string aliasedType) {
+                            bool isUnion, bool isTypedef, string aliasedType ,bool isStatic, bool isExtern, bool isVariadic) {
     auto& current = scopes.back();
     
     // Check if already exists
@@ -59,6 +56,9 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
     sym->isUnion = isUnion;
     sym->isTypedef = isTypedef;
     sym->aliasedType = aliasedType;
+        sym->isStatic = isStatic;      // ✅ NEW
+    sym->isExtern = isExtern;      // ✅ NEW
+    sym->isVariadic = isVariadic;      // ✅ NEW: Set variadic flag
         // Reference flags default (can be set by semantic analyzer after add)
         sym->isReference = false;
     
