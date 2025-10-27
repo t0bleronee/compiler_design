@@ -103,6 +103,8 @@ enum class TACOp {
     GET_PARAM,
     FUNC_BEGIN,  // func_begin factorial
     FUNC_END,    // func_end factorial
+    
+    CAST,
 };
 
 // TAC Instruction
@@ -273,6 +275,17 @@ bool expressionReturnsAddress(Node* node);
     // Helpers for general lvalue handling and ++/-- step calculation
     std::string generateLValueAddress(Node* lvalue);
     int getIncrementStepForLValue(Node* lvalue);
+    
+       bool isConstantValue(const std::string& val);
+    std::string getConstantValue(const std::string& tempName);
+    std::string normalizeTypeName(const std::string& typeName);
+    std::string convertConstantValue(const std::string& value, const std::string& fromType, const std::string& toType);
+    std::string handleImplicitConversion(const std::string& valueTemp, Node* valueNode, Node* targetVarNode);
+std:: string getExpressionResultType(Node* exprNode);
+std:: string extractTypeFromSpecQualList(Node* typeNode);
+    std::string generateConstantCast(const std::string& valTemp, const std::string& targetType);
+   
+   std::string applyIntegerPromotion(const std::string& valueTemp, Node* valueNode);
 };
 
 #endif // IR_GENERATOR_H
