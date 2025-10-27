@@ -14,6 +14,10 @@ for file in testcases/*; do
     echo "------------------------------"
     # Capture output to per-test file and also print to console
     ./compiler < "$file" | tee "outputs/${name}.txt"
+    # Save TAC per test if generated
+    if [ -f output.3ac ]; then
+        cp output.3ac "outputs/${name}.3ac"
+    fi
     echo
 done
 
