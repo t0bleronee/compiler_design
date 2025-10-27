@@ -166,6 +166,9 @@ string TACInstruction::toString() const {
         case TACOp::PTR_MEMBER_STORE:
             ss << operand1 << "->" << operand2 << " = " << result;
             break;    
+        case TACOp::CAST:
+            ss << result << " = (" << operand2 << ")" << operand1;
+            break;
         default:
             ss << "UNKNOWN_OP";
     }
@@ -669,6 +672,15 @@ string IRGenerator::generateExpression(Node* node) {
 }
     // Basic cast expression handling: evaluate inner expression and pass value through
     else if (node->name == "CAST_EXPR") {
+        // Find the target type from SPEC_QUAL_LIST
+        string targetType = "";
+        for (auto child : node->children) {
+            if (child && child->name == "SPEC_QUAL_LIST") {
+                targetType = extractTypeFromSpecQualList(child);
+                break;
+            }
+        }
+        
         // Find the operand expression inside the cast (skip SPEC_QUAL_LIST)
         Node* exprNode = nullptr;
         for (auto child : node->children) {
@@ -680,8 +692,28 @@ string IRGenerator::generateExpression(Node* node) {
         if (!exprNode && !node->children.empty()) {
             exprNode = node->children.back();
         }
+        
+        // Unwrap EXPR_LIST to get the actual expression
+        while (exprNode && exprNode->name == "EXPR_LIST" && !exprNode->children.empty()) {
+            exprNode = exprNode->children[0];
+        }
+        
         string valTemp = exprNode ? generateExpression(exprNode) : string("");
-        // Optionally, emit a CAST op here if IR supports it; for now, propagate value
+        
+        if (!valTemp.empty() && !targetType.empty()) {
+            // Get the source type
+            string sourceType = getExpressionResultType(exprNode);
+            
+            // Only emit cast if types differ
+            if (normalizeTypeName(sourceType) != normalizeTypeName(targetType)) {
+                string resultTemp = createTemp();
+                instructions.emplace_back(TACOp::CAST, resultTemp, valTemp, targetType);
+                cout << "DEBUG: Explicit cast: " << valTemp << " (" << sourceType 
+                     << ") -> " << resultTemp << " (" << targetType << ")" << endl;
+                return resultTemp;
+            }
+        }
+        
         return valTemp;
     }
     else if (node->name == "ADD_EXPR" || node->name == "SUB_EXPR" || 
@@ -1005,6 +1037,9 @@ string IRGenerator::generateBinaryExpr(Node* node, TACOp op) {
             return generatePointerArithmetic(rightNode, rightTemp, leftTemp, TACOp::ADD);
         }
     }
+     // ✅ ADD THIS: Apply integer promotion for bool and char operands
+    leftTemp = applyIntegerPromotion(leftTemp, leftNode);
+    rightTemp = applyIntegerPromotion(rightTemp, rightNode);
     
     // Regular arithmetic
     string resultTemp = createTemp();
@@ -1039,8 +1074,10 @@ string IRGenerator::generateAssignment(Node* node) {
             instructions.emplace_back(TACOp::STORE, lhsName, rhsTemp);
             return lhsName;
         }
+          string finalValue = handleImplicitConversion(rhsTemp, rhs, lhs);
+        
         // Always use the temp from generateExpression for consistency
-        instructions.emplace_back(TACOp::ASSIGN, lhsName, rhsTemp);
+        instructions.emplace_back(TACOp::ASSIGN, lhsName, finalValue);
         return lhsName;
     }
     
@@ -1608,12 +1645,14 @@ void IRGenerator::generateDeclaration(Node* node) {
                             // End label
                             instructions.emplace_back(TACOp::LABEL, endLabel);
                         } else {
-                            // Non-static or global/static at file scope: assign normally
-                            string initTemp = generateExpression(initNode);
-                            if (!initTemp.empty()) {
-                                instructions.emplace_back(TACOp::ASSIGN, varName, initTemp);
-                                cout << "Generated assignment: " << varName << " = " << initTemp << endl;
-                            }
+                           string initTemp = generateExpression(initNode);
+                              if (!initTemp.empty()) {
+                                  // Handle implicit type conversion
+                                  string finalValue = handleImplicitConversion(initTemp, initNode, idInDecl);
+                                  instructions.emplace_back(TACOp::ASSIGN, varName, finalValue);
+                                  cout << "Generated assignment: " << varName << " = " << finalValue << endl;
+                              }
+
                         }
                     } else if (!varName.empty()) {
                         // Handle uninitialized local statics: zero-initialize once
@@ -4618,5 +4657,345 @@ int IRGenerator::getIncrementStepForLValue(Node* lvalue) {
     return 1;
 }
 
+bool IRGenerator::isConstantValue(const string& val) {
+    if (val.empty()) return false;
+    
+    // Check if it's directly a CONST instruction result
+    for (auto it = instructions.rbegin(); it != instructions.rend(); ++it) {
+        if (it->opcode == TACOp::CONST && it->result == val) {
+            return true;
+        }
+    }
+    
+    // Check if it's a variable assigned from a constant (trace back one level)
+    for (auto it = instructions.rbegin(); it != instructions.rend(); ++it) {
+        if (it->opcode == TACOp::ASSIGN && it->result == val) {
+            // Found assignment: result = operand1
+            // Check if operand1 is a constant
+            string source = it->operand1;
+            
+            // Look for CONST instruction that produced this source
+            for (auto it2 = instructions.rbegin(); it2 != instructions.rend(); ++it2) {
+                if (it2->opcode == TACOp::CONST && it2->result == source) {
+                    return true;  // Variable holds a constant value
+                }
+            }
+            
+            break;  // Stop at first assignment to this variable
+        }
+    }
+    
+    return false;
+}
+
+string IRGenerator::getConstantValue(const string& tempName) {
+    // Direct CONST lookup
+    for (auto it = instructions.rbegin(); it != instructions.rend(); ++it) {
+        if (it->opcode == TACOp::CONST && it->result == tempName) {
+            return it->operand1;
+        }
+    }
+    
+    // Trace through assignment: tempName = source, where source is CONST
+    for (auto it = instructions.rbegin(); it != instructions.rend(); ++it) {
+        if (it->opcode == TACOp::ASSIGN && it->result == tempName) {
+            string source = it->operand1;
+            
+            // Look up the source's constant value
+            for (auto it2 = instructions.rbegin(); it2 != instructions.rend(); ++it2) {
+                if (it2->opcode == TACOp::CONST && it2->result == source) {
+                    return it2->operand1;  // Return the constant value
+                }
+            }
+            
+            break;
+        }
+    }
+    
+    return "";
+}
 
 
+// Normalize type name
+string IRGenerator::normalizeTypeName(const string& typeName) {
+    string normalized = typeName;
+    
+    size_t pos;
+    while ((pos = normalized.find("const ")) != string::npos) {
+        normalized.erase(pos, 6);
+    }
+    while ((pos = normalized.find("volatile ")) != string::npos) {
+        normalized.erase(pos, 9);
+    }
+    
+    while (!normalized.empty() && normalized.front() == ' ') {
+        normalized.erase(normalized.begin());
+    }
+    while (!normalized.empty() && normalized.back() == ' ') {
+        normalized.pop_back();
+    }
+    
+    return normalized;
+}
+
+// Convert constant value from one type to another
+string IRGenerator::convertConstantValue(const string& value, const string& fromType, const string& toType) {
+    if (toType == "int" || toType == "unsigned int") {
+        if (value == "false") return "0";
+        if (value == "true") return "1";
+        if (value.find('.') != string::npos) {
+            // Float to int - truncate
+            double d = stod(value);
+            return to_string((int)d);
+        }
+        // Already an integer
+        return value;
+    }
+    else if (toType == "bool") {
+        if (value == "0" || value == "0.0" || value == "false") {
+            return "false";
+        }
+        return "true";
+    }
+    else if (toType == "float" || toType == "double") {
+        if (value == "false") return "0.0";
+        if (value == "true") return "1.0";
+        if (value.find('.') == string::npos) {
+            // Add decimal point
+            return value + ".0";
+        }
+        // Already a float
+        return value;
+    }
+    else if (toType == "char" || toType == "unsigned char") {
+        if (value == "false") return "0";
+        if (value == "true") return "1";
+        if (value.find('.') != string::npos) {
+            double d = stod(value);
+            return to_string((int)d % 256);
+        } else {
+            int v = stoi(value);
+            return to_string(v % 256);
+        }
+    }
+    
+    return value;
+}
+// Handle implicit type conversions in assignments
+string IRGenerator::handleImplicitConversion(const string& valueTemp, Node* valueNode, Node* targetVarNode) {
+    if (!targetVarNode || !targetVarNode->symbol) {
+        return valueTemp;
+    }
+    
+    string targetType = normalizeTypeName(targetVarNode->symbol->type);
+    string sourceType = getExpressionResultType(valueNode);  // ← Changed: use helper
+    
+    cout << "DEBUG: Conversion check - source: " << sourceType 
+         << " -> target: " << targetType << endl;
+    
+    // No conversion needed
+    if (targetType == sourceType) {
+        return valueTemp;
+    }
+    
+    // Check if it's a compile-time constant
+    if (isConstantValue(valueTemp)) {
+        return generateConstantCast(valueTemp, targetType);
+    }
+    
+    // Generate runtime cast
+    cout << "DEBUG: Runtime conversion: " << sourceType 
+         << " -> " << targetType << endl;
+    
+    string resultTemp = createTemp();
+    instructions.emplace_back(TACOp::CAST, resultTemp, valueTemp, targetType);
+    return resultTemp;
+}
+    
+// Determine the result type of an expression
+string IRGenerator::getExpressionResultType(Node* exprNode) {
+    if (!exprNode) return "int";
+    
+    // Identifier - use its type
+    if (exprNode->name == "IDENTIFIER" && exprNode->symbol) {
+        return normalizeTypeName(exprNode->symbol->type);
+    }
+    
+    // Literals
+    if (exprNode->name == "BOOL_LITERAL") return "bool";
+    if (exprNode->name == "CHAR_LITERAL") return "char";
+    if (exprNode->name == "INTEGER_CONSTANT") return "int";
+    if (exprNode->name == "FLOAT_CONSTANT") return "double";
+    if (exprNode->name == "STRING_LITERAL") return "char*";
+    
+    // Binary operations - determine result type from operands
+    if (exprNode->name == "ADD_EXPR" || exprNode->name == "SUB_EXPR" ||
+        exprNode->name == "MUL_EXPR" || exprNode->name == "DIV_EXPR" ||
+        exprNode->name == "MOD_EXPR") {
+        
+        if (exprNode->children.size() >= 2) {
+            string leftType = getExpressionResultType(exprNode->children[0]);
+            string rightType = getExpressionResultType(exprNode->children[1]);
+            
+            // Apply usual arithmetic conversions
+            // If either is double, result is double
+            if (leftType == "double" || rightType == "double") return "double";
+            
+            // If either is float, result is float
+            if (leftType == "float" || rightType == "float") return "float";
+            
+            // If either is long, result is long
+            if (leftType == "long" || rightType == "long") return "long";
+            
+            // Otherwise int (after promotion)
+            return "int";
+        }
+    }
+    
+    // Comparison operations always return bool/int
+    if (exprNode->name == "EQ_EXPR" || exprNode->name == "NEQ_EXPR" ||
+        exprNode->name == "LT_EXPR" || exprNode->name == "GT_EXPR" ||
+        exprNode->name == "LE_EXPR" || exprNode->name == "GE_EXPR" ||
+        exprNode->name == "LOGICAL_AND" || exprNode->name == "LOGICAL_OR") {
+        return "int";
+    }
+    
+    // Unary operations
+    if (exprNode->name == "UNARY_OP" && exprNode->children.size() >= 2) {
+        Node* op = exprNode->children[0];
+        string opStr = op->name.empty() ? op->lexeme : op->name;
+        
+        if (opStr == "&") return "pointer";  // Address-of
+        if (opStr == "*") {
+            // Dereference - get pointed-to type
+            return getExpressionResultType(exprNode->children[1]);
+        }
+        if (opStr == "!") return "int";
+        if (opStr == "~") return "int";
+        if (opStr == "-" || opStr == "+") {
+            return getExpressionResultType(exprNode->children[1]);
+        }
+    }
+    
+    // Cast expression
+    if (exprNode->name == "CAST_EXPR") {
+        // Get target type from cast
+        for (auto child : exprNode->children) {
+            if (child && child->name == "SPEC_QUAL_LIST") {
+                return extractTypeFromSpecQualList(child);
+            }
+        }
+    }
+    
+    // Default to int
+    return "int";
+}
+
+
+// Apply integer promotion (bool/char -> int) for arithmetic operations
+string IRGenerator::applyIntegerPromotion(const string& valueTemp, Node* valueNode) {
+    if (!valueNode) return valueTemp;
+    
+    string sourceType = "";
+    
+    // Determine the type of the operand
+    if (valueNode->name == "IDENTIFIER" && valueNode->symbol) {
+        sourceType = normalizeTypeName(valueNode->symbol->type);
+    } else if (valueNode->name == "BOOL_LITERAL") {
+        sourceType = "bool";
+    } else if (valueNode->name == "CHAR_LITERAL") {
+        sourceType = "char";
+    } else if (valueNode->name == "INTEGER_CONSTANT") {
+        return valueTemp;  // Already int
+    } else if (valueNode->name == "FLOAT_CONSTANT") {
+        return valueTemp;  // Float doesn't need promotion to int
+    } else {
+        return valueTemp;
+    }
+    
+    // Only promote bool and char to int
+    if (sourceType != "bool" && sourceType != "char" && 
+        sourceType != "unsigned char" && sourceType != "signed char") {
+        return valueTemp;
+    }
+    
+    cout << "DEBUG: Integer promotion: " << sourceType << " -> int for " << valueTemp << endl;
+    
+    // Check if it's a compile-time constant
+    if (isConstantValue(valueTemp)) {
+        string constValue = getConstantValue(valueTemp);
+        string convertedValue = convertConstantValue(constValue, sourceType, "int");
+        
+        cout << "DEBUG: Constant promotion: " << constValue << " -> " << convertedValue << endl;
+        
+        string resultTemp = createTemp();
+        instructions.emplace_back(TACOp::CONST, resultTemp, convertedValue);
+        return resultTemp;
+    }
+    
+    // Runtime promotion
+    cout << "DEBUG: Runtime promotion: " << valueTemp << " (" << sourceType << ") -> int" << endl;
+    string resultTemp = createTemp();
+    instructions.emplace_back(TACOp::CAST, resultTemp, valueTemp, "int");
+    return resultTemp;
+}
+
+// Generate constant cast (compile-time conversion)
+string IRGenerator::generateConstantCast(const string& valTemp, const string& targetType) {
+    string constValue = getConstantValue(valTemp);
+    string resultTemp = createTemp();
+    
+    if (constValue.empty()) {
+        // Fallback to runtime cast
+        instructions.emplace_back(TACOp::CAST, resultTemp, valTemp, targetType);
+        return resultTemp;
+    }
+    
+    // Convert the constant based on target type
+    string convertedValue = convertConstantValue(constValue, "", targetType);
+    
+    // Emit the converted constant directly
+    instructions.emplace_back(TACOp::CONST, resultTemp, convertedValue);
+    return resultTemp;
+}
+
+// Extract type name from SPEC_QUAL_LIST
+string IRGenerator::extractTypeFromSpecQualList(Node* typeNode) {
+    if (!typeNode) return "int";
+    
+    string typeName = "";
+    bool isSigned = true;
+    
+    function<void(Node*)> extractType = [&](Node* n) {
+        if (!n) return;
+        
+        if (n->name == "TYPE_SPECIFIER") {
+            if (n->lexeme == "int" || n->lexeme == "char" || 
+                n->lexeme == "float" || n->lexeme == "double" ||
+                n->lexeme == "bool" || n->lexeme == "short" || 
+                n->lexeme == "long" || n->lexeme == "void") {
+                typeName = n->lexeme;
+            }
+        }
+        else if (n->name == "SIGNED") {
+            isSigned = true;
+        }
+        else if (n->name == "UNSIGNED") {
+            isSigned = false;
+        }
+        
+        for (auto child : n->children) {
+            extractType(child);
+        }
+    };
+    
+    extractType(typeNode);
+    
+    if (typeName.empty()) typeName = "int";
+    
+    if (!isSigned && (typeName == "int" || typeName == "char")) {
+        typeName = "unsigned " + typeName;
+    }
+    
+    return typeName;
+}
