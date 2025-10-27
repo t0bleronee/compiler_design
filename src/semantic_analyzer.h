@@ -44,7 +44,7 @@ private:
     void processBlock(Node* node, bool isFunctionBody = false, Node* funcDeclNode = nullptr);
     void traverseAST(Node* node);           // Recursively traverse AST
     std::string extractTypeFromDeclSpecifiers(Node* declSpecifiersNode);
-    std::vector<std::string> extractFunctionParameters(Node* funcDeclNode);
+    std::vector<std::string> extractFunctionParameters(Node* funcDeclNode, std::vector<bool>* outParamIsRef = nullptr);
      void addParametersToScope(Node* funcDeclNode);
      
       void checkIdentifier(Node* node);
@@ -113,6 +113,9 @@ bool isFunctionPrototype(Node* declNode);
 bool hasFunctionDeclarator(Node* node);
 void processFunctionPrototype(Node* declNode);
 Node* findFunctionDeclarator(Node* node);
+    // Helpers for detecting function pointer declarators
+    Node* findFunctionDeclaratorInNode(Node* node);
+    bool isFunctionPointerDeclarator(Node* initDeclNode);
 
 Node* findIdentifierInArray(Node* arrayNode);
 
@@ -132,4 +135,3 @@ bool isEnumDefinition(Node* enumSpecNode);
 
 
 #endif
-
