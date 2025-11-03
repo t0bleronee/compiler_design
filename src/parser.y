@@ -8,10 +8,12 @@
 #include "ast.h"
 #include "semantic_analyzer.h"
 #include "ir_generator.h"
+#include "assembly_generator.h"
 #include <iostream>
 #include "errors.h"
 #include <unordered_set>
 #include <functional>
+#include <fstream>
 using namespace std;
 
 // Global flag to control token printing from the lexer
@@ -1417,9 +1419,11 @@ int main(int argc, char** argv) {
     // CLI options
     string inputPath;
     string irOut = "output.3ac";
+    string asmOut = "output.s";
     bool showAST = true;
     bool genDOT = true;
     bool printIR = true;
+    bool genASM = true;
 
     // Parse simple CLI flags
     for (int i = 1; i < argc; ++i) {
@@ -1431,7 +1435,9 @@ int main(int argc, char** argv) {
             printf("  --no-ast            Disable AST printing\n");
             printf("  --no-dot            Do not generate ast.dot/png\n");
             printf("  --no-ir-print       Do not print TAC to stdout\n");
+            printf("  --no-asm            Do not generate assembly code\n");
             printf("  -o <file>           Write TAC to <file> (default: output.3ac)\n");
+            printf("  -S <file>           Write assembly to <file> (default: output.s)\n");
             printf("  -h, --help          Show this help\n");
             return 0;
         } else if (arg == "--no-tokens") {
@@ -1442,11 +1448,20 @@ int main(int argc, char** argv) {
             genDOT = false;
         } else if (arg == "--no-ir-print") {
             printIR = false;
+        } else if (arg == "--no-asm") {
+            genASM = false;
         } else if (arg == "-o") {
             if (i + 1 < argc) {
                 irOut = argv[++i];
             } else {
                 fprintf(stderr, "Missing filename after -o\n");
+                return 1;
+            }
+        } else if (arg == "-S") {
+            if (i + 1 < argc) {
+                asmOut = argv[++i];
+            } else {
+                fprintf(stderr, "Missing filename after -S\n");
                 return 1;
             }
         } else if (!arg.empty() && arg[0] == '-') {
@@ -1548,6 +1563,24 @@ int main(int argc, char** argv) {
                     
                     cout << "✅ TAC IR generation successful" << endl;
                     cout << "📄 TAC output written to: " << irOut << endl;
+                    
+                    // ✅ NEW: Assembly Generation
+                    if (genASM) {
+                        cout << "\n=== GENERATING x86 ASSEMBLY ===" << endl;
+                        
+                        ofstream asmFile(asmOut);
+                        if (!asmFile.is_open()) {
+                            cerr << "❌ Error: Could not open output file: " << asmOut << endl;
+                            result = 1;
+                        } else {
+                            AssemblyGenerator asmGenerator(irGenerator.getInstructions(), &symTab, asmFile);
+                            asmGenerator.generate();
+                            asmFile.close();
+                            
+                            cout << "✅ Assembly generation successful" << endl;
+                            cout << "📄 Assembly output written to: " << asmOut << endl;
+                        }
+                    }
                 } else {
                     cout << "❌ TAC IR generation failed" << endl;
                     result = 1;
