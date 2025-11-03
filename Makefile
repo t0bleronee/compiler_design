@@ -21,7 +21,7 @@ TARGET = compiler
 # Source files
 YACC_SRC = $(SRC_DIR)/parser.y
 LEX_SRC  = $(SRC_DIR)/lexer.l
-CPP_SRC  = $(SRC_DIR)/errors.cpp $(SRC_DIR)/symbol_table.cpp $(SRC_DIR)/ast.cpp $(SRC_DIR)/semantic_analyzer.cpp  $(SRC_DIR)/ir_generator.cpp  
+CPP_SRC  = $(SRC_DIR)/errors.cpp $(SRC_DIR)/symbol_table.cpp $(SRC_DIR)/ast.cpp $(SRC_DIR)/semantic_analyzer.cpp  $(SRC_DIR)/ir_generator.cpp  $(SRC_DIR)/assembly_generator.cpp  
 
 # Generated files
 YACC_C = $(BUILD_DIR)/parser.tab.c
