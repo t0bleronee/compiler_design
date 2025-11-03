@@ -24,6 +24,7 @@ void SymbolTable::exitScope() {
         s.symbols = scopes.back();
         scopeHistory.push_back(s);
         scopes.pop_back();
+        cout << "Exited scope. Current depth = " 
                   << scopes.size() << ", history = " << scopeHistory.size() << "\n";
     }
 }
