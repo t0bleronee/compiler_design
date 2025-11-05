@@ -83,6 +83,7 @@ std::string getArrayElementType(const std::string& arrayType);
 void validateArrayInitialization(Symbol* arraySym, Node* initList);
 int countInitializerElements(Node* node);
 void checkArrayInitializerSize(Node* initList, const std::vector<int>& dimensions, const std::string& arrayName, size_t dimIndex);
+void checkStructInitializerSize(Node* initList, const std::string& structType, const std::string& varName);
 std::string getResultType(const std::string& type1, const std::string& type2);
 bool areTypesCompatible(const std::string& type1, const std::string& type2, const std::string& operation);
 void checkAssignment(Node* node);
