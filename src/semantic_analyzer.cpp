@@ -361,7 +361,21 @@ else if (node->name == "BIT_OR" || node->name == "BIT_AND" ||
     checkBitwiseOperation(node);
 }
 else if (node->name == "ASSIGN_EXPR") {
-    checkAssignment(node);
+    // Skip assignment checks if this is part of a declaration (initializer)
+    // The type check will be done after the symbol is added to the table
+    bool isPartOfDeclaration = false;
+    Node* parent = node->parent;
+    while (parent) {
+        if (parent->name == "INIT_DECL_LIST" || parent->name == "DECLARATION") {
+            isPartOfDeclaration = true;
+            break;
+        }
+        parent = parent->parent;
+    }
+    
+    if (!isPartOfDeclaration) {
+        checkAssignment(node);
+    }
 }
     else if (node->name == "POST_INC" || node->name == "POST_DEC") {
         checkPostfixOperation(node);
@@ -625,7 +639,34 @@ currentFunctionReturnType = "";
 string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode) {
     if (!declSpecifiersNode) return "";
 
-    // First pass: handle typedef/type names and struct/union/enum early
+    // First pass: check for conflicting type specifiers
+    bool hasTypeName = false;
+    bool hasTypeSpecifier = false;
+    string typeNameValue;
+    
+    for (auto child : declSpecifiersNode->children) {
+        if (child->name == "TYPE_NAME") {
+            hasTypeName = true;
+            typeNameValue = child->lexeme;
+        }
+        else if (child->name == "TYPE_SPECIFIER") {
+            hasTypeSpecifier = true;
+        }
+        else if (child->name == "DECL_SPECIFIERS") {
+            // Recursively check nested DECL_SPECIFIERS
+            for (auto nested : child->children) {
+                if (nested->name == "TYPE_SPECIFIER") hasTypeSpecifier = true;
+            }
+        }
+    }
+    
+    // ERROR: Cannot have both TYPE_NAME and TYPE_SPECIFIER
+    if (hasTypeName && hasTypeSpecifier) {
+        addError("Cannot combine typedef name '" + typeNameValue + "' with other type specifiers");
+        return typeNameValue;  // Return the typedef for error recovery
+    }
+
+    // Original first pass: handle typedef/type names and struct/union/enum early
     for (auto child : declSpecifiersNode->children) {
         if (child->name == "STORAGE_CLASS_SPECIFIER") {
             continue; // ignore storage in type composition
@@ -668,6 +709,7 @@ string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode)
     int longCount = 0;
     bool isShort = false, isUnsigned = false, isSigned = false;
     string base;
+    int baseTypeCount = 0;  // Track how many base types we've seen
 
     function<void(Node*)> collectSpecs = [&](Node* n){
         if (!n) return;
@@ -678,7 +720,20 @@ string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode)
                 else if (t == "short") isShort = true;
                 else if (t == "unsigned") isUnsigned = true;
                 else if (t == "signed") isSigned = true;
-                else if (t == "int" || t == "char" || t == "float" || t == "double" || t == "void") base = t;
+                else if (t == "int" || t == "char" || t == "float" || t == "double" || t == "void") {
+                    if (!base.empty() && base != t) {
+                        // Different base types specified (e.g., "int char")
+                        addError("Multiple conflicting type specifiers: '" + base + "' and '" + t + "'");
+                    } else if (base == t) {
+                        // Same base type specified multiple times (e.g., "int int")
+                        baseTypeCount++;
+                        if (baseTypeCount > 1) {
+                            addError("Duplicate type specifier: '" + t + "'");
+                        }
+                    }
+                    base = t;
+                    if (base == t && baseTypeCount == 0) baseTypeCount = 1;
+                }
                 else base = t; // typedef or others resolved here
             } else if (c->name == "DECL_SPECIFIERS") {
                 collectSpecs(c);
@@ -1013,8 +1068,15 @@ cout<<"VARRRTYPE"<<varType<<endl;
                             // Look for INIT_LIST in declChild (ASSIGN_EXPR)
                             if (declChild->name == "ASSIGN_EXPR" && declChild->children.size() >= 3) {
                                 Node* rhs = declChild->children[2];
-                                if (rhs && rhs->name == "INIT_LIST" && !arrayDimensions.empty()) {
-                                    checkArrayInitializerSize(rhs, arrayDimensions, varName, 0);
+                                if (rhs && rhs->name == "INIT_LIST") {
+                                    // Check array initializers
+                                    if (!arrayDimensions.empty()) {
+                                        checkArrayInitializerSize(rhs, arrayDimensions, varName, 0);
+                                    }
+                                    // Check struct initializers
+                                    else if (varType.find("struct") == 0 || varType.find("union") == 0) {
+                                        checkStructInitializerSize(rhs, varType, varName);
+                                    }
                                 }
                             }
                     }
@@ -1134,7 +1196,13 @@ cout<<"VARRRTYPE"<<varType<<endl;
 if (!symbolTable.addSymbol(varName, varType, nodee, false, {}, isArray, 
                           arrayDimensions, pointerDepth, false, false, false,
                           false, "", hasStatic, false)) {  // ✅ Pass static flag
-    addError("Redeclaration of variable: " + varName);
+    // Check if it's a conflict with a typedef
+    Symbol* existing = symbolTable.lookupCurrentScope(varName);
+    if (existing && existing->isTypedef) {
+        addError("Cannot redeclare typedef '" + varName + "' as a variable");
+    } else {
+        addError("Redeclaration of variable: " + varName);
+    }
 } else {
     Symbol* sym = symbolTable.lookupCurrentScope(varName);
     if (sym && nodee) {
@@ -1148,6 +1216,26 @@ if (!symbolTable.addSymbol(varName, varType, nodee, false, {}, isArray,
       // If this was a pointer-to-array declarator, store pointee array dimensions for IR sizing
     if (sym && !isArray && !arrayDimensions.empty() && pointerDepth > 0) {
         sym->pointeeArrayDimensions = arrayDimensions;
+        cout << "DEBUG: Stored pointeeArrayDimensions for '" << varName << "': ";
+        for (int dim : arrayDimensions) {
+            cout << "[" << dim << "]";
+        }
+        cout << "\n";
+    }
+    
+    // Check initializer list for structs/unions/arrays
+    if (sym && declChild && declChild->name == "ASSIGN_EXPR" && declChild->children.size() >= 3) {
+        Node* rhs = declChild->children[2];
+        if (rhs && rhs->name == "INIT_LIST") {
+            // Check array initializers
+            if (isArray && !arrayDimensions.empty()) {
+                checkArrayInitializerSize(rhs, arrayDimensions, varName, 0);
+            }
+            // Check struct/union initializers
+            else if (varType.find("struct") == 0 || varType.find("union") == 0) {
+                checkStructInitializerSize(rhs, varType, varName);
+            }
+        }
     }
 }
                     }
@@ -1233,10 +1321,32 @@ vector<string> SemanticAnalyzer::extractFunctionParameters(Node* funcDeclNode, s
                             string paramName;
                             bool isRefParam = false;
                             string typedefNameUsed;
+                            bool isFunctionPointerParam = false;
+                            string funcPtrFullType;
                             
                             for (auto paramChild : paramDecl->children) {
                                 if (paramChild->name == "DECL_SPECIFIERS" || 
                                     paramChild->name == "declaration_specifiers") {
+                                    // Check for invalid storage class specifiers in parameters
+                                    for (auto specChild : paramChild->children) {
+                                        if (specChild->name == "STORAGE_CLASS_SPECIFIER") {
+                                            string storageClass = specChild->lexeme;
+                                            if (storageClass == "static" || storageClass == "extern" || 
+                                                storageClass == "auto" || storageClass == "typedef") {
+                                                addError("Storage class specifier '" + storageClass + 
+                                                        "' is not allowed in function parameters");
+                                            }
+                                        }
+                                        else if (specChild->name == "STATIC") {
+                                            addError("Storage class specifier 'static' is not allowed in function parameters");
+                                        }
+                                        else if (specChild->name == "EXTERN") {
+                                            addError("Storage class specifier 'extern' is not allowed in function parameters");
+                                        }
+                                        else if (specChild->name == "TYPEDEF") {
+                                            addError("Storage class specifier 'typedef' is not allowed in function parameters");
+                                        }
+                                    }
                                     baseType = extractTypeFromDeclSpecifiers(paramChild);
                                     // Capture typedef name if present
                                     for (auto sc : paramChild->children) {
@@ -1246,7 +1356,53 @@ vector<string> SemanticAnalyzer::extractFunctionParameters(Node* funcDeclNode, s
                                     }
                                 }
                                 else if (paramChild->name == "DECLARATOR") {
-                                    analyzeDeclarator(paramChild, paramName, pointerDepth, isArray, arrayDims, true);
+                                    // Check if this is a function pointer
+                                    Node* funcDecl = findFunctionDeclarator(paramChild);
+                                    if (funcDecl && isFunctionPointerDeclarator(paramChild)) {
+                                        // This is a function pointer parameter
+                                        isFunctionPointerParam = true;
+                                        // Extract inner parameters
+                                        vector<bool> innerRefFlags;
+                                        vector<string> innerParamTypes = extractFunctionParameters(funcDecl, &innerRefFlags);
+                                        
+                                        // Build function pointer type: returnType (*)(...params...)
+                                        funcPtrFullType = baseType + " (*)(";
+                                        for (size_t i = 0; i < innerParamTypes.size(); i++) {
+                                            if (i > 0) funcPtrFullType += ", ";
+                                            funcPtrFullType += innerParamTypes[i];
+                                        }
+                                        funcPtrFullType += ")";
+                                    } else {
+                                        // Regular declarator
+                                        analyzeDeclarator(paramChild, paramName, pointerDepth, isArray, arrayDims, true);
+                                    }
+                                }
+                                else if (paramChild->name == "FUNCTION_DECL") {
+                                    // Function pointer parameter (FUNCTION_DECL is direct child)
+                                    isFunctionPointerParam = true;
+                                    
+                                    // Extract parameter name from DECLARATOR inside FUNCTION_DECL
+                                    if (!paramChild->children.empty()) {
+                                        Node* firstChild = paramChild->children[0];
+                                        if (firstChild && firstChild->name == "DECLARATOR") {
+                                            Node* idNode = findIdentifierInDeclarator(firstChild);
+                                            if (idNode) {
+                                                paramName = idNode->lexeme;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract inner parameters
+                                    vector<bool> innerRefFlags;
+                                    vector<string> innerParamTypes = extractFunctionParameters(paramChild, &innerRefFlags);
+                                    
+                                    // Build function pointer type: returnType (*)(...params...)
+                                    funcPtrFullType = baseType + " (*)(";
+                                    for (size_t i = 0; i < innerParamTypes.size(); i++) {
+                                        if (i > 0) funcPtrFullType += ", ";
+                                        funcPtrFullType += innerParamTypes[i];
+                                    }
+                                    funcPtrFullType += ")";
                                 }
                                 else if (paramChild->name == "ARRAY") {
                                     // ✅ Handle array parameters (allow incomplete dimensions like char argv[])
@@ -1290,7 +1446,15 @@ vector<string> SemanticAnalyzer::extractFunctionParameters(Node* funcDeclNode, s
                                     }
                                 }
                             }
-                            if (!baseType.empty()) {
+                            
+                            // Handle function pointer parameters
+                            if (isFunctionPointerParam && !funcPtrFullType.empty()) {
+                                paramTypes.push_back(funcPtrFullType);
+                                cout << "DEBUG: Function param type: " << funcPtrFullType << "\n";
+                                if (outParamIsRef) outParamIsRef->push_back(false);
+                            }
+                            // Handle regular parameters
+                            else if (!baseType.empty()) {
                                 paramTypes.push_back(fullType);
                                 cout << "DEBUG: Function param type: " << fullType << "\n";
                                 if (outParamIsRef) outParamIsRef->push_back(isRefParam);
@@ -1321,7 +1485,11 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                             string paramName;
                             bool isRefParam = false;
                             string typedefNameUsed;
+                            bool isFunctionPointer = false;
+                            string funcPtrReturnType;
+                            vector<string> funcPtrParamTypes;
                             nodee=NULL;
+                            
                             for (auto paramChild : paramDecl->children) {
                                 if (paramChild->name == "DECL_SPECIFIERS" || 
                                     paramChild->name == "declaration_specifiers") {
@@ -1331,9 +1499,58 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                                     }
                                 }
                                 else if (paramChild->name == "DECLARATOR") {
-                                    analyzeDeclarator(paramChild, paramName, pointerDepth, isArray, arrayDims, true);
-                                     nodee = findIdentifierInDeclarator(paramChild);  // ✅ FIX!
-                          
+                                    // Check if this is a function pointer parameter
+                                    Node* funcDecl = findFunctionDeclarator(paramChild);
+                                    if (funcDecl && isFunctionPointerDeclarator(paramChild)) {
+                                        // This is a function pointer parameter
+                                        isFunctionPointer = true;
+                                        funcPtrReturnType = baseType;
+                                        
+                                        // Extract parameter name from function pointer declarator
+                                        if (!funcDecl->children.empty()) {
+                                            // First child of FUNCTION_DECL may be a DECLARATOR with POINTER
+                                            Node* inner = funcDecl->children[0];
+                                            if (inner && inner->name == "DECLARATOR") {
+                                                Node* idNode = findIdentifierInDeclarator(inner);
+                                                if (idNode) {
+                                                    paramName = idNode->lexeme;
+                                                    nodee = idNode;
+                                                }
+                                            } else if (inner && inner->name == "IDENTIFIER") {
+                                                paramName = inner->lexeme;
+                                                nodee = inner;
+                                            }
+                                        }
+                                        
+                                        // Extract function pointer parameter types
+                                        vector<bool> dummyRefFlags;
+                                        funcPtrParamTypes = extractFunctionParameters(funcDecl, &dummyRefFlags);
+                                    } else {
+                                        // Regular declarator
+                                        analyzeDeclarator(paramChild, paramName, pointerDepth, isArray, arrayDims, true);
+                                        nodee = findIdentifierInDeclarator(paramChild);
+                                    }
+                                }
+                                else if (paramChild->name == "FUNCTION_DECL") {
+                                    // Function pointer parameter (FUNCTION_DECL is direct child)
+                                    isFunctionPointer = true;
+                                    funcPtrReturnType = baseType;
+                                    
+                                    // Extract parameter name from DECLARATOR inside FUNCTION_DECL
+                                    if (!paramChild->children.empty()) {
+                                        Node* firstChild = paramChild->children[0];
+                                        if (firstChild && firstChild->name == "DECLARATOR") {
+                                            Node* idNode = findIdentifierInDeclarator(firstChild);
+                                            if (idNode) {
+                                                paramName = idNode->lexeme;
+                                                nodee = idNode;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Extract function pointer parameter types
+                                    vector<bool> dummyRefFlags;
+                                    funcPtrParamTypes = extractFunctionParameters(paramChild, &dummyRefFlags);
                                 }
                                 else if (paramChild->name == "ARRAY") {
                                      isArray=true;
@@ -1376,11 +1593,29 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                             }
                             
                             if (!paramName.empty() && !baseType.empty()) {
-                                // ✅ Store with proper array/pointer info
-                                if (!symbolTable.addSymbol(paramName, baseType, nodee, false, {}, 
-                                                          isArray, arrayDims, pointerDepth)) {
-                                    addError("Duplicate parameter name: " + paramName);
-                                } else {
+                                // Handle function pointer parameters
+                                if (isFunctionPointer) {
+                                    if (!symbolTable.addSymbol(paramName, funcPtrReturnType, nodee, false)) {
+                                        addError("Duplicate parameter name: " + paramName);
+                                    } else {
+                                        Symbol* sym = symbolTable.lookupCurrentScope(paramName);
+                                        if (sym) {
+                                            sym->isFunctionPointer = true;
+                                            sym->funcPtrReturnType = funcPtrReturnType;
+                                            sym->funcPtrParamTypes = funcPtrParamTypes;
+                                            if (nodee) nodee->symbol = sym;
+                                            cout << "DEBUG: Added function pointer parameter " << paramName 
+                                                 << " [" << funcPtrReturnType << " (*)(...)]" << endl;
+                                        }
+                                    }
+                                }
+                                // Handle regular parameters
+                                else {
+                                    // ✅ Store with proper array/pointer info
+                                    if (!symbolTable.addSymbol(paramName, baseType, nodee, false, {}, 
+                                                              isArray, arrayDims, pointerDepth)) {
+                                        addError("Duplicate parameter name: " + paramName);
+                                    } else {
                              
     Symbol* sym = symbolTable.lookupCurrentScope(paramName);
     if (sym && nodee) {
@@ -1403,6 +1638,7 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                                     if (isRefParam) cout << " &";
                                     cout << "\n";
                                 }
+                                    }  // end of else for regular parameters
                             }
                         }
                     }
@@ -1679,7 +1915,17 @@ bool SemanticAnalyzer::areFunctionArgCompatible(const string& argType, const str
         return true;
     }
 
-    // Non-numeric cases: reuse the general compatibility (assignment-like)
+    // Pointer type argument checking
+    if (isPointerType(paramType)) {
+        // Pointer parameter requires pointer argument (no int→pointer conversion in calls)
+        if (!isPointerType(argType)) {
+            return false;  // Reject: cannot pass int to int* parameter
+        }
+        // Both are pointers - check compatibility
+        return areTypesCompatible(paramType, argType, "=");
+    }
+
+    // Non-numeric, non-pointer cases: reuse the general compatibility (assignment-like)
     return areTypesCompatible(paramType, argType, "=");
 }
 
@@ -2383,6 +2629,30 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
         
         string type = resolveTypedef(sym->type);
         
+        // If this is a function identifier (not a function call), decay to function pointer
+        if (sym->isFunction) {
+            // Build function pointer type: returnType (*)(param1, param2, ...)
+            string funcPtrType = type + " (*)(";
+            for (size_t i = 0; i < sym->paramTypes.size(); i++) {
+                if (i > 0) funcPtrType += ", ";
+                funcPtrType += sym->paramTypes[i];
+            }
+            funcPtrType += ")";
+            cout << "DEBUG getExpressionType: Function '" << node->lexeme << "' decays to function pointer type '" << funcPtrType << "'\n";
+            return funcPtrType;
+        }
+        
+        // If this is a function pointer symbol, return its type
+        if (sym->isFunctionPointer) {
+            string funcPtrType = sym->funcPtrReturnType + " (*)(";
+            for (size_t i = 0; i < sym->funcPtrParamTypes.size(); i++) {
+                if (i > 0) funcPtrType += ", ";
+                funcPtrType += sym->funcPtrParamTypes[i];
+            }
+            funcPtrType += ")";
+            return funcPtrType;
+        }
+        
         // For arrays, we need to return the full array type, not the decayed pointer type
         // This allows proper type checking in assignments
         if (sym->isArray) {
@@ -2414,6 +2684,7 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
             for (int dim : sym->pointeeArrayDimensions) {
                 fullType += "[" + (dim > 0 ? to_string(dim) : "") + "]";
             }
+            cout << "DEBUG getExpressionType: Returning pointer-to-array type '" << fullType << "' for '" << node->lexeme << "'\n";
             return fullType;
         }
         
@@ -2629,6 +2900,21 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
         
         // Handle address-of operator: add one pointer level
         if (!operandType.empty()) {
+            // ✅ SPECIAL CASE: Address of array
+            // &arr where arr is int[5] → int(*)[5]
+            // &arr where arr is int[3][4] → int(*)[3][4]
+            if (isArrayType(operandType)) {
+                // Extract base type and array dimensions
+                size_t firstBracket = operandType.find('[');
+                if (firstBracket != string::npos) {
+                    string baseType = operandType.substr(0, firstBracket);
+                    string arrayDims = operandType.substr(firstBracket);
+                    // Build pointer-to-array type: base(*)arrayDims
+                    return baseType + "(*)" + arrayDims;
+                }
+            }
+            
+            // Regular cases: scalar or pointer
             // If operand is already a pointer, increment pointer level
             if (isPointerType(operandType)) {
                 return operandType + "*";
@@ -3329,6 +3615,38 @@ void SemanticAnalyzer::checkArrayInitializerSize(Node* initList, const vector<in
     }
 }
 
+void SemanticAnalyzer::checkStructInitializerSize(Node* initList, const string& structType, const string& varName) {
+    if (!initList) return;
+    
+    // Extract struct name from type (e.g., "struct Point" -> "Point")
+    string structName = structType;
+    if (structName.find("struct ") == 0) {
+        structName = structName.substr(7);  // Remove "struct "
+    } else if (structName.find("union ") == 0) {
+        structName = structName.substr(6);  // Remove "union "
+    }
+    
+    // Look up the struct definition
+    Symbol* structSym = symbolTable.lookup(structName);
+    if (!structSym || (!structSym->isStruct && !structSym->isUnion)) {
+        // Can't validate if struct not found (error already reported elsewhere)
+        return;
+    }
+    
+    // Count number of members in the struct
+    int memberCount = structSym->structMembers.size();
+    
+    // Count initializers provided
+    int initializerCount = initList->children.size();
+    
+    // Check for too many initializers
+    if (initializerCount > memberCount) {
+        addError("Too many initializers for " + structType + " '" + varName + "': "
+                 "expected " + to_string(memberCount) + " member(s), but " 
+                 + to_string(initializerCount) + " initializer(s) provided");
+    }
+}
+
 string SemanticAnalyzer::getResultType(const string& type1, const string& type2) {
     // If either is double, result is double
     if (type1 == "double" || type2 == "double") return "double";
@@ -3484,6 +3802,9 @@ if ((isPointerType(type1) && isIntegerType(type2)) ||
     int depth1 = countPointerLevel(type1);
     int depth2 = countPointerLevel(type2);
     
+    cout << "DEBUG areTypesCompatible: Comparing pointers '" << type1 << "' vs '" << type2 << "'\n";
+    cout << "  Depths: " << depth1 << " vs " << depth2 << "\n";
+    
     if (depth1 != depth2) {
         return false;  // int* vs int** are incompatible
     }
@@ -3491,7 +3812,13 @@ if ((isPointerType(type1) && isIntegerType(type2)) ||
     // ✅ Optional: Check base types are compatible
     string base1 = getBaseTypeFromPointer(type1);
     string base2 = getBaseTypeFromPointer(type2);
-        if (base1 == base2) {return true;}
+    
+    cout << "  Bases: '" << base1 << "' vs '" << base2 << "'\n";
+    
+        if (base1 == base2) {
+            cout << "  Exact match!\n";
+            return true;
+        }
     
     // Allow some base type conversions
     if ((base1 == "char" && base2 == "int") ||
@@ -3501,6 +3828,7 @@ if ((isPointerType(type1) && isIntegerType(type2)) ||
         return true;
     }
     
+    cout << "  No match - returning false\n";
     return false;
 
 }
@@ -3740,6 +4068,9 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     Node* lhs = node->children[0];
     Node* rhs = node->children[2];  // children[1] is the operator
     
+    cout << "DEBUG checkAssignment: LHS node=" << (lhs ? lhs->name : "null") 
+         << " RHS node=" << (rhs ? rhs->name : "null") << "\n";
+    
     // Skip if RHS is EMPTY (uninitialized declaration)
     if (rhs && rhs->name == "EMPTY") {
         return;
@@ -3793,6 +4124,7 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
     
     string lhsType = getExpressionType(lhs);
     string rhsType = getExpressionType(rhs);
+    
     // Check for array-to-array assignment (should be error)
     if (lhs->name == "IDENTIFIER" && rhs->name == "IDENTIFIER") {
         Symbol* lhsSym = symbolTable.lookup(lhs->lexeme);
@@ -3812,7 +4144,9 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
 
     // Handle array-to-pointer assignment (array decay)
     // In C, arrays decay to pointers when assigned to pointer variables
-    if (isArrayType(rhsType) && isPointerType(lhsType)) {
+    // BUT: Skip if RHS is a pointer-to-array like int(*)[5] (not actual array decay)
+    bool rhsIsPointerToArray = (rhsType.find("(*)") != string::npos);
+    if (isArrayType(rhsType) && isPointerType(lhsType) && !rhsIsPointerToArray) {
         // Check if the array can decay to the pointer type
         string arrayElementType = getArrayElementType(rhsType);
         string pointerElementType = getBaseTypeFromPointer(lhsType);
@@ -4154,10 +4488,10 @@ void SemanticAnalyzer::checkAssignment(Node* node) {
         }
         return;
     }
-   
     
     // General type mismatch
     if (lhsType != rhsType) {
+        cout << "DEBUG: Final type check: LHS='" << lhsType << "' != RHS='" << rhsType << "'\n";
         addError("Type mismatch in assignment: cannot assign '" + rhsType + "' to '" + lhsType + "'");
     }
 }
@@ -5376,7 +5710,20 @@ bool SemanticAnalyzer::hasFunctionDeclarator(Node* node) {
 void SemanticAnalyzer::processFunctionPrototype(Node* declNode) {
     if (!declNode) return;
     
-    cout << "DEBUG: Processing function prototype\n";
+    int currentScope = symbolTable.getCurrentScopeLevel();
+    cout << "DEBUG: Processing function prototype at scope level " << currentScope << "\n";
+    
+    // Check if we're inside a function (nested function declaration is not allowed in C/C++)
+    // Due to double scope entry (SymbolTable constructor + buildSymbolTable), 
+    // global scope is actually level 2, so function scopes are level 3+
+    if (currentScope > 2) {
+        // This is trying to declare a function inside another function
+        // It's likely a malformed function pointer declaration missing the *
+        addError("Function declarations are not allowed inside functions. "
+                 "Did you mean to declare a function pointer? Use: returnType (*name)(params)");
+        return;
+    }
+    
     Node* nodee=NULL;
     string funcName;
     string returnType;
