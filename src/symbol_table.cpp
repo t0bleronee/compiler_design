@@ -24,8 +24,8 @@ void SymbolTable::exitScope() {
         s.symbols = scopes.back();
         scopeHistory.push_back(s);
         scopes.pop_back();
-        cout << "Exited scope. Current depth = " 
-                  << scopes.size() << ", history = " << scopeHistory.size() << "\n";
+        // Debug: print scope levels
+        // cout << "Exited scope, now at level " << scopes.size() << ", history = " << scopeHistory.size() << "\n";
     }
 }
 bool SymbolTable::addSymbol(const string& name, const string& type, Node* node, 
