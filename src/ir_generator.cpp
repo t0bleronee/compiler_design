@@ -665,6 +665,14 @@ string IRGenerator::generateExpression(Node* node) {
         instructions.emplace_back(TACOp::ADDRESS, temp, node->lexeme);
         return temp;
     }
+    // Array-to-pointer decay: when an array name is used in an expression context,
+    // it decays to a pointer to its first element
+    if (node->symbol && node->symbol->isArray) {
+        string arrayName = getUniqueNameFor(node, node->lexeme);
+        string temp = createTemp();
+        instructions.emplace_back(TACOp::ADDRESS, temp, arrayName);
+        return temp;
+    }
     // References hold addresses; reading a reference as rvalue
     // - scalar refs: LOAD through address
     // - array refs: return the address directly (decays to pointer)
@@ -2167,8 +2175,25 @@ void IRGenerator::generateFunction(Node* node) {
     instructions.emplace_back(TACOp::LABEL, label);
     
     cout << "Generating function: " << funcName << endl;
-       // NEW: Add function begin marker
-    instructions.emplace_back(TACOp::FUNC_BEGIN, funcName);  // Add FUNC_BEGIN to enum
+    
+    // Count parameters first
+    int paramCount = 0;
+    if (paramList) {
+        for (auto child : paramList->children) {
+            if (child->name == "PARAM_LIST") {
+                for (auto param : child->children) {
+                    if (param->name == "PARAM_DECL") {
+                        paramCount++;
+                    }
+                }
+            } else if (child->name == "PARAM_DECL") {
+                paramCount++;
+            }
+        }
+    }
+    
+    // Add function begin marker with parameter count
+    instructions.emplace_back(TACOp::FUNC_BEGIN, funcName, "", "", paramCount);
     
     if (paramList) {
         generateParameterHandling(paramList);
