@@ -159,8 +159,8 @@ public:
     void printIR(std::ostream& out = std::cout) const;
     void writeToFile(const std::string& filename) const;
     
-    // Getter for instructions (for assembly generation)
-    std::vector<TACInstruction>& getInstructions() { return instructions; }
+    // Accessor for generated instructions (for code generation phase)
+    const std::vector<TACInstruction>& getInstructions() const { return instructions; }
     
 private:
     // String literal pooling: map label -> literal contents (raw)
