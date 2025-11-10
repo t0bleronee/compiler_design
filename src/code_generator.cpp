@@ -1,758 +1,940 @@
 #include "code_generator.h"
 #include <fstream>
 #include <sstream>
-#include <algorithm>
 #include <iostream>
+#include <algorithm>
+#include <cctype>
 
-CodeGenerator::CodeGenerator(const vector<TACInstruction>& tacInstructions, SymbolTable* symbolTable)
-    : instructions(tacInstructions), symTab(symbolTable), currentStackOffset(0), stringLabelCounter(0) {
-    initializeRegisters();
+using namespace std;
+
+CodeGenerator::CodeGenerator(const vector<TACInstruction>& instructions, SymbolTable* symTab)
+    : tacInstructions(instructions), symbolTable(symTab), 
+      frameSize(0), currentOffset(0), stringCounter(0), 
+      functionParamCount(0), currentFunctionFrameSize(0), inFunction(false), labelCounter(0) {
+    registers.init();
 }
 
-void CodeGenerator::initializeRegisters() {
-    // Temporary registers ($t0-$t9)
-    for (int i = 0; i <= 9; i++) {
-        tempRegisters.push_back("$t" + to_string(i));
-    }
+//============================================================================
+// Register Allocation
+//============================================================================
+
+void CodeGenerator::RegisterPool::init() {
+    // MIPS register convention:
+    // $t0-$t9: temporary registers (caller-saved)
+    // $s0-$s7: saved registers (callee-saved)
+    // $a0-$a3: argument registers
+    // $v0-$v1: return value registers
+    // $ra: return address
+    // $sp: stack pointer
+    // $fp: frame pointer
     
-    // Saved registers ($s0-$s7)
-    for (int i = 0; i <= 7; i++) {
-        savedRegisters.push_back("$s" + to_string(i));
-    }
+    tempRegs = {"$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7", "$t8", "$t9"};
+    savedRegs = {"$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7"};
+    varToReg.clear();
+    regToVar.clear();
 }
 
-bool CodeGenerator::isTemporary(const string& var) {
-    return var.length() > 0 && var[0] == 't' && isdigit(var[1]);
-}
-
-bool CodeGenerator::isConstant(const string& var) {
-    if (var.empty()) return false;
-    if (var[0] == '-' || isdigit(var[0])) return true;
-    if (var[0] == '\'' && var[var.length()-1] == '\'') return true; // Character literal
-    return false;
-}
-
-bool CodeGenerator::isStringLiteral(const string& var) {
-    return var.length() >= 2 && var[0] == '"' && var[var.length()-1] == '"';
-}
-
-string CodeGenerator::allocateRegister(const string& var) {
+string CodeGenerator::RegisterPool::allocateTemp(const string& var) {
     if (varToReg.find(var) != varToReg.end()) {
         return varToReg[var];
     }
     
-    // Try to find a free temporary register
-    for (const string& reg : tempRegisters) {
-        bool inUse = false;
-        for (const auto& pair : varToReg) {
-            if (pair.second == reg) {
-                inUse = true;
-                break;
-            }
-        }
-        if (!inUse) {
-            varToReg[var] = reg;
-            return reg;
-        }
+    if (!tempRegs.empty()) {
+        string reg = *tempRegs.begin();
+        tempRegs.erase(tempRegs.begin());
+        varToReg[var] = reg;
+        regToVar[reg] = var;
+        return reg;
     }
     
-    // If all temp registers are used, spill to stack
-    // For simplicity, we'll just use the first available temp register
-    // and assume previous value was already used
-    string reg = tempRegisters[0];
-    varToReg[var] = reg;
-    return reg;
+    return "$t9";  // Fallback
 }
 
-void CodeGenerator::freeRegister(const string& var) {
-    varToReg.erase(var);
-}
-
-string CodeGenerator::getRegister(const string& var) {
+string CodeGenerator::RegisterPool::allocateSaved(const string& var) {
     if (varToReg.find(var) != varToReg.end()) {
         return varToReg[var];
     }
-    return allocateRegister(var);
-}
-
-int CodeGenerator::allocateStackSpace(const string& var, int size) {
-    currentStackOffset += size;
-    varToStackOffset[var] = -currentStackOffset;
-    return varToStackOffset[var];
-}
-
-int CodeGenerator::getStackOffset(const string& var) {
-    if (varToStackOffset.find(var) != varToStackOffset.end()) {
-        return varToStackOffset[var];
-    }
-    // Default allocation for non-arrays
-    return allocateStackSpace(var, 4);
-}
-
-int CodeGenerator::getArraySize(const string& varName) {
-    // Extract base name from unique name (e.g., "arr#2" -> "arr")
-    string baseName = varName;
-    size_t hashPos = varName.find('#');
-    if (hashPos != string::npos) {
-        baseName = varName.substr(0, hashPos);
+    
+    if (!savedRegs.empty()) {
+        string reg = *savedRegs.begin();
+        savedRegs.erase(savedRegs.begin());
+        varToReg[var] = reg;
+        regToVar[reg] = var;
+        return reg;
     }
     
-    cerr << "DEBUG getArraySize: varName=" << varName << ", baseName=" << baseName << endl;
-    
-    // Look up in symbol table
-    Symbol* sym = symTab->lookup(baseName);
-    if (sym) {
-        cerr << "  Found symbol: isArray=" << sym->isArray << ", arrayDimensions.size()=" << sym->arrayDimensions.size() << endl;
-        if (sym->isArray && !sym->arrayDimensions.empty()) {
-            // Calculate total size: element_size * dim[0] * dim[1] * ...
-            int totalSize = 4; // Assume 4 bytes per element (int)
-            for (int dim : sym->arrayDimensions) {
-                cerr << "    dimension: " << dim << endl;
-                if (dim > 0) {
-                    totalSize *= dim;
-                }
-            }
-            cerr << "  Total array size: " << totalSize << " bytes" << endl;
-            return totalSize;
-        }
-    } else {
-        cerr << "  Symbol not found in table" << endl;
-    }
-    
-    // Not an array or size unknown
-    return 4;
+    return allocateTemp(var);
 }
 
-void CodeGenerator::computeFunctionStackFrames() {
-    string currentFunc = "";
-    set<string> localVars;
-    
-    for (const auto& instr : instructions) {
-        if (instr.opcode == TACOp::FUNC_BEGIN) {
-            currentFunc = instr.operand1;
-            localVars.clear();
-        } else if (instr.opcode == TACOp::FUNC_END) {
-            functionLocalVars[currentFunc] = vector<string>(localVars.begin(), localVars.end());
-            // Calculate stack size: locals + saved registers + return address
-            int stackSize = localVars.size() * 4 + 8; // +8 for $ra and $fp
-            functionStackSize[currentFunc] = stackSize;
-        } else if (!currentFunc.empty()) {
-            // Track local variables (non-temporaries)
-            if (!instr.result.empty() && !isTemporary(instr.result) && !isConstant(instr.result)) {
-                localVars.insert(instr.result);
-            }
+void CodeGenerator::RegisterPool::freeReg(const string& reg) {
+    if (regToVar.find(reg) != regToVar.end()) {
+        string var = regToVar[reg];
+        varToReg.erase(var);
+        regToVar.erase(reg);
+        
+        if (reg[1] == 't') {
+            tempRegs.insert(reg);
+        } else if (reg[1] == 's') {
+            savedRegs.insert(reg);
         }
     }
 }
+
+void CodeGenerator::RegisterPool::spillAll() {
+    varToReg.clear();
+    regToVar.clear();
+    init();
+}
+
+bool CodeGenerator::RegisterPool::isAllocated(const string& var) {
+    return varToReg.find(var) != varToReg.end();
+}
+
+string CodeGenerator::RegisterPool::getReg(const string& var) {
+    if (varToReg.find(var) != varToReg.end()) {
+        return varToReg[var];
+    }
+    return "";
+}
+
+//============================================================================
+// Helper Utilities
+//============================================================================
 
 void CodeGenerator::emit(const string& instruction) {
-    textSection.push_back(instruction);
+    asmCode.push_back("    " + instruction);
 }
 
-void CodeGenerator::emitData(const string& directive) {
-    dataSection.push_back(directive);
+void CodeGenerator::emitLabel(const string& label) {
+    asmCode.push_back(label + ":");
 }
 
 void CodeGenerator::emitComment(const string& comment) {
-    emit("    # " + comment);
+    asmCode.push_back("    # " + comment);
 }
 
-void CodeGenerator::loadOperand(const string& operand, const string& reg) {
-    if (isConstant(operand)) {
-        // Handle numeric constants
-        if (operand[0] == '\'') {
-            // Character literal
-            int charValue = (int)operand[1];
-            emit("    li " + reg + ", " + to_string(charValue));
-        } else {
-            emit("    li " + reg + ", " + operand);
+void CodeGenerator::emitBlankLine() {
+    asmCode.push_back("");
+}
+
+string CodeGenerator::newLabel(const string& prefix) {
+    return prefix + "_" + to_string(labelCounter++);
+}
+
+string CodeGenerator::getStringLabel(const string& content) {
+    if (stringLabels.find(content) != stringLabels.end()) {
+        return stringLabels[content];
+    }
+    
+    string label = "_str" + to_string(stringCounter++);
+    stringLabels[content] = label;
+    dataSection.push_back(label + ": .asciiz " + content);
+    return label;
+}
+
+bool CodeGenerator::isImmediate(const string& operand) {
+    if (operand.empty()) return false;
+    if (operand[0] == '-' || isdigit(operand[0])) {
+        for (size_t i = 1; i < operand.size(); i++) {
+            if (!isdigit(operand[i])) return false;
         }
-    } else if (isStringLiteral(operand)) {
-        // Load address of string literal
-        if (stringLabels.find(operand) == stringLabels.end()) {
-            string label = "str_" + to_string(stringLabelCounter++);
-            stringLabels[operand] = label;
-            emitData(label + ": .asciiz " + operand);
-        }
-        emit("    la " + reg + ", " + stringLabels[operand]);
-    } else {
-        // Load from stack (both temporaries and variables)
-        int offset = getStackOffset(operand);
-        emit("    lw " + reg + ", " + to_string(offset) + "($fp)");
+        return true;
     }
+    return false;
 }
 
-void CodeGenerator::storeResult(const string& result, const string& reg) {
-    // Always store results (both temporaries and variables) to stack
-    // This ensures values are preserved across complex expressions
-    int offset = getStackOffset(result);
-    emit("    sw " + reg + ", " + to_string(offset) + "($fp)");
+bool CodeGenerator::isTemp(const string& operand) {
+    return operand.size() > 0 && operand[0] == 't' && isdigit(operand[1]);
 }
 
-void CodeGenerator::genArithmetic(const TACInstruction& instr) {
-    string resultReg = "$t0";
-    string op1Reg = "$t8";
-    string op2Reg = "$t9";
-    
-    // Load operands
-    loadOperand(instr.operand1, op1Reg);
-    
-    if (instr.opcode != TACOp::NEG) {
-        loadOperand(instr.operand2, op2Reg);
-    }
-    
-    switch (instr.opcode) {
-        case TACOp::ADD:
-            emit("    add " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::SUB:
-            emit("    sub " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::MUL:
-            emit("    mul " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::DIV:
-            emit("    div " + op1Reg + ", " + op2Reg);
-            emit("    mflo " + resultReg);
-            break;
-        case TACOp::MOD:
-            emit("    div " + op1Reg + ", " + op2Reg);
-            emit("    mfhi " + resultReg);
-            break;
-        case TACOp::NEG:
-            emit("    neg " + resultReg + ", " + op1Reg);
-            break;
-        default:
-            break;
-    }
-    
-    storeResult(instr.result, resultReg);
+bool CodeGenerator::isVariable(const string& operand) {
+    return !isImmediate(operand) && !isTemp(operand) && !operand.empty();
 }
 
-void CodeGenerator::genComparison(const TACInstruction& instr) {
-    string resultReg = "$t0";
-    string op1Reg = "$t8";
-    string op2Reg = "$t9";
-    
-    loadOperand(instr.operand1, op1Reg);
-    loadOperand(instr.operand2, op2Reg);
-    
-    switch (instr.opcode) {
-        case TACOp::EQ:
-            emit("    seq " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::NE:
-            emit("    sne " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::LT:
-            emit("    slt " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::LE:
-            emit("    sle " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::GT:
-            emit("    sgt " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        case TACOp::GE:
-            emit("    sge " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            break;
-        default:
-            break;
-    }
-    
-    storeResult(instr.result, resultReg);
+int CodeGenerator::getImmediate(const string& operand) {
+    return stoi(operand);
 }
 
-void CodeGenerator::genLogical(const TACInstruction& instr) {
-    string resultReg = "$t0";
-    string op1Reg = "$t8";
-    string op2Reg = "$t9";
+int CodeGenerator::getVarOffset(const string& varName) {
+    if (varOffsets.find(varName) != varOffsets.end()) {
+        return varOffsets[varName];
+    }
+    // Allocate new offset
+    currentOffset -= 4;  // Assuming 4-byte integers
+    varOffsets[varName] = currentOffset;
+    return currentOffset;
+}
+
+int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
+    // Pre-scan the function to find all variables that will need stack space
+    int minOffset = 0;  // Track the most negative offset
+    map<string, int> tempOffsets;
+    int tempOffset = 0;
     
-    if (instr.opcode == TACOp::NOT) {
-        loadOperand(instr.operand1, op1Reg);
-        emit("    seq " + resultReg + ", " + op1Reg + ", $zero");
-    } else {
-        loadOperand(instr.operand1, op1Reg);
-        loadOperand(instr.operand2, op2Reg);
+    // Safety check
+    if (funcEndIdx > tacInstructions.size()) {
+        funcEndIdx = tacInstructions.size();
+    }
+    
+    for (size_t i = funcStartIdx; i < funcEndIdx; i++) {
+        const TACInstruction& instr = tacInstructions[i];
         
-        if (instr.opcode == TACOp::AND) {
-            emit("    and " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            emit("    sltu " + resultReg + ", $zero, " + resultReg);
-        } else if (instr.opcode == TACOp::OR) {
-            emit("    or " + resultReg + ", " + op1Reg + ", " + op2Reg);
-            emit("    sltu " + resultReg + ", $zero, " + resultReg);
-        }
-    }
-    
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genBitwise(const TACInstruction& instr) {
-    string resultReg = "$t0";
-    string op1Reg = "$t8";
-    string op2Reg = "$t9";
-    
-    loadOperand(instr.operand1, op1Reg);
-    
-    if (instr.opcode == TACOp::BIT_NOT) {
-        emit("    not " + resultReg + ", " + op1Reg);
-    } else {
-        loadOperand(instr.operand2, op2Reg);
+        // Skip labels and control flow instructions for operands
+        bool isControlFlow = (instr.opcode == TACOp::LABEL || instr.opcode == TACOp::GOTO ||
+                             instr.opcode == TACOp::IF_GOTO || instr.opcode == TACOp::IF_FALSE_GOTO ||
+                             instr.opcode == TACOp::FUNC_BEGIN || instr.opcode == TACOp::FUNC_END);
         
-        switch (instr.opcode) {
-            case TACOp::BIT_AND:
-                emit("    and " + resultReg + ", " + op1Reg + ", " + op2Reg);
-                break;
-            case TACOp::BIT_OR:
-                emit("    or " + resultReg + ", " + op1Reg + ", " + op2Reg);
-                break;
-            case TACOp::BIT_XOR:
-                emit("    xor " + resultReg + ", " + op1Reg + ", " + op2Reg);
-                break;
-            case TACOp::SHL:
-                emit("    sllv " + resultReg + ", " + op1Reg + ", " + op2Reg);
-                break;
-            case TACOp::SHR:
-                emit("    srlv " + resultReg + ", " + op1Reg + ", " + op2Reg);
-                break;
-            default:
-                break;
-        }
-    }
-    
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genAssign(const TACInstruction& instr) {
-    string resultReg = "$t0";
-    
-    // Check if operand1 is a variable that has never been assigned/initialized
-    // This typically means it's an array name that needs its address taken
-    if (!isTemporary(instr.operand1) && !isConstant(instr.operand1) && !isStringLiteral(instr.operand1)) {
-        // Check if this variable has ever been written to
-        if (varToStackOffset.find(instr.operand1) == varToStackOffset.end()) {
-            // This is likely an array - allocate space and take its address
-            int offset = allocateStackSpace(instr.operand1, 20);  // Allocate space for array
-            emit("    addi " + resultReg + ", $fp, " + to_string(offset));
-            storeResult(instr.result, resultReg);
-            return;
-        }
-    }
-    
-    loadOperand(instr.operand1, resultReg);
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genLoad(const TACInstruction& instr) {
-    string ptrReg = "$t8";
-    string resultReg = getRegister(instr.result);
-    
-    loadOperand(instr.operand1, ptrReg);
-    emit("    lw " + resultReg + ", 0(" + ptrReg + ")");
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genStore(const TACInstruction& instr) {
-    string valueReg = "$t8";
-    string ptrReg = "$t9";
-    
-    loadOperand(instr.operand1, valueReg);
-    loadOperand(instr.result, ptrReg);
-    emit("    sw " + valueReg + ", 0(" + ptrReg + ")");
-}
-
-void CodeGenerator::genAddress(const TACInstruction& instr) {
-    string resultReg = getRegister(instr.result);
-    
-    // Check if this is an array and allocate proper space if not already allocated
-    if (varToStackOffset.find(instr.operand1) == varToStackOffset.end()) {
-        int arraySize = getArraySize(instr.operand1);
-        allocateStackSpace(instr.operand1, arraySize);
-    }
-    
-    int offset = getStackOffset(instr.operand1);
-    emit("    addi " + resultReg + ", $fp, " + to_string(offset));
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genArrayLoad(const TACInstruction& instr) {
-    string baseReg = "$t7";
-    string indexReg = "$t8";
-    string resultReg = getRegister(instr.result);
-    
-    loadOperand(instr.operand1, baseReg);
-    loadOperand(instr.operand2, indexReg);
-    
-    // Calculate address: base + index
-    emit("    add " + resultReg + ", " + baseReg + ", " + indexReg);
-    emit("    lw " + resultReg + ", 0(" + resultReg + ")");
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genArrayStore(const TACInstruction& instr) {
-    string baseReg = "$t7";
-    string indexReg = "$t8";
-    string valueReg = "$t9";
-    string addrReg = "$t6";
-    
-    loadOperand(instr.result, baseReg);
-    loadOperand(instr.operand1, indexReg);
-    loadOperand(instr.operand2, valueReg);
-    
-    // Calculate address: base + index
-    emit("    add " + addrReg + ", " + baseReg + ", " + indexReg);
-    emit("    sw " + valueReg + ", 0(" + addrReg + ")");
-}
-
-void CodeGenerator::genGoto(const TACInstruction& instr) {
-    emit("    j " + instr.result);
-}
-
-void CodeGenerator::genIfGoto(const TACInstruction& instr) {
-    string condReg = "$t8";
-    loadOperand(instr.operand1, condReg);
-    emit("    bne " + condReg + ", $zero, " + instr.result);
-}
-
-void CodeGenerator::genIfFalseGoto(const TACInstruction& instr) {
-    string condReg = "$t8";
-    loadOperand(instr.operand1, condReg);
-    emit("    beq " + condReg + ", $zero, " + instr.result);
-}
-
-void CodeGenerator::genLabel(const TACInstruction& instr) {
-    // Skip function labels (func_*) as they're handled by FUNC_BEGIN
-    string label = instr.result;
-    if (label.substr(0, 5) == "func_") {
-        return;  // Skip function labels, handled in FUNC_BEGIN
-    }
-    emit(label + ":");
-}
-
-void CodeGenerator::genParam(const TACInstruction& instr) {
-    // Parameters are pushed onto the stack before a call
-    string paramReg = "$t8";
-    loadOperand(instr.operand1, paramReg);
-    emit("    addi $sp, $sp, -4");
-    emit("    sw " + paramReg + ", 0($sp)");
-}
-
-void CodeGenerator::genGetParam(const TACInstruction& instr) {
-    // Load parameter from stack frame
-    // Parameters are passed on the stack, starting at offset 8 from $fp (after $ra and old $fp)
-    // param[0] is at 8($fp), param[1] at 12($fp), etc.
-    
-    // operand1 contains just the index as a string: "0", "1", "2", etc.
-    int paramIndex = stoi(instr.operand1);
-    
-    // Calculate offset: 8 + (paramIndex * 4)
-    int offset = 8 + (paramIndex * 4);
-    
-    string resultReg = getRegister(instr.result);
-    emit("    lw " + resultReg + ", " + to_string(offset) + "($fp)");
-    storeResult(instr.result, resultReg);
-}
-
-void CodeGenerator::genCall(const TACInstruction& instr) {
-    // Call the function
-    string funcLabel = instr.operand1;
-    if (funcLabel.substr(0, 5) == "func_") {
-        funcLabel = funcLabel.substr(5); // Remove "func_" prefix
-    }
-    
-    emit("    jal " + funcLabel);
-    
-    // Clean up parameters from stack
-    int paramCount = instr.paramCount;
-    if (paramCount > 0) {
-        emit("    addi $sp, $sp, " + to_string(paramCount * 4));
-    }
-    
-    // Store return value if needed
-    // CRITICAL: For temporaries, we must store to stack to avoid being overwritten
-    if (!instr.result.empty()) {
-        if (isTemporary(instr.result)) {
-            // Always store call results to stack first to preserve them
-            int offset = getStackOffset(instr.result);
-            emit("    sw $v0, " + to_string(offset) + "($fp)");
-        } else {
-            string resultReg = getRegister(instr.result);
-            emit("    move " + resultReg + ", $v0");
-            storeResult(instr.result, resultReg);
-        }
-    }
-}
-
-void CodeGenerator::genReturn(const TACInstruction& instr) {
-    if (!instr.operand1.empty()) {
-        loadOperand(instr.operand1, "$v0");
-    }
-    // Jump to function epilogue (handled in FUNC_END)
-    emit("    j " + currentFunction + "_epilogue");
-}
-
-void CodeGenerator::genFunctionBegin(const TACInstruction& instr) {
-    currentFunction = instr.result;  // Function name is in result field
-    varToReg.clear();
-    varToStackOffset.clear();
-    currentStackOffset = 0;
-    
-    // Function label
-    emit("");
-    emitComment("Function: " + currentFunction);
-    
-    // If the function is main, make it the entry point
-    if (currentFunction == "main") {
-        emit("main:");
-    } else {
-        emit(currentFunction + ":");
-    }
-    
-    // Prologue
-    emit("    # Prologue");
-    emit("    addi $sp, $sp, -8");
-    emit("    sw $ra, 4($sp)");
-    emit("    sw $fp, 0($sp)");
-    emit("    move $fp, $sp");
-    
-    // Reserve space for locals - will be patched later
-    emit("    # Reserve space for local variables");
-    
-    // Placeholder - we'll track the actual size as we generate code
-    // For now, don't allocate anything; we'll do it dynamically
-    emit("    # STACK_ALLOC_PLACEHOLDER");
-}
-
-void CodeGenerator::genFunctionEnd(const TACInstruction& instr) {
-    // Calculate actual stack space needed (round up to 16-byte alignment for safety)
-    int stackSize = ((abs(currentStackOffset) + 15) / 16) * 16;
-    
-    // Find and replace the placeholder with actual allocation
-    for (size_t i = 0; i < textSection.size(); i++) {
-        if (textSection[i].find("# STACK_ALLOC_PLACEHOLDER") != string::npos) {
-            if (stackSize > 0) {
-                textSection[i] = "    addi $sp, $sp, -" + to_string(stackSize);
-            } else {
-                textSection[i] = "    # No local variables";
+        // Check result operand (variables and temps that will be stored)
+        if (!instr.result.empty() && !isImmediate(instr.result) && !isControlFlow) {
+            if (tempOffsets.find(instr.result) == tempOffsets.end()) {
+                tempOffset -= 4;
+                tempOffsets[instr.result] = tempOffset;
+                if (tempOffset < minOffset) {
+                    minOffset = tempOffset;
+                }
             }
-            break;
+        }
+        
+        // Check operand1 (if it's a variable/temp that will be loaded)
+        if (!instr.operand1.empty() && !isImmediate(instr.operand1) && !isControlFlow) {
+            if (tempOffsets.find(instr.operand1) == tempOffsets.end()) {
+                tempOffset -= 4;
+                tempOffsets[instr.operand1] = tempOffset;
+                if (tempOffset < minOffset) {
+                    minOffset = tempOffset;
+                }
+            }
+        }
+        
+        // Check operand2
+        if (!instr.operand2.empty() && !isImmediate(instr.operand2)) {
+            if (tempOffsets.find(instr.operand2) == tempOffsets.end()) {
+                tempOffset -= 4;
+                tempOffsets[instr.operand2] = tempOffset;
+                if (tempOffset < minOffset) {
+                    minOffset = tempOffset;
+                }
+            }
         }
     }
     
-    // Epilogue
-    emit("");
-    emit(currentFunction + "_epilogue:");
-    emit("    # Epilogue");
-    if (stackSize > 0) {
-        emit("    addi $sp, $sp, " + to_string(stackSize));
+    // Calculate frame size: space for locals + 8 bytes for $ra/$fp + parameter space
+    int localsSpace = -minOffset;  // Convert negative offset to positive size
+    int paramSpace = (functionParamCount > 4 ? 4 : functionParamCount) * 4;
+    int totalSpace = localsSpace + 8 + paramSpace;
+    
+    // Ensure minimum frame size and round up to 8-byte alignment for MIPS
+    if (totalSpace < 16) totalSpace = 16;  // Minimum frame
+    if (totalSpace % 8 != 0) {
+        totalSpace = ((totalSpace / 8) + 1) * 8;
     }
-    emit("    move $sp, $fp");
-    emit("    lw $fp, 0($sp)");
-    emit("    lw $ra, 4($sp)");
-    emit("    addi $sp, $sp, 8");
-    emit("    jr $ra");
+    
+    return totalSpace;
 }
 
-void CodeGenerator::genCast(const TACInstruction& instr) {
-    // For basic types, cast is essentially a move
-    string resultReg = getRegister(instr.result);
-    loadOperand(instr.operand1, resultReg);
-    storeResult(instr.result, resultReg);
-}
+//============================================================================
+// Operand Loading/Storing
+//============================================================================
 
-void CodeGenerator::generateInstruction(const TACInstruction& instr) {
-    switch (instr.opcode) {
-        case TACOp::CONST:
-            genAssign(instr);  // Handle CONST like assignment: result = operand1
-            break;
-            
-        case TACOp::ADD:
-        case TACOp::SUB:
-        case TACOp::MUL:
-        case TACOp::DIV:
-        case TACOp::MOD:
-        case TACOp::NEG:
-            genArithmetic(instr);
-            break;
-            
-        case TACOp::EQ:
-        case TACOp::NE:
-        case TACOp::LT:
-        case TACOp::LE:
-        case TACOp::GT:
-        case TACOp::GE:
-            genComparison(instr);
-            break;
-            
-        case TACOp::AND:
-        case TACOp::OR:
-        case TACOp::NOT:
-            genLogical(instr);
-            break;
-            
-        case TACOp::BIT_AND:
-        case TACOp::BIT_OR:
-        case TACOp::BIT_XOR:
-        case TACOp::SHL:
-        case TACOp::SHR:
-        case TACOp::BIT_NOT:
-            genBitwise(instr);
-            break;
-            
-        case TACOp::ASSIGN:
-            genAssign(instr);
-            break;
-            
-        case TACOp::LOAD:
-            genLoad(instr);
-            break;
-            
-        case TACOp::STORE:
-            genStore(instr);
-            break;
-            
-        case TACOp::ADDRESS:
-            genAddress(instr);
-            break;
-            
-        case TACOp::ARRAY_LOAD:
-            genArrayLoad(instr);
-            break;
-            
-        case TACOp::ARRAY_STORE:
-            genArrayStore(instr);
-            break;
-            
-        case TACOp::GOTO:
-            genGoto(instr);
-            break;
-            
-        case TACOp::IF_GOTO:
-            genIfGoto(instr);
-            break;
-            
-        case TACOp::IF_FALSE_GOTO:
-            genIfFalseGoto(instr);
-            break;
-            
-        case TACOp::LABEL:
-            genLabel(instr);
-            break;
-            
-        case TACOp::CALL:
-            genCall(instr);
-            break;
-            
-        case TACOp::RETURN:
-            genReturn(instr);
-            break;
-            
-        case TACOp::PARAM:
-            genParam(instr);
-            break;
-            
-        case TACOp::GET_PARAM:
-            genGetParam(instr);
-            break;
-            
-        case TACOp::FUNC_BEGIN:
-            genFunctionBegin(instr);
-            break;
-            
-        case TACOp::FUNC_END:
-            genFunctionEnd(instr);
-            break;
-            
-        case TACOp::CAST:
-            genCast(instr);
-            break;
-            
-        default:
-            emitComment("Unhandled opcode");
-            break;
+void CodeGenerator::loadOperand(const string& operand, const string& targetReg) {
+    if (isImmediate(operand)) {
+        emit("li " + targetReg + ", " + operand);
+    }
+    else if (registers.isAllocated(operand)) {
+        string srcReg = registers.getReg(operand);
+        if (srcReg != targetReg) {
+            emit("move " + targetReg + ", " + srcReg);
+        }
+    }
+    else {
+        // Load from stack
+        int offset = getVarOffset(operand);
+        emit("lw " + targetReg + ", " + to_string(offset) + "($fp)");
     }
 }
 
-void CodeGenerator::generateDataSection() {
-    emitData(".data");
-    
-    // Add any global string literals
-    for (const auto& pair : stringLabels) {
-        emitData(pair.second + ": .asciiz " + pair.first);
+void CodeGenerator::storeToVar(const string& var, const string& sourceReg) {
+    if (registers.isAllocated(var)) {
+        string destReg = registers.getReg(var);
+        if (destReg != sourceReg) {
+            emit("move " + destReg + ", " + sourceReg);
+        }
     }
-    
-    // Add newline for output
-    emitData("newline: .asciiz \"\\n\"");
+    else {
+        // Store to stack
+        int offset = getVarOffset(var);
+        emit("sw " + sourceReg + ", " + to_string(offset) + "($fp)");
+    }
 }
 
-void CodeGenerator::generateTextSection() {
-    emit(".text");
-    emit(".globl main");
-    emit("");
-    
-    // Generate code for each TAC instruction
-    for (const auto& instr : instructions) {
-        generateInstruction(instr);
-    }
-    
-    // Add exit syscall at the end of main if needed
-    emit("");
-    emit("# Program exit");
-    emit("_exit:");
-    emit("    li $v0, 10");
-    emit("    syscall");
-}
+//============================================================================
+// Main Generation
+//============================================================================
 
 void CodeGenerator::generate() {
-    computeFunctionStackFrames();
+    asmCode.clear();
+    dataSection.clear();
     
-    // First pass: collect string literals
-    for (const auto& instr : instructions) {
-        if (isStringLiteral(instr.operand1)) {
-            if (stringLabels.find(instr.operand1) == stringLabels.end()) {
-                string label = "str_" + to_string(stringLabelCounter++);
-                stringLabels[instr.operand1] = label;
-            }
-        }
-        if (isStringLiteral(instr.operand2)) {
-            if (stringLabels.find(instr.operand2) == stringLabels.end()) {
-                string label = "str_" + to_string(stringLabelCounter++);
-                stringLabels[instr.operand2] = label;
-            }
-        }
-    }
+    emitComment("Generated MIPS Assembly");
+    emitComment("Compiler: Custom C Compiler");
+    emitBlankLine();
     
     generateDataSection();
+    emitBlankLine();
     generateTextSection();
 }
 
-string CodeGenerator::getAssemblyCode() {
-    stringstream ss;
+void CodeGenerator::generateDataSection() {
+    asmCode.push_back(".data");
     
-    // Output data section
-    for (const string& line : dataSection) {
-        ss << line << endl;
+    // Predefined strings
+    dataSection.push_back("_newline: .asciiz \"\\n\"");
+    dataSection.push_back("_int_fmt: .asciiz \"%d\"");
+    dataSection.push_back("_str_fmt: .asciiz \"%s\"");
+    dataSection.push_back("_char_fmt: .asciiz \"%c\"");
+    
+    // Collect string literals from TAC (first pass)
+    for (const auto& instr : tacInstructions) {
+        if (instr.opcode == TACOp::CONST && 
+            !instr.operand1.empty() && instr.operand1[0] == '"') {
+            getStringLabel(instr.operand1);
+        }
     }
     
-    ss << endl;
-    
-    // Output text section
-    for (const string& line : textSection) {
-        ss << line << endl;
+    // Emit all data
+    for (const auto& line : dataSection) {
+        asmCode.push_back("    " + line);
     }
     
-    return ss.str();
+    // Global/static variables
+    for (const auto& entry : staticVars) {
+        asmCode.push_back("    " + entry.second + ": .word 0");
+    }
 }
 
-void CodeGenerator::writeToFile(const string& filename) {
-    ofstream outFile(filename);
-    if (!outFile) {
-        cerr << "Error: Could not open file " << filename << " for writing" << endl;
+void CodeGenerator::generateTextSection() {
+    asmCode.push_back(".text");
+    asmCode.push_back(".globl main");
+    emitBlankLine();
+    
+    // PRE-PASS: Calculate frame sizes for all functions
+    for (size_t i = 0; i < tacInstructions.size(); i++) {
+        if (tacInstructions[i].opcode == TACOp::FUNC_BEGIN) {
+            string funcName = tacInstructions[i].result;
+            int paramCount = tacInstructions[i].paramCount;
+            
+            // Find the end of this function
+            size_t funcEnd = i + 1;
+            for (size_t j = i + 1; j < tacInstructions.size(); j++) {
+                if (tacInstructions[j].opcode == TACOp::FUNC_END) {
+                    funcEnd = j;
+                    break;
+                }
+            }
+            
+            // Temporarily set function param count for calculation
+            int savedParamCount = functionParamCount;
+            functionParamCount = paramCount;
+            
+            // Calculate frame size for this function
+            int fsize = calculateFrameSize(i + 1, funcEnd);
+            functionFrameSizes[funcName] = fsize;
+            
+            functionParamCount = savedParamCount;
+            
+            emitComment("Function " + funcName + " frame size: " + to_string(fsize) + " bytes");
+        }
+    }
+    
+    emitBlankLine();
+    
+    // MAIN PASS: Generate code
+    for (const auto& instr : tacInstructions) {
+        generateInstruction(instr);
+    }
+    
+    // Add exit syscall
+    emitBlankLine();
+    emitLabel("_program_exit");
+    emit("li $v0, 10");
+    emit("syscall");
+}
+
+//============================================================================
+// Instruction Dispatcher
+//============================================================================
+
+void CodeGenerator::generateInstruction(const TACInstruction& instr) {
+    // Skip comments and nops
+    if (instr.opcode == TACOp::COMMENT || instr.opcode == TACOp::NOP) {
+        emitComment(instr.toString());
         return;
     }
     
-    outFile << getAssemblyCode();
-    outFile.close();
+    emitComment(instr.toString());
     
-    cout << "MIPS assembly code written to " << filename << endl;
+    switch (instr.opcode) {
+        // Arithmetic
+        case TACOp::ADD: generateAdd(instr); break;
+        case TACOp::SUB: generateSub(instr); break;
+        case TACOp::MUL: generateMul(instr); break;
+        case TACOp::DIV: generateDiv(instr); break;
+        case TACOp::MOD: generateMod(instr); break;
+        case TACOp::NEG: generateNeg(instr); break;
+        
+        // Logical (short-circuit)
+        case TACOp::AND: generateLogicalAnd(instr); break;
+        case TACOp::OR: generateLogicalOr(instr); break;
+        case TACOp::NOT: generateLogicalNot(instr); break;
+        
+        // Bitwise
+        case TACOp::BIT_AND: generateBitAnd(instr); break;
+        case TACOp::BIT_OR: generateBitOr(instr); break;
+        case TACOp::BIT_XOR: generateBitXor(instr); break;
+        case TACOp::BIT_NOT: generateBitNot(instr); break;
+        case TACOp::SHL: generateShl(instr); break;
+        case TACOp::SHR: generateShr(instr); break;
+        
+        // Comparison
+        case TACOp::EQ: generateEq(instr); break;
+        case TACOp::NE: generateNe(instr); break;
+        case TACOp::LT: generateLt(instr); break;
+        case TACOp::LE: generateLe(instr); break;
+        case TACOp::GT: generateGt(instr); break;
+        case TACOp::GE: generateGe(instr); break;
+        
+        // Memory
+        case TACOp::ASSIGN: generateAssign(instr); break;
+        case TACOp::LOAD: generateLoad(instr); break;
+        case TACOp::STORE: generateStore(instr); break;
+        case TACOp::ADDRESS: generateAddress(instr); break;
+        case TACOp::ARRAY_LOAD: generateArrayLoad(instr); break;
+        case TACOp::ARRAY_STORE: generateArrayStore(instr); break;
+        
+        // Control flow
+        case TACOp::LABEL: generateLabel(instr); break;
+        case TACOp::GOTO: generateGoto(instr); break;
+        case TACOp::IF_GOTO: generateIfGoto(instr); break;
+        case TACOp::IF_FALSE_GOTO: generateIfFalseGoto(instr); break;
+        
+        // Functions
+        case TACOp::FUNC_BEGIN: generateFuncBegin(instr); break;
+        case TACOp::FUNC_END: generateFuncEnd(instr); break;
+        case TACOp::PARAM: generateParam(instr); break;
+        case TACOp::CALL: generateCall(instr); break;
+        case TACOp::RETURN: generateReturn(instr); break;
+        
+        // Type conversion
+        case TACOp::CAST: generateCast(instr); break;
+        
+        case TACOp::CONST:
+            // result = constant
+            if (!instr.operand1.empty() && instr.operand1[0] == '"') {
+                // String constant - load address
+                string label = getStringLabel(instr.operand1);
+                emit("la $t0, " + label);
+            } else {
+                // Numeric constant
+                emit("li $t0, " + instr.operand1);
+            }
+            storeToVar(instr.result, "$t0");
+            break;
+        
+        case TACOp::GET_PARAM:
+            // result = param[index]
+            // Parameters saved in prologue at: 0($fp), -4($fp), -8($fp), -12($fp)
+            {
+                int paramIdx = 0;
+                if (!instr.operand1.empty()) {
+                    paramIdx = stoi(instr.operand1);
+                }
+                
+                if (paramIdx < 4) {
+                    // Parameter was in register, saved to stack in prologue
+                    int offset = -(paramIdx * 4);  // 0, -4, -8, -12 for params 0-3
+                    emit("lw $t0, " + to_string(offset) + "($fp)");
+                } else {
+                    // Parameter on stack (beyond first 4)
+                    // These are above the frame: at frameSpace + offset
+                    int paramSaveSpace = 4 * 4;  // Space for first 4 params
+                    int frameSpace = 8 + paramSaveSpace;
+                    int offset = frameSpace + ((paramIdx - 4) * 4);
+                    emit("lw $t0, " + to_string(offset) + "($fp)");
+                }
+                storeToVar(instr.result, "$t0");
+            }
+            break;
+            
+        default:
+            emitComment("TODO: Unimplemented operation");
+    }
+}
+
+//============================================================================
+// ARITHMETIC OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateAdd(const TACInstruction& instr) {
+    // result = op1 + op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("addi $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("add $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateSub(const TACInstruction& instr) {
+    // result = op1 - op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("subi $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("sub $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateMul(const TACInstruction& instr) {
+    // result = op1 * op2
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("mul $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateDiv(const TACInstruction& instr) {
+    // result = op1 / op2
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("div $t0, $t1");
+    emit("mflo $t0");  // Quotient in lo
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateMod(const TACInstruction& instr) {
+    // result = op1 % op2
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("div $t0, $t1");
+    emit("mfhi $t0");  // Remainder in hi
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateNeg(const TACInstruction& instr) {
+    // result = -op1
+    loadOperand(instr.operand1, "$t0");
+    emit("neg $t0, $t0");
+    storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// LOGICAL OPERATIONS (Short-circuit evaluation)
+//============================================================================
+
+void CodeGenerator::generateLogicalAnd(const TACInstruction& instr) {
+    // result = op1 && op2 (short-circuit)
+    string falseLabel = newLabel("and_false");
+    string endLabel = newLabel("and_end");
+    
+    loadOperand(instr.operand1, "$t0");
+    emit("beqz $t0, " + falseLabel);
+    
+    loadOperand(instr.operand2, "$t0");
+    emit("beqz $t0, " + falseLabel);
+    
+    // Both true
+    emit("li $t0, 1");
+    emit("j " + endLabel);
+    
+    emitLabel(falseLabel);
+    emit("li $t0, 0");
+    
+    emitLabel(endLabel);
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateLogicalOr(const TACInstruction& instr) {
+    // result = op1 || op2 (short-circuit)
+    string trueLabel = newLabel("or_true");
+    string endLabel = newLabel("or_end");
+    
+    loadOperand(instr.operand1, "$t0");
+    emit("bnez $t0, " + trueLabel);
+    
+    loadOperand(instr.operand2, "$t0");
+    emit("bnez $t0, " + trueLabel);
+    
+    // Both false
+    emit("li $t0, 0");
+    emit("j " + endLabel);
+    
+    emitLabel(trueLabel);
+    emit("li $t0, 1");
+    
+    emitLabel(endLabel);
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateLogicalNot(const TACInstruction& instr) {
+    // result = !op1
+    loadOperand(instr.operand1, "$t0");
+    emit("seq $t0, $t0, $zero");  // Set if equal to zero
+    storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// BITWISE OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateBitAnd(const TACInstruction& instr) {
+    // result = op1 & op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("andi $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("and $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateBitOr(const TACInstruction& instr) {
+    // result = op1 | op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("ori $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("or $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateBitXor(const TACInstruction& instr) {
+    // result = op1 ^ op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("xori $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("xor $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateBitNot(const TACInstruction& instr) {
+    // result = ~op1
+    loadOperand(instr.operand1, "$t0");
+    emit("nor $t0, $t0, $zero");  // NOR with zero = NOT
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateShl(const TACInstruction& instr) {
+    // result = op1 << op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("sll $t0, $t0, " + instr.operand2);
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("sllv $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateShr(const TACInstruction& instr) {
+    // result = op1 >> op2
+    loadOperand(instr.operand1, "$t0");
+    
+    if (isImmediate(instr.operand2)) {
+        emit("sra $t0, $t0, " + instr.operand2);  // Arithmetic shift
+    } else {
+        loadOperand(instr.operand2, "$t1");
+        emit("srav $t0, $t0, $t1");
+    }
+    
+    storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// COMPARISON OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateEq(const TACInstruction& instr) {
+    // result = (op1 == op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("seq $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateNe(const TACInstruction& instr) {
+    // result = (op1 != op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("sne $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateLt(const TACInstruction& instr) {
+    // result = (op1 < op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("slt $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateLe(const TACInstruction& instr) {
+    // result = (op1 <= op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("sle $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateGt(const TACInstruction& instr) {
+    // result = (op1 > op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("sgt $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateGe(const TACInstruction& instr) {
+    // result = (op1 >= op2)
+    loadOperand(instr.operand1, "$t0");
+    loadOperand(instr.operand2, "$t1");
+    emit("sge $t0, $t0, $t1");
+    storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// MEMORY OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateAssign(const TACInstruction& instr) {
+    // result = op1
+    loadOperand(instr.operand1, "$t0");
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateLoad(const TACInstruction& instr) {
+    // result = *op1 (pointer dereference)
+    loadOperand(instr.operand1, "$t0");  // Get address
+    emit("lw $t0, 0($t0)");              // Load value at address
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateStore(const TACInstruction& instr) {
+    // *result = op1 (store through pointer)
+    loadOperand(instr.operand1, "$t0");  // Get value
+    loadOperand(instr.result, "$t1");    // Get address
+    emit("sw $t0, 0($t1)");              // Store value at address
+}
+
+void CodeGenerator::generateAddress(const TACInstruction& instr) {
+    // result = &op1
+    int offset = getVarOffset(instr.operand1);
+    emit("addi $t0, $fp, " + to_string(offset));
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateArrayLoad(const TACInstruction& instr) {
+    // result = arr[index]
+    // operand1 = base address, operand2 = index
+    loadOperand(instr.operand1, "$t0");  // Base address
+    loadOperand(instr.operand2, "$t1");  // Index
+    emit("sll $t1, $t1, 2");             // Index * 4 (word size)
+    emit("add $t0, $t0, $t1");           // Address = base + offset
+    emit("lw $t0, 0($t0)");              // Load value
+    storeToVar(instr.result, "$t0");
+}
+
+void CodeGenerator::generateArrayStore(const TACInstruction& instr) {
+    // arr[index] = value
+    // result = base address, operand1 = index, operand2 = value
+    loadOperand(instr.result, "$t0");    // Base address
+    loadOperand(instr.operand1, "$t1");  // Index
+    emit("sll $t1, $t1, 2");             // Index * 4
+    emit("add $t0, $t0, $t1");           // Address = base + offset
+    loadOperand(instr.operand2, "$t2");  // Value
+    emit("sw $t2, 0($t0)");              // Store value
+}
+
+//============================================================================
+// CONTROL FLOW
+//============================================================================
+
+void CodeGenerator::generateLabel(const TACInstruction& instr) {
+    emitLabel(instr.result);
+}
+
+void CodeGenerator::generateGoto(const TACInstruction& instr) {
+    emit("j " + instr.result);
+}
+
+void CodeGenerator::generateIfGoto(const TACInstruction& instr) {
+    // if (condition) goto label
+    loadOperand(instr.operand1, "$t0");
+    emit("bnez $t0, " + instr.result);
+}
+
+void CodeGenerator::generateIfFalseGoto(const TACInstruction& instr) {
+    // if (!condition) goto label
+    loadOperand(instr.operand1, "$t0");
+    emit("beqz $t0, " + instr.result);
+}
+
+//============================================================================
+// FUNCTION OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateFuncBegin(const TACInstruction& instr) {
+    currentFunction = instr.result;
+    inFunction = true;
+    functionParamCount = instr.paramCount;  // Get parameter count from instruction
+    varOffsets.clear();
+    currentOffset = 0;  // Will be set after frame setup
+    registers.spillAll();
+    
+    // Get pre-calculated frame size
+    currentFunctionFrameSize = 64;  // Default minimum
+    if (functionFrameSizes.find(currentFunction) != functionFrameSizes.end()) {
+        currentFunctionFrameSize = functionFrameSizes[currentFunction];
+    }
+    
+    emitBlankLine();
+    emitLabel(instr.result);
+    
+    // Function prologue - CORRECT ORDER WITH PROPER FRAME SIZE
+    // 1. Allocate FULL frame (includes locals, temporaries, saved regs, params)
+    emit("addi $sp, $sp, -" + to_string(currentFunctionFrameSize));
+    
+    // 2. Save return address and frame pointer at TOP of frame
+    emit("sw $ra, " + to_string(currentFunctionFrameSize - 4) + "($sp)");  // $ra at top
+    emit("sw $fp, " + to_string(currentFunctionFrameSize - 8) + "($sp)");  // $fp below $ra
+    
+    // 3. Set new frame pointer
+    emit("move $fp, $sp");
+    
+    // 4. Save parameter registers to stack (for first 4 parameters)
+    currentOffset = 0;  // Start at $fp
+    for (int i = 0; i < functionParamCount && i < 4; i++) {
+        string argReg = "$a" + to_string(i);
+        int offset = currentOffset;
+        emit("sw " + argReg + ", " + to_string(offset) + "($fp)");
+        currentOffset -= 4;  // Move down for next parameter
+    }
+}
+
+void CodeGenerator::generateFuncEnd(const TACInstruction& instr) {
+    // Function epilogue - CORRECT ORDER WITH PROPER FRAME SIZE
+    emitLabel(instr.result + "_epilogue");
+    
+    // Use the same frame size as prologue
+    int frameSpace = currentFunctionFrameSize;
+    
+    // 1. Restore frame pointer and return address from TOP of frame
+    emit("lw $fp, " + to_string(frameSpace - 8) + "($sp)");  // Restore $fp
+    emit("lw $ra, " + to_string(frameSpace - 4) + "($sp)");  // Restore $ra
+    
+    // 2. Deallocate FULL stack frame
+    emit("addi $sp, $sp, " + to_string(frameSpace));
+    
+    // 3. Return
+    emit("jr $ra");
+    
+    inFunction = false;
+    emitBlankLine();
+}
+
+void CodeGenerator::generateParam(const TACInstruction& instr) {
+    // Queue parameter for function call
+    paramQueue.push_back(instr.result);
+}
+
+void CodeGenerator::generateCall(const TACInstruction& instr) {
+    // Pass parameters (up to 4 in registers, rest on stack)
+    int paramIdx = 0;
+    
+    for (const auto& param : paramQueue) {
+        if (paramIdx < 4) {
+            // Use $a0-$a3 for first 4 parameters
+            string argReg = "$a" + to_string(paramIdx);
+            loadOperand(param, argReg);
+        } else {
+            // Push to stack for parameters beyond 4
+            loadOperand(param, "$t0");
+            emit("sw $t0, " + to_string((paramIdx - 4) * 4) + "($sp)");
+        }
+        paramIdx++;
+    }
+    
+    // Call function
+    emit("jal " + instr.operand1);
+    
+    // Get return value
+    if (!instr.result.empty()) {
+        storeToVar(instr.result, "$v0");
+    }
+    
+    // Clear parameter queue
+    paramQueue.clear();
+}
+
+void CodeGenerator::generateReturn(const TACInstruction& instr) {
+    // Return value is in operand1, not result!
+    if (!instr.operand1.empty()) {
+        loadOperand(instr.operand1, "$v0");
+    }
+    emit("j " + currentFunction + "_epilogue");
+}
+
+//============================================================================
+// TYPE CONVERSION
+//============================================================================
+
+void CodeGenerator::generateCast(const TACInstruction& instr) {
+    // Simple cast: just copy value (more complex casts could be added)
+    loadOperand(instr.operand1, "$t0");
+    storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// OUTPUT
+//============================================================================
+
+void CodeGenerator::writeToFile(const string& filename) {
+    ofstream out(filename);
+    if (!out) {
+        cerr << "Error: Cannot open file " << filename << " for writing" << endl;
+        return;
+    }
+    
+    for (const auto& line : asmCode) {
+        out << line << endl;
+    }
+    
+    out.close();
+}
+
+void CodeGenerator::printAssembly(ostream& out) const {
+    for (const auto& line : asmCode) {
+        out << line << endl;
+    }
 }
