@@ -18,6 +18,10 @@ for file in testcases/*; do
     if [ -f output.3ac ]; then
         cp output.3ac "outputs/${name}.3ac"
     fi
+    # Save MIPS assembly per test if generated
+    if [ -f output.s ]; then
+        cp output.s "outputs/${name}.s"
+    fi
     echo
 done
 
