@@ -49,6 +49,15 @@ private:
     // String literals
     int stringCounter;
     std::map<std::string, std::string> stringLabels;  // content -> label
+    std::map<std::string, std::string> varToStringLiteral;  // variable -> actual string content
+    std::vector<std::string> dynamicDataSection;  // Strings generated during code generation (e.g., printf split strings)
+    
+    // Float constants
+    int floatCounter;
+    std::map<std::string, std::string> floatLabels;  // value -> label
+    
+    // Type tracking
+    std::map<std::string, std::string> varTypes;  // variable -> type ("int" or "float")
     
     // Function context
     std::string currentFunction;
@@ -72,7 +81,9 @@ private:
     bool isImmediate(const std::string& operand);
     bool isTemp(const std::string& operand);
     bool isVariable(const std::string& operand);
+    bool isFloatLiteral(const std::string& operand);
     int getImmediate(const std::string& operand);
+    std::string getOrCreateFloatLabel(const std::string& value);
     
     // Arithmetic operations
     void generateAdd(const TACInstruction& instr);
