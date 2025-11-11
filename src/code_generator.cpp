@@ -9,7 +9,7 @@ using namespace std;
 
 CodeGenerator::CodeGenerator(const vector<TACInstruction>& instructions, SymbolTable* symTab)
     : tacInstructions(instructions), symbolTable(symTab), 
-      frameSize(0), currentOffset(0), stringCounter(0), 
+      frameSize(0), currentOffset(0), stringCounter(0), floatCounter(0),
       functionParamCount(0), currentFunctionFrameSize(0), inFunction(false), labelCounter(0) {
     registers.init();
 }
@@ -143,6 +143,22 @@ bool CodeGenerator::isImmediate(const string& operand) {
     return false;
 }
 
+bool CodeGenerator::isFloatLiteral(const string& operand) {
+    if (operand.empty()) return false;
+    // Check if it contains a decimal point
+    return operand.find('.') != string::npos;
+}
+
+string CodeGenerator::getOrCreateFloatLabel(const string& value) {
+    if (floatLabels.find(value) != floatLabels.end()) {
+        return floatLabels[value];
+    }
+    string label = "_fconst" + to_string(floatCounter++);
+    floatLabels[value] = label;
+    dataSection.push_back(label + ": .float " + value);
+    return label;
+}
+
 bool CodeGenerator::isTemp(const string& operand) {
     return operand.size() > 0 && operand[0] == 't' && isdigit(operand[1]);
 }
@@ -237,7 +253,16 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
 //============================================================================
 
 void CodeGenerator::loadOperand(const string& operand, const string& targetReg) {
-    if (isImmediate(operand)) {
+    if (isFloatLiteral(operand)) {
+        // Float literal - create a label in .data and load address
+        // Note: For proper float handling, this should use l.s into FPU register
+        // For now, we store the bits as integer (TEMPORARY WORKAROUND)
+        emitComment("WARNING: Float literal " + operand + " treated as integer bits");
+        string label = getOrCreateFloatLabel(operand);
+        emit("la $t9, " + label);
+        emit("lw " + targetReg + ", 0($t9)");
+    }
+    else if (isImmediate(operand)) {
         emit("li " + targetReg + ", " + operand);
     }
     else if (registers.isAllocated(operand)) {
@@ -274,14 +299,35 @@ void CodeGenerator::storeToVar(const string& var, const string& sourceReg) {
 void CodeGenerator::generate() {
     asmCode.clear();
     dataSection.clear();
+    dynamicDataSection.clear();
     
-    emitComment("Generated MIPS Assembly");
-    emitComment("Compiler: Custom C Compiler");
-    emitBlankLine();
+    // Don't indent initial comments - Venus compatibility
+    asmCode.push_back("# Generated MIPS Assembly");
+    asmCode.push_back("# Compiler: Custom C Compiler");
+    asmCode.push_back("");
     
     generateDataSection();
     emitBlankLine();
     generateTextSection();
+    
+    // Insert dynamic data section (printf strings) before .text
+    if (!dynamicDataSection.empty()) {
+        // Find the .text line
+        auto it = asmCode.begin();
+        for (; it != asmCode.end(); ++it) {
+            if (it->find(".text") != string::npos) {
+                break;
+            }
+        }
+        
+        // Insert dynamic data before .text
+        if (it != asmCode.end()) {
+            for (const auto& line : dynamicDataSection) {
+                it = asmCode.insert(it, "    " + line);
+                ++it;  // Move past inserted element
+            }
+        }
+    }
 }
 
 void CodeGenerator::generateDataSection() {
@@ -293,11 +339,16 @@ void CodeGenerator::generateDataSection() {
     dataSection.push_back("_str_fmt: .asciiz \"%s\"");
     dataSection.push_back("_char_fmt: .asciiz \"%c\"");
     
-    // Collect string literals from TAC (first pass)
+    // Collect string and float literals from TAC (first pass)
     for (const auto& instr : tacInstructions) {
-        if (instr.opcode == TACOp::CONST && 
-            !instr.operand1.empty() && instr.operand1[0] == '"') {
-            getStringLabel(instr.operand1);
+        if (instr.opcode == TACOp::CONST && !instr.operand1.empty()) {
+            if (instr.operand1[0] == '"') {
+                // String literal
+                getStringLabel(instr.operand1);
+            } else if (isFloatLiteral(instr.operand1)) {
+                // Float literal
+                getOrCreateFloatLabel(instr.operand1);
+            }
         }
     }
     
@@ -433,8 +484,17 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                 // String constant - load address
                 string label = getStringLabel(instr.operand1);
                 emit("la $t0, " + label);
+                // Track which variable holds this string literal (strip quotes)
+                string strContent = instr.operand1.substr(1, instr.operand1.length() - 2);
+                varToStringLiteral[instr.result] = strContent;
+            } else if (isFloatLiteral(instr.operand1)) {
+                // Float constant - must load from .data section
+                emitComment("WARNING: Float " + instr.operand1 + " loaded as integer bits (proper FPU support needed)");
+                string label = getOrCreateFloatLabel(instr.operand1);
+                emit("la $t0, " + label);
+                emit("lw $t0, 0($t0)");  // Load the float bits as int
             } else {
-                // Numeric constant
+                // Integer constant
                 emit("li $t0, " + instr.operand1);
             }
             storeToVar(instr.result, "$t0");
@@ -442,7 +502,8 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
         
         case TACOp::GET_PARAM:
             // result = param[index]
-            // Parameters saved in prologue at: 0($fp), -4($fp), -8($fp), -12($fp)
+            // Parameters 0-3: in $a0-$a3
+            // Parameters 4+: on stack at 16($fp), 20($fp), 24($fp), ...
             {
                 int paramIdx = 0;
                 if (!instr.operand1.empty()) {
@@ -450,15 +511,13 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                 }
                 
                 if (paramIdx < 4) {
-                    // Parameter was in register, saved to stack in prologue
-                    int offset = -(paramIdx * 4);  // 0, -4, -8, -12 for params 0-3
-                    emit("lw $t0, " + to_string(offset) + "($fp)");
+                    // Parameter is in register $a0-$a3
+                    string argReg = "$a" + to_string(paramIdx);
+                    emit("move $t0, " + argReg);
                 } else {
                     // Parameter on stack (beyond first 4)
-                    // These are above the frame: at frameSpace + offset
-                    int paramSaveSpace = 4 * 4;  // Space for first 4 params
-                    int frameSpace = 8 + paramSaveSpace;
-                    int offset = frameSpace + ((paramIdx - 4) * 4);
+                    // Stack args start at 16($fp): above saved $ra and $fp
+                    int offset = 16 + ((paramIdx - 4) * 4);
                     emit("lw $t0, " + to_string(offset) + "($fp)");
                 }
                 storeToVar(instr.result, "$t0");
@@ -832,14 +891,10 @@ void CodeGenerator::generateFuncBegin(const TACInstruction& instr) {
     // 3. Set new frame pointer
     emit("move $fp, $sp");
     
-    // 4. Save parameter registers to stack (for first 4 parameters)
-    currentOffset = 0;  // Start at $fp
-    for (int i = 0; i < functionParamCount && i < 4; i++) {
-        string argReg = "$a" + to_string(i);
-        int offset = currentOffset;
-        emit("sw " + argReg + ", " + to_string(offset) + "($fp)");
-        currentOffset -= 4;  // Move down for next parameter
-    }
+    // NOTE: We do NOT save $a0-$a3 here automatically.
+    // They will be accessed directly when needed via GET_PARAM.
+    // Stack parameters (5+) are already on stack at 16($fp), 20($fp), etc.
+    currentOffset = -16;  // Start after $ra and $fp
 }
 
 void CodeGenerator::generateFuncEnd(const TACInstruction& instr) {
@@ -865,30 +920,138 @@ void CodeGenerator::generateFuncEnd(const TACInstruction& instr) {
 
 void CodeGenerator::generateParam(const TACInstruction& instr) {
     // Queue parameter for function call
-    paramQueue.push_back(instr.result);
+    // Parameter value is in operand1, not result!
+    paramQueue.push_back(instr.operand1);
 }
 
 void CodeGenerator::generateCall(const TACInstruction& instr) {
-    // Pass parameters (up to 4 in registers, rest on stack)
-    int paramIdx = 0;
-    
-    for (const auto& param : paramQueue) {
-        if (paramIdx < 4) {
-            // Use $a0-$a3 for first 4 parameters
-            string argReg = "$a" + to_string(paramIdx);
-            loadOperand(param, argReg);
-        } else {
-            // Push to stack for parameters beyond 4
-            loadOperand(param, "$t0");
-            emit("sw $t0, " + to_string((paramIdx - 4) * 4) + "($sp)");
+    // Special handling for printf - convert to SPIM syscalls
+    if (instr.operand1 == "printf") {
+        if (paramQueue.size() >= 2) {
+            // Parse the format string at compile time
+            string formatParam = paramQueue[0];
+            
+            // Extract the actual string literal if it's a string constant
+            string formatStr = "";
+            if (varToStringLiteral.find(formatParam) != varToStringLiteral.end()) {
+                formatStr = varToStringLiteral[formatParam];
+            }
+            
+            // Parse format string and emit appropriate syscalls
+            if (!formatStr.empty()) {
+                size_t pos = 0;
+                int argIndex = 1; // Start from paramQueue[1]
+                
+                while (pos < formatStr.length()) {
+                    // Find next format specifier
+                    size_t specPos = formatStr.find('%', pos);
+                    
+                    if (specPos == string::npos) {
+                        // No more format specifiers - print remaining text
+                        string remaining = formatStr.substr(pos);
+                        if (!remaining.empty()) {
+                            string label = "_str_" + to_string(labelCounter++);
+                            dynamicDataSection.push_back(label + ": .asciiz \"" + remaining + "\"");
+                            emit("la $a0, " + label);
+                            emit("li $v0, 4");       // print_string
+                            emit("syscall");
+                        }
+                        break;
+                    }
+                    
+                    // Print text before %
+                    if (specPos > pos) {
+                        string before = formatStr.substr(pos, specPos - pos);
+                        string label = "_str_" + to_string(labelCounter++);
+                        dynamicDataSection.push_back(label + ": .asciiz \"" + before + "\"");
+                        emit("la $a0, " + label);
+                        emit("li $v0, 4");       // print_string
+                        emit("syscall");
+                    }
+                    
+                    // Handle format specifier
+                    if (specPos + 1 < formatStr.length()) {
+                        char spec = formatStr[specPos + 1];
+                        if (spec == 'd' && argIndex < paramQueue.size()) {
+                            // Print integer
+                            loadOperand(paramQueue[argIndex], "$a0");
+                            emit("li $v0, 1");       // print_int
+                            emit("syscall");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else if (spec == '%') {
+                            // Literal % - print it
+                            string label = "_str_" + to_string(labelCounter++);
+                            dynamicDataSection.push_back(label + ": .asciiz \"%\"");
+                            emit("la $a0, " + label);
+                            emit("li $v0, 4");       // print_string
+                            emit("syscall");
+                            pos = specPos + 2;
+                        } else {
+                            // Unknown format specifier - skip it
+                            pos = specPos + 2;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // Fallback: just print integer and newline
+                loadOperand(paramQueue[1], "$a0");
+                emit("li $v0, 1");       // print_int
+                emit("syscall");
+                emit("la $a0, _newline");
+                emit("li $v0, 4");       // print_string
+                emit("syscall");
+            }
+        } else if (paramQueue.size() == 1) {
+            // Just format string, no arguments - print it
+            loadOperand(paramQueue[0], "$a0");
+            emit("li $v0, 4");       // print_string syscall
+            emit("syscall");
         }
-        paramIdx++;
+        
+        paramQueue.clear();
+        return;
     }
     
-    // Call function
+    // MIPS calling convention for other functions:
+    // First 4 params in $a0-$a3
+    // Remaining params on stack ABOVE the return address
+    
+    int numParams = paramQueue.size();
+    int stackParams = (numParams > 4) ? (numParams - 4) : 0;
+    
+    // 1. Reserve space for stack parameters (if any)
+    if (stackParams > 0) {
+        int stackSpace = stackParams * 4;
+        emit("addi $sp, $sp, -" + to_string(stackSpace));
+    }
+    
+    // 2. Pass parameters
+    for (int i = 0; i < numParams; i++) {
+        if (i < 4) {
+            // Use $a0-$a3 for first 4 parameters
+            string argReg = "$a" + to_string(i);
+            loadOperand(paramQueue[i], argReg);
+        } else {
+            // Push to stack for parameters beyond 4
+            loadOperand(paramQueue[i], "$t0");
+            int offset = (i - 4) * 4;
+            emit("sw $t0, " + to_string(offset) + "($sp)");
+        }
+    }
+    
+    // 3. Call function
     emit("jal " + instr.operand1);
     
-    // Get return value
+    // 4. Clean up stack parameters (if any)
+    if (stackParams > 0) {
+        int stackSpace = stackParams * 4;
+        emit("addi $sp, $sp, " + to_string(stackSpace));
+    }
+    
+    // 5. Get return value
     if (!instr.result.empty()) {
         storeToVar(instr.result, "$v0");
     }
