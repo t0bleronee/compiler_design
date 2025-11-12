@@ -396,16 +396,19 @@ static std::vector<unsigned char> decodeCString(const std::string& rawWithQuotes
 // Produce a unique IR name for an identifier using its bound Symbol
 std::string IRGenerator::getUniqueNameFor(Node* idNode, const std::string& fallback) {
     if (!idNode) return fallback;
-    if (idNode->symbol) {
-        // First check function-local name map (for parameters that might have multiple Symbol* instances)
-        std::string base = idNode->lexeme.empty() ? fallback : idNode->lexeme;
-        if (!currentFunction.empty()) {
-            auto localIt = functionLocalNames.find(base);
-            if (localIt != functionLocalNames.end()) {
-                return localIt->second;
-            }
+    
+    std::string base = idNode->lexeme.empty() ? fallback : idNode->lexeme;
+    
+    // CRITICAL FIX: Check function-local name map FIRST (before Symbol* lookup)
+    // This ensures parameters are found correctly even if Symbol* differs
+    if (!currentFunction.empty()) {
+        auto localIt = functionLocalNames.find(base);
+        if (localIt != functionLocalNames.end()) {
+            return localIt->second;
         }
-        
+    }
+    
+    if (idNode->symbol) {
         // Then check symbol-based map
         auto it = symbolUniqueNames.find(idNode->symbol);
         if (it != symbolUniqueNames.end()) {
@@ -1775,7 +1778,7 @@ void IRGenerator::generateDeclaration(Node* node) {
                                 // If the array's element type is a pointer (e.g., char* arr[]),
                                 // each element is pointer-sized.
                                 if (idNode->symbol->pointerDepth > 0) {
-                                    elemSize = 8;
+                                    elemSize = 4;
                                 } else {
                                     elemSize = getBaseTypeSize(idNode->symbol->type);
                                 }
@@ -2378,6 +2381,8 @@ void IRGenerator::generateParameterHandling(Node* paramList) {
                         auto it = symbolUniqueNames.find(paramSym);
                         if (it != symbolUniqueNames.end()) {
                             targetName = it->second;
+                            // CRITICAL FIX: Even if reusing, add to functionLocalNames!
+                            functionLocalNames[paramName] = targetName;
                         } else {
                             // Create unique name for this parameter
                             targetName = paramName + "#" + to_string(++symbolNameCounter);
@@ -2472,14 +2477,32 @@ void IRGenerator::generateParameterHandling(Node* paramList) {
 string IRGenerator::findParameterName(Node* paramDecl) {
     if (!paramDecl) return "";
     
+    // FIXED: Enhanced parameter name extraction for array and pointer declarators
     // Look for declarator in parameter declaration
     for (auto child : paramDecl->children) {
-        if (child->name == "DECLARATOR" || child->name == "IDENTIFIER") {
-            return getDeclaratorName(child);
+        if (child->name == "DECLARATOR") {
+            string name = getDeclaratorName(child);
+            if (!name.empty()) return name;
+        }
+        // Also check direct IDENTIFIER (for simple parameters)
+        if (child->name == "IDENTIFIER") {
+            return child->lexeme;
         }
     }
     
-    return "";
+    // FIXED: If not found yet, search recursively for IDENTIFIER in the entire subtree
+    // This handles complex declarators like array parameters: int arr[]
+    std::function<string(Node*)> findIdentifierRecursive = [&](Node* n) -> string {
+        if (!n) return "";
+        if (n->name == "IDENTIFIER") return n->lexeme;
+        for (auto c : n->children) {
+            string result = findIdentifierRecursive(c);
+            if (!result.empty()) return result;
+        }
+        return "";
+    };
+    
+    return findIdentifierRecursive(paramDecl);
 }
 void IRGenerator::generateIfStatement(Node* node) {
     if (!node) return;
@@ -3526,7 +3549,8 @@ else {
         Symbol* sym = baseExpr->symbol;
         if (sym->isArray) {
             // Array variable: element size depends on element type
-            elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+            // For array of pointers, elements are pointer-sized (4 bytes on MIPS32)
+            elemSize = (sym->pointerDepth > 0) ? 4 : getBaseTypeSize(sym->type);
         } else if (sym->pointerDepth > 0) {
             // Pointer variable: element size is the pointed-to base type
             elemSize = getBaseTypeSize(sym->type);
@@ -3543,9 +3567,9 @@ else {
             Node* left = baseExpr->children[0];
             Node* right = (baseExpr->children.size() >= 2) ? baseExpr->children[1] : nullptr;
             if (left && left->name == "IDENTIFIER" && left->symbol && left->symbol->isArray && left->symbol->pointerDepth > 0) {
-                elemSize = 8;
+                elemSize = 4;
             } else if (right && right->name == "IDENTIFIER" && right->symbol && right->symbol->isArray && right->symbol->pointerDepth > 0) {
-                elemSize = 8;
+                elemSize = 4;
             }
         }
     }
@@ -3639,7 +3663,16 @@ string indexTemp = generateExpression(actualIndexExpr);
 if (baseExpr->name == "IDENTIFIER") {
     Symbol* sym = baseExpr->symbol;
     string baseName = getUniqueNameFor(baseExpr, baseExpr->lexeme);
-    if (sym && sym->isArray) {
+    // ✅ FIX: Decayed array parameters (e.g., int a[3][3] -> int(*)[3])
+    // have both isArray=true, pointerDepth>0, AND isReference=true.
+    // They should use the value, not address.
+    // Local array-of-pointers (e.g., int* ptrs[3]) has isArray=true, pointerDepth>0,
+    // but isReference=false, so it should use ADDRESS.
+    if (sym && sym->isArray && sym->pointerDepth > 0 && sym->isReference) {
+        // Decayed array parameter: already a pointer, use its value
+        instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
+        if (kIrDebug) cout << "DEBUG: Array access on decayed array parameter, using pointer value" << endl;
+    } else if (sym && sym->isArray) {
         if (sym->isReference) {
             // Reference to array: variable already holds base address
             instructions.emplace_back(TACOp::ASSIGN, baseAddr, baseName);
@@ -3693,7 +3726,15 @@ else {
                 }
                 elemSize = innerSize;
             } else {
-                elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+                // Single dimension array
+                // Check if elements are pointers (array of pointers)
+                if (sym->pointerDepth > 0) {
+                    // Array of pointers: elements are pointer-sized (4 bytes on MIPS32)
+                    elemSize = 4;
+                } else {
+                    // Regular array: element is base type size
+                    elemSize = getBaseTypeSize(sym->type);
+                }
             }
         } else if (sym->pointerDepth > 0) {
             elemSize = getBaseTypeSize(sym->type);
@@ -3703,15 +3744,6 @@ else {
     } else {
         // Non-identifier base expression: use pointed-to size
         elemSize = getPointedToSize(baseExpr);
-        if ((baseExpr->name == "ADD_EXPR" || baseExpr->name == "SUB_EXPR") && baseExpr->children.size() >= 1) {
-            Node* left = baseExpr->children[0];
-            Node* right = (baseExpr->children.size() >= 2) ? baseExpr->children[1] : nullptr;
-            if (left && left->name == "IDENTIFIER" && left->symbol && left->symbol->isArray && left->symbol->pointerDepth > 0) {
-                elemSize = 8;
-            } else if (right && right->name == "IDENTIFIER" && right->symbol && right->symbol->isArray && right->symbol->pointerDepth > 0) {
-                elemSize = 8;
-            }
-        }
     }
     
     string elemSizeTemp = createTemp();
@@ -3989,14 +4021,14 @@ string IRGenerator::generateSizeof(Node* node) {
                 if (sym) {
                     if (sym->isArray && !sym->arrayDimensions.empty()) {
                         // Compute total array size: product(dims) * sizeof(element)
-                        int elem = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+                        int elem = (sym->pointerDepth > 0) ? 4 : getBaseTypeSize(sym->type);  // FIXED: MIPS32 pointer size
                         long long total = elem;
                         for (int dim : sym->arrayDimensions) {
                             if (dim > 0) total *= dim;
                         }
                         size = static_cast<int>(total);
                     } else if (sym->pointerDepth > 0) {
-                        size = 8;
+                        size = 4;  // FIXED: MIPS32 pointer size
                     } else {
                         size = getBaseTypeSize(sym->type);
                     }
@@ -4016,10 +4048,10 @@ int IRGenerator::getSizeofType(Node* typeNode) {
     
     string typeName = "";
     int pointerDepth = 0;
-    // If there's an explicit pointer, sizeof(type*) is pointer size
+    // If there's an explicit pointer, sizeof(type*) is pointer size (MIPS32 = 4 bytes)
     for (auto child : typeNode->children) {
         if (child->name == "POINTER") {
-            return 8;
+            return 4;  // FIXED: MIPS32 pointer size
         }
     }
     
@@ -4055,7 +4087,7 @@ int IRGenerator::getSizeofType(Node* typeNode) {
     }
     
     // Any pointer is 8 bytes
-    if (pointerDepth > 0) return 8;
+    if (pointerDepth > 0) return 4;
     
     // Base type sizes
     if (typeName == "char") return 1;
@@ -4084,7 +4116,7 @@ int IRGenerator::getSizeofType(Node* typeNode) {
             // Possibly a typedef or tag name without prefix
             if (Symbol* tSym = symbolTable.lookuph(base)) {
                 if (tSym->isTypedef) {
-                    if (tSym->pointerDepth > 0) return 8;
+                    if (tSym->pointerDepth > 0) return 4;
                     string aliased = tSym->aliasedType.empty() ? tSym->type : tSym->aliasedType;
                     return getBaseTypeSize(aliased);
                 }
@@ -4154,7 +4186,7 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
                 
                 // Check if member is a pointer
                 if (memberType.find("*") != string::npos) {
-                    return 8;
+                    return 4;  // MIPS32 pointer size
                 }
                 
                 // Return member's base type size
@@ -4193,7 +4225,7 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
                 // Base is not an array; treat as pointer indexing
                 // sizeof(*(ptr + ...)) semantics: size of pointed-to type
                 int pDepth = sym->pointerDepth;
-                if (pDepth > 1) return 8; // still pointer after deref(s)
+                if (pDepth > 1) return 4; // still pointer after deref(s)
                 if (pDepth == 1) return getBaseTypeSize(sym->type);
                 return getBaseTypeSize(sym->type);
             }
@@ -4211,7 +4243,7 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
                 return (int)size;
             } else if (levels == (int)dims.size()) {
                 // Exactly at the array element
-                if (elemPtrDepth > 0) return 8; // element is a pointer object
+                if (elemPtrDepth > 0) return 4; // element is a pointer object
                 return elemBaseSize;
             } else {
                 // Indexed beyond array dims: indexing into the pointer element
@@ -4243,7 +4275,7 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
                         return getBaseTypeSize(sym->type);
                     } else {
                         // Still a pointer
-                        return 8;
+                        return 4;  // MIPS32 pointer size
                     }
                 }
             } else if (operand->name == "UNARY_OP" && operand->children.size() >= 2) {
@@ -4261,8 +4293,8 @@ int IRGenerator::getSizeofExpression(Node* exprNode) {
             }
         }
          else if (opStr == "&") {
-        // Address-of operator - always returns pointer (8 bytes)
-        return 8;
+        // Address-of operator - always returns pointer (4 bytes on MIPS32)
+        return 4;
     }
     else if (opStr == "+" || opStr == "-") {
         // Unary +/- preserves the type
@@ -4334,10 +4366,10 @@ if (exprNode->name == "POST_INC" || exprNode->name == "POST_DEC" ||
                 return totalSize;
             }
             
-            // If it's a pointer, return 8
+            // If it's a pointer, return 4 (MIPS32 pointer size)
             if (sym->pointerDepth > 0) {
-                cout << "DEBUG sizeof: Returning pointer size 8" << endl;
-                return 8;
+                cout << "DEBUG sizeof: Returning pointer size 4" << endl;
+                return 4;
             }
             // In getSizeofExpression, after checking sym->type:
 if (sym->isStruct || sym->isUnion) {
@@ -4438,8 +4470,8 @@ if (exprNode->name == "BIT_AND" || exprNode->name == "BIT_OR" ||
 }
 
 int IRGenerator::getBaseTypeSize(const string& typeName) {
-    // Fast-path for obvious pointer spellings
-    if (typeName.find("*") != string::npos) return 8;
+    // Fast-path for obvious pointer spellings (MIPS32 = 4 bytes)
+    if (typeName.find("*") != string::npos) return 4;  // FIXED: MIPS32 pointer size
 
     // Arrays encoded in type string, e.g., "int[10]" or "struct B[2][3]"
     auto lb = typeName.find('[');
@@ -4498,7 +4530,7 @@ int IRGenerator::getBaseTypeSize(const string& typeName) {
             // Typedef to something
             if (tSym->isTypedef) {
                 // Pointer typedef
-                if (tSym->pointerDepth > 0) return 8;
+                if (tSym->pointerDepth > 0) return 4;
                 // Recurse into aliased type (could itself be struct/union or another typedef)
                 if (!tSym->aliasedType.empty()) {
                     return getBaseTypeSize(tSym->aliasedType);
@@ -4760,7 +4792,7 @@ int IRGenerator::getMemberAlignment(const string& typeName) {
     static const bool kIrDebug = false;
     if (kIrDebug) cout << "DEBUG align: type='" << typeName << "'" << endl;
     // Pointers align to 8 (spellings with * or typedef pointers)
-    if (typeName.find("*") != string::npos) return 8;
+    if (typeName.find("*") != string::npos) return 4;
     // Arrays: alignment is alignment of element type
     auto lb = typeName.find('[');
     if (lb != string::npos) {
@@ -4788,7 +4820,7 @@ int IRGenerator::getMemberAlignment(const string& typeName) {
     Symbol* typeSym = symbolTable.lookuph(baseType);
     // If it's a typedef, resolve to underlying aliased type/tag
     if (typeSym && typeSym->isTypedef) {
-        if (typeSym->pointerDepth > 0) return 8;
+        if (typeSym->pointerDepth > 0) return 4;
         baseType = typeSym->aliasedType.empty() ? typeSym->type : typeSym->aliasedType;
         if (baseType.rfind("struct ", 0) == 0) baseType = baseType.substr(7);
         else if (baseType.rfind("union ", 0) == 0) baseType = baseType.substr(6);
@@ -4897,12 +4929,23 @@ string IRGenerator::generateMultiDimArrayAddress(Node* arrayNode) {
     } else if (arrayBase->name == "IDENTIFIER") {
         // Base case: get address of the array variable
         string arrayName = arrayBase->lexeme;
-        // If the identifier is a reference-to-array parameter, it already holds the base address.
-        if (arrayBase->symbol && arrayBase->symbol->isReference) {
+        Symbol* sym = arrayBase->symbol;
+        
+        // ✅ FIX: Decayed array parameters have both isArray=true and pointerDepth>0
+        // They are already pointers, so use their value, not address
+        if (sym && sym->isArray && sym->pointerDepth > 0 && sym->isReference) {
+            // Decayed array parameter: use the pointer value directly
             baseAddr = getUniqueNameFor(arrayBase, arrayName);
+            if (kIrDebug) cout << "DEBUG: Multidim access on decayed array parameter, using pointer value" << endl;
+        } else if (sym && sym->isReference) {
+            // Reference-to-array parameter: already holds the base address
+            baseAddr = getUniqueNameFor(arrayBase, arrayName);
+            if (kIrDebug) cout << "DEBUG: Multidim access on reference array, using address value" << endl;
         } else {
+            // Regular array variable: take its address
             baseAddr = createTemp();
             instructions.emplace_back(TACOp::ADDRESS, baseAddr, arrayName);
+            if (kIrDebug) cout << "DEBUG: Multidim access on regular array, taking ADDRESS" << endl;
         }
     } else {
         return "";
@@ -4966,8 +5009,20 @@ int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
     if (!sym || !sym->isArray) return 4;
     
     vector<int> dimensions = sym->arrayDimensions;
-    // Base element size: if element type is a pointer, each element is pointer-sized
-    int elemSize = (sym->pointerDepth > 0) ? 8 : getBaseTypeSize(sym->type);
+    // ✅ FIX: For decayed array parameters (isArray=true, pointerDepth>0),
+    // the pointerDepth refers to the pointer-to-array itself, NOT the element type.
+    // Example: int a[3][3] decays to int(*)[3] with pointerDepth=1, arrayDims=[3]
+    // The element is still int (4 bytes), not a pointer.
+    int elemSize;
+    if (sym->isArray && sym->pointerDepth > 0) {
+        // Decayed array parameter: element type is still the base type
+        elemSize = getBaseTypeSize(sym->type);
+    } else if (sym->pointerDepth > 0) {
+        // True pointer array: elements are pointers (4 bytes on MIPS32)
+        elemSize = 4;
+    } else {
+        elemSize = getBaseTypeSize(sym->type);
+    }
     
     if (kIrDebug) {
         cout << "DEBUG: Array " << base->lexeme << " has " << dimensions.size() << " dimensions: ";
@@ -4975,16 +5030,24 @@ int IRGenerator::getSubArraySizeForDimension(Node* arrayNode, int dimIndex) {
         cout << endl;
         cout << "DEBUG: Base element size = " << elemSize << endl;
         cout << "DEBUG: Indexing dimension " << dimIndex << endl;
+        cout << "DEBUG: Is decayed parameter: " << (sym->pointerDepth > 0 ? "yes" : "no") << endl;
     }
     
-    // For dimension dimIndex, we need to multiply by all dimensions AFTER dimIndex
-    // For arr[3][4]:
-    //   - dimIndex 0: multiply by dimensions[1] = 4 → size = 4 × 4 = 16
-    //   - dimIndex 1: multiply by nothing → size = 4
+    // ✅ FIX: For decayed array parameters (e.g., int a[3][3] -> int(*)[3]),
+    // arrayDims=[3] represents the INNER dimensions that should be multiplied
+    // For the FIRST access (dimIndex=0), we should multiply by ALL remaining dims
+    // For a regular array int arr[3][4]:
+    //   - dimIndex 0: multiply by dimensions[1..end] = [4] → size = 4 * 4 = 16
+    //   - dimIndex 1: multiply by dimensions[2..end] = [] → size = 4
+    // For a decayed parameter int(*)[3] with arrayDims=[3]:
+    //   - dimIndex 0: multiply by dimensions[0..end] = [3] → size = 4 * 3 = 12
+    //   - dimIndex 1: multiply by dimensions[1..end] = [] → size = 4
     
     int subArraySize = elemSize;
-    for (size_t i = dimIndex + 1; i < dimensions.size(); i++) {
-    if (kIrDebug) cout << "DEBUG: Multiplying by dimensions[" << i << "] = " << dimensions[i] << endl;
+    size_t startDim = (sym->pointerDepth > 0 && sym->isArray) ? dimIndex : (dimIndex + 1);
+    
+    for (size_t i = startDim; i < dimensions.size(); i++) {
+        if (kIrDebug) cout << "DEBUG: Multiplying by dimensions[" << i << "] = " << dimensions[i] << endl;
         subArraySize *= dimensions[i];
     }
     
@@ -5096,7 +5159,7 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                 string elemTypeStr = sym->type;
                 // If indexing exactly to the element and the element is a pointer, return size of what it points to
                 if (levels == (int)dims.size()) {
-                    if (elemPtrDepth > 1) return 8; // still pointer after one deref
+                    if (elemPtrDepth > 1) return 4; // still pointer after one deref
                     if (elemPtrDepth == 1) {
                         // Compute base type by stripping one '*'
                         string baseType = elemTypeStr;
@@ -5123,7 +5186,7 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                 // If still within array (subarray result), the decay-to-pointer would point to its element
                 // In that case, the pointed-to size is the size of one element of that subarray
                 // which is either pointer-sized (if element is pointer) or the base element size.
-                if (elemPtrDepth > 0) return 8; // subarray of pointers
+                if (elemPtrDepth > 0) return 4; // subarray of pointers
                 return getBaseTypeSize(elemTypeStr);
             }
         }
@@ -5139,8 +5202,8 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
             // Arrays: element size; arrays-of-pointers are pointer-sized
             if (sym->isArray) {
                 if (sym->pointerDepth > 0) {
-                    cout << "DEBUG: Array of pointers, returning 8" << endl;
-                    return 8;
+                    cout << "DEBUG: Array of pointers, returning 4 (MIPS32)" << endl;
+                    return 4;
                 }
                 // If multi-dimensional array, the element is the subarray of remaining dims
                 int elemSize = getBaseTypeSize(sym->type);
@@ -5162,16 +5225,16 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                 }
                 // For multi-level pointers, pointer arithmetic on the outer pointer uses pointer size
                 if (sym->pointerDepth > 1) {
-                    cout << "DEBUG: Multi-level pointer to array, returning pointer size 8" << endl;
-                    return 8;
+                    cout << "DEBUG: Multi-level pointer to array, returning pointer size 4 (MIPS32)" << endl;
+                    return 4;
                 }
                 cout << "DEBUG: Pointer-to-array element size (full aggregate) = " << agg << endl;
                 return static_cast<int>(agg);
             }
-            // Pointers: if depth > 1, still a pointer (8); if depth == 1, base type size
+            // Pointers: if depth > 1, still a pointer (4); if depth == 1, base type size
             if (sym->pointerDepth > 1) {
-                cout << "DEBUG: Multi-level pointer, returning 8" << endl;
-                return 8;
+                cout << "DEBUG: Multi-level pointer, returning 4 (MIPS32)" << endl;
+                return 4;
             } else if (sym->pointerDepth == 1) {
                 int size = getBaseTypeSize(sym->type);
                 cout << "DEBUG: Single-level pointer, base type size = " << size << endl;
@@ -5233,10 +5296,10 @@ int IRGenerator::getPointedToSize(Node* ptrNode) {
                     // int* -> int (base type, size 4)
                     if (sym->pointerDepth > 2) {
                         cout << "DEBUG: After deref, still multi-level pointer, returning 8" << endl;
-                        return 8;  // Still a pointer
+                        return 4;  // Still a pointer
                     } else if (sym->pointerDepth == 2) {
                         cout << "DEBUG: After deref, becomes single pointer, returning 8" << endl;
-                        return 8;  // Becomes int* which is still a pointer
+                        return 4;  // Becomes int* which is still a pointer
                     } else if (sym->pointerDepth == 1) {
                         int size = getBaseTypeSize(sym->type);
                         cout << "DEBUG: After deref, becomes base type, returning " << size << endl;
@@ -5396,9 +5459,9 @@ else {
             Node* left = baseExpr->children[0];
             Node* right = (baseExpr->children.size() >= 2) ? baseExpr->children[1] : nullptr;
             if (left && left->name == "IDENTIFIER" && left->symbol && left->symbol->isArray && left->symbol->pointerDepth > 0) {
-                elemSize = 8;
+                elemSize = 4;
             } else if (right && right->name == "IDENTIFIER" && right->symbol && right->symbol->isArray && right->symbol->pointerDepth > 0) {
-                elemSize = 8;
+                elemSize = 4;
             }
         }
     }
@@ -5770,7 +5833,8 @@ string IRGenerator::normalizeTypeName(const string& typeName) {
 }
 
 // Convert constant value from one type to another
-string IRGenerator::convertConstantValue(const string& value, const string& fromType, const string& toType) {
+// FIX: fromType parameter removed as it was unused
+string IRGenerator::convertConstantValue(const string& value, const string& /*fromType*/, const string& toType) {
     if (toType == "int" || toType == "unsigned int") {
         if (value == "false") return "0";
         if (value == "true") return "1";
@@ -6087,4 +6151,3 @@ string IRGenerator::extractTypeFromSpecQualList(Node* typeNode) {
     
     return typeName;
 }
-
