@@ -7,11 +7,19 @@
 
 using namespace std;
 
-CodeGenerator::CodeGenerator(const vector<TACInstruction>& instructions, SymbolTable* symTab)
+CodeGenerator::CodeGenerator(const vector<TACInstruction>& instructions, SymbolTable* symTab,
+                             const map<string, string>& strLiterals)
     : tacInstructions(instructions), symbolTable(symTab), 
       frameSize(0), currentOffset(0), stringCounter(0), floatCounter(0),
       functionParamCount(0), currentFunctionFrameSize(0), inFunction(false), labelCounter(0) {
     registers.init();
+    floatRegisters.init();  // ADDED: Initialize float register pool
+    
+    // FIXED: Import string literals from IR generator
+    // These are labels like "str1" -> "\"Hello\""
+    for (const auto& [label, content] : strLiterals) {
+        dataSection.push_back(label + ": .asciiz " + content);
+    }
 }
 
 //============================================================================
@@ -98,6 +106,91 @@ string CodeGenerator::RegisterPool::getReg(const string& var) {
 }
 
 //============================================================================
+// Float Register Pool Implementation
+//============================================================================
+
+void CodeGenerator::FloatRegisterPool::init() {
+    // Even-numbered float registers for single precision
+    // $f0-$f18 for temporaries (even only)
+    for (int i = 0; i <= 18; i += 2) {
+        tempRegs.insert("$f" + to_string(i));
+    }
+    
+    // $f20-$f30 for saved values (even only)
+    for (int i = 20; i <= 30; i += 2) {
+        savedRegs.insert("$f" + to_string(i));
+    }
+    
+    varToReg.clear();
+    regToVar.clear();
+}
+
+string CodeGenerator::FloatRegisterPool::allocateTemp(const string& var) {
+    if (varToReg.find(var) != varToReg.end()) {
+        return varToReg[var];
+    }
+    
+    if (!tempRegs.empty()) {
+        string reg = *tempRegs.begin();
+        tempRegs.erase(tempRegs.begin());
+        varToReg[var] = reg;
+        regToVar[reg] = var;
+        return reg;
+    }
+    
+    return "$f18";  // Fallback
+}
+
+string CodeGenerator::FloatRegisterPool::allocateSaved(const string& var) {
+    if (varToReg.find(var) != varToReg.end()) {
+        return varToReg[var];
+    }
+    
+    if (!savedRegs.empty()) {
+        string reg = *savedRegs.begin();
+        savedRegs.erase(savedRegs.begin());
+        varToReg[var] = reg;
+        regToVar[reg] = var;
+        return reg;
+    }
+    
+    return allocateTemp(var);
+}
+
+void CodeGenerator::FloatRegisterPool::freeReg(const string& reg) {
+    if (regToVar.find(reg) != regToVar.end()) {
+        string var = regToVar[reg];
+        varToReg.erase(var);
+        regToVar.erase(reg);
+        
+        // Parse register number
+        int regNum = stoi(reg.substr(2));
+        if (regNum <= 18) {
+            tempRegs.insert(reg);
+        } else {
+            savedRegs.insert(reg);
+        }
+    }
+}
+
+void CodeGenerator::FloatRegisterPool::spillAll() {
+    varToReg.clear();
+    regToVar.clear();
+    init();
+}
+
+bool CodeGenerator::FloatRegisterPool::isAllocated(const string& var) {
+    return varToReg.find(var) != varToReg.end();
+}
+
+string CodeGenerator::FloatRegisterPool::getReg(const string& var) {
+    if (varToReg.find(var) != varToReg.end()) {
+        return varToReg[var];
+    }
+    return "";
+}
+
+//============================================================================
 // Helper Utilities
 //============================================================================
 
@@ -171,21 +264,89 @@ int CodeGenerator::getImmediate(const string& operand) {
     return stoi(operand);
 }
 
-int CodeGenerator::getVarOffset(const string& varName) {
-    if (varOffsets.find(varName) != varOffsets.end()) {
-        return varOffsets[varName];
-    }
-    // Allocate new offset - check if it's an array
-    int varSize = 4;  // Default size for scalar variables
-    
-    // Strip SSA suffix (e.g., arr#2 -> arr) to look up in symbol table
+// FIXED: Helper function to get element size and proper load/store instructions based on type
+// Returns: {size_in_bytes, load_instruction, store_instruction}
+// Example: "int" -> {4, "lw", "sw"}, "char" -> {1, "lb", "sb"}
+CodeGenerator::TypeInfo CodeGenerator::getTypeInfo(const string& varName) {
+    // Strip SSA suffix (e.g., arr#2 -> arr)
     string baseName = varName;
     size_t hashPos = varName.find('#');
     if (hashPos != string::npos) {
         baseName = varName.substr(0, hashPos);
     }
     
-    Symbol* sym = symbolTable->lookuph(baseName);  // Use lookuph to search scope history
+    // Look up in varTypes map first (for temporaries)
+    if (varTypes.find(varName) != varTypes.end() || varTypes.find(baseName) != varTypes.end()) {
+        string type = varTypes.find(varName) != varTypes.end() ? varTypes[varName] : varTypes[baseName];
+        if (type.find("char") != string::npos && type.find('*') == string::npos) {
+            return {1, "lb", "sb"};  // char (not char*)
+        }
+        if (type.find("short") != string::npos && type.find('*') == string::npos) {
+            return {2, "lh", "sh"};  // short (not short*)
+        }
+        // int, float, pointers are all 4 bytes
+        return {4, "lw", "sw"};
+    }
+    
+    // Look up in symbol table
+    Symbol* sym = symbolTable->lookuph(baseName);
+    if (sym) {
+        string baseType = sym->type;
+        // If it's a pointer, size is always 4 bytes (pointer size on MIPS32)
+        if (sym->pointerDepth > 0) {
+            return {4, "lw", "sw"};
+        }
+        // If it's an array, get element type
+        if (sym->isArray) {
+            // Array elements - check base type
+            if (baseType == "char") {
+                return {1, "lb", "sb"};
+            }
+            if (baseType == "short") {
+                return {2, "lh", "sh"};
+            }
+            // int, float arrays
+            return {4, "lw", "sw"};
+        }
+        // Scalar type
+        if (baseType == "char") {
+            return {1, "lb", "sb"};
+        }
+        if (baseType == "short") {
+            return {2, "lh", "sh"};
+        }
+    }
+    
+    // Default: assume 4-byte integer/float/pointer
+    return {4, "lw", "sw"};
+}
+
+int CodeGenerator::getVarOffset(const string& varName) {
+    // ✅ CRITICAL FIX: Strip SSA suffix FIRST before any lookups
+    // This ensures matrix2d#1 and matrix2d refer to the SAME stack location
+    string baseName = varName;
+    size_t hashPos = varName.find('#');
+    if (hashPos != string::npos) {
+        baseName = varName.substr(0, hashPos);
+    }
+    
+    // Check if already allocated (using base name)
+    if (varOffsets.find(baseName) != varOffsets.end()) {
+        return varOffsets[baseName];
+    }
+    
+    // FIXED: Check if this variable was already identified as a global during pre-scan
+    // If it's in staticVars, it's a global and shouldn't be on the stack
+    if (staticVars.find(baseName) != staticVars.end()) {
+        return -1;  // Not on stack - it's in .data section
+    }
+    
+    // This is a local variable - allocate stack space for it
+    Symbol* sym = symbolTable->lookuph(baseName);
+    
+    // Allocate new offset for local variable - check if it's an array
+    int varSize = 4;  // Default size for scalar variables
+    
     if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
         // Calculate total array size
         varSize = 4;  // Base element size (assuming int/float = 4 bytes)
@@ -196,7 +357,8 @@ int CodeGenerator::getVarOffset(const string& varName) {
         }
     }
     currentOffset -= varSize;
-    varOffsets[varName] = currentOffset;
+    // ✅ Store using BASE NAME so all SSA versions map to same location
+    varOffsets[baseName] = currentOffset;
     return currentOffset;
 }
 
@@ -310,15 +472,113 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
     // Calculate frame size: space for locals + 8 bytes for $ra/$fp + parameter space
     int localsSpace = -minOffset;  // Convert negative offset to positive size
     int paramSpace = (functionParamCount > 4 ? 4 : functionParamCount) * 4;
-    int totalSpace = localsSpace + 8 + paramSpace;
+    
+    // ✅ FIX: Add safety margin for temporaries created during code generation
+    // printf and complex expressions create many temporaries not visible in TAC
+    // Formula: 3x the calculated space to be safe (triples available stack)
+    int safetyMultiplier = 3;
+    
+    int totalSpace = (localsSpace + 8 + paramSpace) * safetyMultiplier;
     
     // Ensure minimum frame size and round up to 8-byte alignment for MIPS
-    if (totalSpace < 16) totalSpace = 16;  // Minimum frame
+    if (totalSpace < 128) totalSpace = 128;  // Higher minimum for functions with loops/printf
     if (totalSpace % 8 != 0) {
         totalSpace = ((totalSpace / 8) + 1) * 8;
     }
     
     return totalSpace;
+}
+
+//============================================================================
+// Float Type Tracking Helpers
+//============================================================================
+
+bool CodeGenerator::isFloatType(const string& varName) {
+    string type = getVarType(varName);
+    return (type == "float" || type == "double");
+}
+
+string CodeGenerator::getVarType(const string& varName) {
+    // Strip SSA suffix
+    string baseName = varName;
+    size_t hashPos = varName.find('#');
+    if (hashPos != string::npos) {
+        baseName = varName.substr(0, hashPos);
+    }
+    
+    // Check varTypes map first (for temporaries and explicit tracking)
+    if (varTypes.find(varName) != varTypes.end()) {
+        return varTypes[varName];
+    }
+    if (varTypes.find(baseName) != varTypes.end()) {
+        return varTypes[baseName];
+    }
+    
+    // Look up in symbol table
+    Symbol* sym = symbolTable->lookuph(baseName);
+    if (sym) {
+        return sym->type;
+    }
+    
+    // Default to int
+    return "int";
+}
+
+void CodeGenerator::setVarType(const string& varName, const string& type) {
+    varTypes[varName] = type;
+}
+
+void CodeGenerator::loadFloatOperand(const string& operand, const string& targetReg) {
+    // targetReg should be a float register like $f0, $f2, etc.
+    if (isFloatLiteral(operand)) {
+        // Load float literal from .data section
+        string label = getOrCreateFloatLabel(operand);
+        emit("la $t9, " + label);
+        emit("lwc1 " + targetReg + ", 0($t9)");  // Load word coprocessor 1 (FPU)
+    }
+    else if (isImmediate(operand)) {
+        // Integer immediate - need to convert to float
+        emit("li $t9, " + operand);
+        emit("mtc1 $t9, " + targetReg);  // Move to coprocessor 1
+        emit("cvt.s.w " + targetReg + ", " + targetReg);  // Convert int to float
+    }
+    else if (isTemp(operand) || isVariable(operand)) {
+        // Load from stack
+        int offset = getVarOffset(operand);
+        if (offset == -1) {
+            // Global variable
+            string baseName = operand;
+            size_t hashPos = operand.find('#');
+            if (hashPos != string::npos) {
+                baseName = operand.substr(0, hashPos);
+            }
+            if (staticVars.find(baseName) != staticVars.end()) {
+                emit("la $t9, " + staticVars[baseName]);
+                emit("lwc1 " + targetReg + ", 0($t9)");
+            }
+        } else {
+            emit("lwc1 " + targetReg + ", " + to_string(offset) + "($fp)");
+        }
+    }
+}
+
+void CodeGenerator::storeFloatToVar(const string& var, const string& sourceReg) {
+    // sourceReg should be a float register like $f0, $f2, etc.
+    int offset = getVarOffset(var);
+    if (offset == -1) {
+        // Global variable
+        string baseName = var;
+        size_t hashPos = var.find('#');
+        if (hashPos != string::npos) {
+            baseName = var.substr(0, hashPos);
+        }
+        if (staticVars.find(baseName) != staticVars.end()) {
+            emit("la $t9, " + staticVars[baseName]);
+            emit("swc1 " + sourceReg + ", 0($t9)");
+        }
+    } else {
+        emit("swc1 " + sourceReg + ", " + to_string(offset) + "($fp)");
+    }
 }
 
 //============================================================================
@@ -337,6 +597,12 @@ void CodeGenerator::loadOperand(const string& operand, const string& targetReg) 
     }
     else if (isImmediate(operand)) {
         emit("li " + targetReg + ", " + operand);
+    }
+    // FIXED: Check if operand is a string literal label (from IR: "str1", "str2", etc.)
+    // These look like identifiers but are actually labels that need 'la' not 'li'
+    else if (operand.size() >= 3 && operand.substr(0, 3) == "str" && isdigit(operand[3])) {
+        // String literal label from IR (e.g., str1, str2)
+        emit("la " + targetReg + ", " + operand);
     }
     else if (registers.isAllocated(operand)) {
         string srcReg = registers.getReg(operand);
@@ -381,7 +647,8 @@ void CodeGenerator::storeToVar(const string& var, const string& sourceReg) {
 
 void CodeGenerator::generate() {
     asmCode.clear();
-    dataSection.clear();
+    // FIXED: Don't clear dataSection - it contains string literals from constructor
+    // dataSection.clear();
     dynamicDataSection.clear();
     
     // Don't indent initial comments - Venus compatibility
@@ -403,8 +670,12 @@ void CodeGenerator::generate() {
             }
         }
         
-        // Insert dynamic data before .text
+        // Insert dynamic data before .text with comment
         if (it != asmCode.end()) {
+            it = asmCode.insert(it, "");
+            ++it;
+            it = asmCode.insert(it, "    # Dynamic string literals (from printf)");
+            ++it;
             for (const auto& line : dynamicDataSection) {
                 it = asmCode.insert(it, "    " + line);
                 ++it;  // Move past inserted element
@@ -422,10 +693,117 @@ void CodeGenerator::generateDataSection() {
     dataSection.push_back("_str_fmt: .asciiz \"%s\"");
     dataSection.push_back("_char_fmt: .asciiz \"%c\"");
     
-    // Collect string and float literals from TAC (first pass)
+    // FIRST PASS: Identify truly global variables
+    // Strategy 1: Variables accessed via ADDRESS (&var) - arrays and address-taken vars
+    // Strategy 2: Scalar globals used directly - check symbol table for !isLocal
+    std::map<std::string, int> globalInits;  // variable -> initial value
+    std::set<std::string> parameterNames;    // Track parameters to exclude them
+    
+    // Collect parameter names from FUNC_BEGIN blocks
+    for (size_t i = 0; i < tacInstructions.size(); i++) {
+        if (tacInstructions[i].opcode == TACOp::FUNC_BEGIN) {
+            // Next instructions will be GET_PARAM operations
+            for (size_t j = i + 1; j < tacInstructions.size(); j++) {
+                const auto& instr = tacInstructions[j];
+                // Check if this is a GET_PARAM operation
+                if (instr.opcode == TACOp::GET_PARAM) {
+                    // This is a parameter: n#1 = param[0]
+                    string varName = instr.result;
+                    string baseName = varName;
+                    size_t hashPos = baseName.find('#');
+                    if (hashPos != string::npos) {
+                        baseName = baseName.substr(0, hashPos);
+                    }
+                    parameterNames.insert(baseName);
+                } else {
+                    // Hit a non-parameter instruction, stop scanning this function
+                    break;
+                }
+            }
+        }
+    }
+    
+    // PASS 1: Find globals via ADDRESS operations (arrays, address-taken vars)
+    for (const auto& instr : tacInstructions) {
+        if (instr.opcode == TACOp::ADDRESS && !instr.operand1.empty()) {
+            string varName = instr.operand1;
+            
+            // Skip temps and literals
+            if (varName.empty() || varName[0] == 't' || varName[0] == '"' || 
+                isdigit(varName[0]) || varName.find('.') != string::npos) {
+                continue;
+            }
+            
+            string baseName = varName;
+            size_t hashPos = baseName.find('#');
+            if (hashPos != string::npos) {
+                baseName = baseName.substr(0, hashPos);
+            }
+            
+            // Skip parameters
+            if (parameterNames.find(baseName) != parameterNames.end()) {
+                continue;
+            }
+            
+            // Check symbol table: must be not local, not static, and NOT a function
+            Symbol* sym = symbolTable->lookuph(baseName);
+            if (sym && !sym->isLocal && !sym->isStatic && !sym->isFunction) {
+                string sanitizedName = varName;
+                std::replace(sanitizedName.begin(), sanitizedName.end(), '#', '_');
+                staticVars[varName] = sanitizedName;
+                if (globalInits.find(varName) == globalInits.end()) {
+                    globalInits[varName] = 0;
+                }
+            }
+        }
+    }
+    
+    // PASS 2: Find scalar globals used directly (not via ADDRESS)
+    // These are globals that are read/written directly like: hanoi_moves = hanoi_moves + 1
+    for (const auto& instr : tacInstructions) {
+        auto checkScalarGlobal = [&](const string& varName) {
+            if (varName.empty() || varName[0] == 't' || varName[0] == '"' || 
+                isdigit(varName[0]) || varName.find('.') != string::npos) {
+                return;
+            }
+            
+            // Already detected in PASS 1?
+            if (staticVars.find(varName) != staticVars.end()) {
+                return;
+            }
+            
+            string baseName = varName;
+            size_t hashPos = baseName.find('#');
+            if (hashPos != string::npos) {
+                baseName = baseName.substr(0, hashPos);
+            }
+            
+            // Skip parameters
+            if (parameterNames.find(baseName) != parameterNames.end()) {
+                return;
+            }
+            
+            // Check symbol table: must be global (not local, not static, not function)
+            Symbol* sym = symbolTable->lookuph(baseName);
+            if (sym && !sym->isLocal && !sym->isStatic && !sym->isFunction) {
+                string sanitizedName = varName;
+                std::replace(sanitizedName.begin(), sanitizedName.end(), '#', '_');
+                staticVars[varName] = sanitizedName;
+                if (globalInits.find(varName) == globalInits.end()) {
+                    globalInits[varName] = 0;
+                }
+            }
+        };
+        
+        // Check operands and results for potential scalar globals
+        checkScalarGlobal(instr.operand1);
+        checkScalarGlobal(instr.operand2);
+        checkScalarGlobal(instr.result);
+    }
+    
+    // Collect string and float literals from TAC
     // Also collect global variable initializations (before any function)
     // And function-local static variables (those with __inited guard)
-    std::map<std::string, int> globalInits;  // variable -> initial value
     bool inGlobalScope = true;
     std::string pendingConstValue = "";
     std::string lastLabel = "";  // Track labels for detecting static init patterns
@@ -439,6 +817,66 @@ void CodeGenerator::generateDataSection() {
         // Track labels to detect static initialization guards
         if (instr.opcode == TACOp::LABEL) {
             lastLabel = instr.result;
+        }
+        
+        // FIXED: Detect ADDRESS operations on potential globals - scan ALL TAC, not just global scope
+        // But we need to be careful: only treat as global if it's TRULY a global (not a parameter or local)
+        if (instr.opcode == TACOp::ADDRESS && !instr.operand1.empty()) {
+            // Extract base name without SSA suffix
+            string baseName = instr.operand1;
+            size_t hashPos = baseName.find('#');
+            if (hashPos != string::npos) {
+                baseName = baseName.substr(0, hashPos);
+            }
+            
+            // Check if this is a global variable - was it identified in ADDRESS pre-scan?
+            bool isTrueGlobal = (staticVars.find(instr.operand1) != staticVars.end());
+            
+            if (isTrueGlobal) {
+                // This is a global - already in staticVars from ADDRESS scan
+                string sanitizedName = instr.operand1;
+                std::replace(sanitizedName.begin(), sanitizedName.end(), '#', '_');
+                staticVars[instr.operand1] = sanitizedName;
+                if (globalInits.find(instr.operand1) == globalInits.end()) {
+                    globalInits[instr.operand1] = 0;  // Default init to 0
+                }
+            }
+        }
+        
+        // FIXED: Detect direct variable access in GLOBAL SCOPE ONLY
+        if (inGlobalScope) {
+            auto checkOperandForGlobal = [&](const string& operand) {
+                if (operand.empty() || operand[0] == '"' || isdigit(operand[0]) || 
+                    operand[0] == '-' || operand[0] == 't' || operand.find('.') != string::npos) {
+                    return;  // Skip temps, literals, and strings
+                }
+                
+                // Extract base name
+                string baseName = operand;
+                size_t hashPos = baseName.find('#');
+                if (hashPos != string::npos) {
+                    baseName = baseName.substr(0, hashPos);
+                }
+                
+                // Check if global via symbol table
+                Symbol* sym = symbolTable->lookuph(baseName);
+                if (sym && !sym->isLocal && !sym->isStatic) {
+                    string sanitizedName = operand;
+                    std::replace(sanitizedName.begin(), sanitizedName.end(), '#', '_');
+                    staticVars[operand] = sanitizedName;
+                    if (globalInits.find(operand) == globalInits.end()) {
+                        globalInits[operand] = 0;
+                    }
+                }
+            };
+            
+            // Check all operands and result (only in global scope before first function)
+            checkOperandForGlobal(instr.operand1);
+            checkOperandForGlobal(instr.operand2);
+            if (instr.opcode == TACOp::ASSIGN || instr.opcode == TACOp::ADD || 
+                instr.opcode == TACOp::SUB || instr.opcode == TACOp::MUL || instr.opcode == TACOp::DIV) {
+                checkOperandForGlobal(instr.result);
+            }
         }
         
         // Detect function-local static variables by their __inited guard pattern
@@ -496,26 +934,87 @@ void CodeGenerator::generateDataSection() {
         }
     }
     
-    // Emit all data
+    // === ORGANIZED DATA SECTION ===
+    // Section 1: String literals (read-only data)
+    asmCode.push_back("");
+    asmCode.push_back("    # String literals");
     for (const auto& line : dataSection) {
         asmCode.push_back("    " + line);
     }
     
-    // Global/static variables with their initial values
+    // Section 2: Initialized global/static variables (scalars with initial values)
+    bool hasInitializedGlobals = false;
     for (const auto& entry : staticVars) {
-        int initValue = 0;
-        auto it = globalInits.find(entry.first);
-        if (it != globalInits.end()) {
-            initValue = it->second;
+        string baseName = entry.first;
+        size_t hashPos = baseName.find('#');
+        if (hashPos != string::npos) {
+            baseName = baseName.substr(0, hashPos);
         }
-        // Sanitize label name (replace # with _)
-        string label = entry.second;
-        for (char& c : label) {
-            if (c == '#') c = '_';
+        
+        Symbol* sym = symbolTable->lookuph(baseName);
+        // Only process scalar variables here (not arrays)
+        if (!sym || !sym->isArray || sym->arrayDimensions.empty()) {
+            if (!hasInitializedGlobals) {
+                asmCode.push_back("");
+                asmCode.push_back("    # Initialized global variables");
+                hasInitializedGlobals = true;
+            }
+            
+            int initValue = 0;
+            auto it = globalInits.find(entry.first);
+            if (it != globalInits.end()) {
+                initValue = it->second;
+            }
+            
+            string label = entry.second;
+            for (char& c : label) {
+                if (c == '#') c = '_';
+            }
+            
+            asmCode.push_back("    .align 2");
+            asmCode.push_back("    " + label + ": .word " + std::to_string(initValue));
+            
+            // Update the staticVars map with sanitized name
+            const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
         }
-        asmCode.push_back("    " + label + ": .word " + std::to_string(initValue));
-        // Update the staticVars map with sanitized name
-        const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
+    }
+    
+    // Section 3: Uninitialized global/static variables (arrays)
+    bool hasUninitializedGlobals = false;
+    for (const auto& entry : staticVars) {
+        string baseName = entry.first;
+        size_t hashPos = baseName.find('#');
+        if (hashPos != string::npos) {
+            baseName = baseName.substr(0, hashPos);
+        }
+        
+        Symbol* sym = symbolTable->lookuph(baseName);
+        if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
+            if (!hasUninitializedGlobals) {
+                asmCode.push_back("");
+                asmCode.push_back("    # Uninitialized global variables (arrays)");
+                hasUninitializedGlobals = true;
+            }
+            
+            // Calculate total array size in bytes
+            int totalSize = 4;  // Base element size (int/float = 4 bytes)
+            for (int dim : sym->arrayDimensions) {
+                if (dim > 0) {
+                    totalSize *= dim;
+                }
+            }
+            
+            string label = entry.second;
+            for (char& c : label) {
+                if (c == '#') c = '_';
+            }
+            
+            asmCode.push_back("    .align 2");
+            asmCode.push_back("    " + label + ": .space " + std::to_string(totalSize));
+            
+            // Update the staticVars map with sanitized name
+            const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
+        }
     }
 }
 
@@ -653,17 +1152,29 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                 // Track which variable holds this string literal (strip quotes)
                 string strContent = instr.operand1.substr(1, instr.operand1.length() - 2);
                 varToStringLiteral[instr.result] = strContent;
-            } else if (isFloatLiteral(instr.operand1)) {
-                // Float constant - must load from .data section
-                emitComment("WARNING: Float " + instr.operand1 + " loaded as integer bits (proper FPU support needed)");
-                string label = getOrCreateFloatLabel(instr.operand1);
-                emit("la $t0, " + label);
-                emit("lw $t0, 0($t0)");  // Load the float bits as int
+                storeToVar(instr.result, "$t0");
+            } 
+            // FIXED: Check if operand is a string literal label (from IR: "str1", "str2", etc.)
+            else if (instr.operand1.size() >= 3 && instr.operand1.substr(0, 3) == "str" && 
+                     isdigit(instr.operand1[3])) {
+                // String literal label - load address not immediate
+                emit("la $t0, " + instr.operand1);
+                // FIXED: Track that result is a char* (string literals are char arrays)
+                varTypes[instr.result] = "char*";
+                storeToVar(instr.result, "$t0");
+            }
+            else if (isFloatLiteral(instr.operand1)) {
+                // Float constant - load into FPU register
+                emitComment("Float constant: " + instr.result + " = " + instr.operand1);
+                loadFloatOperand(instr.operand1, "$f0");
+                storeFloatToVar(instr.result, "$f0");
+                // Mark as float type
+                setVarType(instr.result, "float");
             } else {
                 // Integer constant
                 emit("li $t0, " + instr.operand1);
+                storeToVar(instr.result, "$t0");
             }
-            storeToVar(instr.result, "$t0");
             break;
         
         case TACOp::GET_PARAM:
@@ -688,6 +1199,22 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                     emit("lw $t0, " + to_string(offset) + "($fp)");
                 }
                 storeToVar(instr.result, "$t0");
+                
+                // Track parameter type in varTypes
+                string baseName = instr.result;
+                size_t hashPos = instr.result.find('#');
+                if (hashPos != string::npos) {
+                    baseName = instr.result.substr(0, hashPos);
+                }
+                Symbol* sym = symbolTable->lookuph(baseName);
+                if (sym && sym->pointerDepth > 0) {
+                    // Build type string: type + '*' * pointerDepth
+                    string typeStr = sym->type;
+                    for (int i = 0; i < sym->pointerDepth; i++) {
+                        typeStr += "*";
+                    }
+                    varTypes[instr.result] = typeStr;
+                }
             }
             break;
             
@@ -701,6 +1228,12 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
 //============================================================================
 
 void CodeGenerator::generateAdd(const TACInstruction& instr) {
+    // Check if we need float arithmetic
+    if (isFloatType(instr.operand1) || isFloatType(instr.operand2) || isFloatType(instr.result)) {
+        generateFloatAdd(instr);
+        return;
+    }
+    
     // result = op1 + op2
     loadOperand(instr.operand1, "$t0");
     
@@ -712,9 +1245,25 @@ void CodeGenerator::generateAdd(const TACInstruction& instr) {
     }
     
     storeToVar(instr.result, "$t0");
+    
+    // FIXED: Propagate pointer type information through ADD operations
+    // If op1 is a pointer type, result is also that pointer type
+    if (varTypes.find(instr.operand1) != varTypes.end()) {
+        string type1 = varTypes[instr.operand1];
+        if (type1.find('*') != string::npos) {
+            // op1 is a pointer, propagate its type to result
+            varTypes[instr.result] = type1;
+        }
+    }
 }
 
 void CodeGenerator::generateSub(const TACInstruction& instr) {
+    // Check if we need float arithmetic
+    if (isFloatType(instr.operand1) || isFloatType(instr.operand2) || isFloatType(instr.result)) {
+        generateFloatSub(instr);
+        return;
+    }
+    
     // result = op1 - op2
     loadOperand(instr.operand1, "$t0");
     
@@ -729,6 +1278,12 @@ void CodeGenerator::generateSub(const TACInstruction& instr) {
 }
 
 void CodeGenerator::generateMul(const TACInstruction& instr) {
+    // Check if we need float arithmetic
+    if (isFloatType(instr.operand1) || isFloatType(instr.operand2) || isFloatType(instr.result)) {
+        generateFloatMul(instr);
+        return;
+    }
+    
     // result = op1 * op2
     loadOperand(instr.operand1, "$t0");
     loadOperand(instr.operand2, "$t1");
@@ -737,6 +1292,12 @@ void CodeGenerator::generateMul(const TACInstruction& instr) {
 }
 
 void CodeGenerator::generateDiv(const TACInstruction& instr) {
+    // Check if we need float arithmetic
+    if (isFloatType(instr.operand1) || isFloatType(instr.operand2) || isFloatType(instr.result)) {
+        generateFloatDiv(instr);
+        return;
+    }
+    
     // result = op1 / op2
     loadOperand(instr.operand1, "$t0");
     loadOperand(instr.operand2, "$t1");
@@ -755,10 +1316,84 @@ void CodeGenerator::generateMod(const TACInstruction& instr) {
 }
 
 void CodeGenerator::generateNeg(const TACInstruction& instr) {
+    // Check if we need float arithmetic
+    if (isFloatType(instr.operand1) || isFloatType(instr.result)) {
+        generateFloatNeg(instr);
+        return;
+    }
+    
     // result = -op1
     loadOperand(instr.operand1, "$t0");
     emit("neg $t0, $t0");
     storeToVar(instr.result, "$t0");
+}
+
+//============================================================================
+// FLOAT ARITHMETIC OPERATIONS
+//============================================================================
+
+void CodeGenerator::generateFloatAdd(const TACInstruction& instr) {
+    // result = op1 + op2 (float)
+    emitComment("Float addition: " + instr.result + " = " + instr.operand1 + " + " + instr.operand2);
+    
+    loadFloatOperand(instr.operand1, "$f0");
+    loadFloatOperand(instr.operand2, "$f2");
+    emit("add.s $f0, $f0, $f2");  // Single precision float add
+    storeFloatToVar(instr.result, "$f0");
+    
+    // Mark result as float type
+    setVarType(instr.result, "float");
+}
+
+void CodeGenerator::generateFloatSub(const TACInstruction& instr) {
+    // result = op1 - op2 (float)
+    emitComment("Float subtraction: " + instr.result + " = " + instr.operand1 + " - " + instr.operand2);
+    
+    loadFloatOperand(instr.operand1, "$f0");
+    loadFloatOperand(instr.operand2, "$f2");
+    emit("sub.s $f0, $f0, $f2");  // Single precision float subtract
+    storeFloatToVar(instr.result, "$f0");
+    
+    // Mark result as float type
+    setVarType(instr.result, "float");
+}
+
+void CodeGenerator::generateFloatMul(const TACInstruction& instr) {
+    // result = op1 * op2 (float)
+    emitComment("Float multiplication: " + instr.result + " = " + instr.operand1 + " * " + instr.operand2);
+    
+    loadFloatOperand(instr.operand1, "$f0");
+    loadFloatOperand(instr.operand2, "$f2");
+    emit("mul.s $f0, $f0, $f2");  // Single precision float multiply
+    storeFloatToVar(instr.result, "$f0");
+    
+    // Mark result as float type
+    setVarType(instr.result, "float");
+}
+
+void CodeGenerator::generateFloatDiv(const TACInstruction& instr) {
+    // result = op1 / op2 (float)
+    emitComment("Float division: " + instr.result + " = " + instr.operand1 + " / " + instr.operand2);
+    
+    loadFloatOperand(instr.operand1, "$f0");
+    loadFloatOperand(instr.operand2, "$f2");
+    emit("div.s $f0, $f0, $f2");  // Single precision float divide
+    storeFloatToVar(instr.result, "$f0");
+    
+    // Mark result as float type
+    setVarType(instr.result, "float");
+}
+
+void CodeGenerator::generateFloatNeg(const TACInstruction& instr) {
+    // result = -op1 (float)
+    emitComment("Float negation: " + instr.result + " = -" + instr.operand1);
+    
+    loadFloatOperand(instr.operand1, "$f0");
+    emit("neg.s $f0, $f0");  // Single precision float negate
+    storeFloatToVar(instr.result, "$f0");
+    
+    // Mark result as float type
+    setVarType(instr.result, "float");
 }
 
 //============================================================================
@@ -955,32 +1590,224 @@ void CodeGenerator::generateGe(const TACInstruction& instr) {
 
 void CodeGenerator::generateAssign(const TACInstruction& instr) {
     // result = op1
+    
+    // Check if we're assigning a float
+    if (isFloatType(instr.operand1)) {
+        loadFloatOperand(instr.operand1, "$f0");
+        storeFloatToVar(instr.result, "$f0");
+        setVarType(instr.result, "float");
+        return;
+    }
+    
     loadOperand(instr.operand1, "$t0");
     storeToVar(instr.result, "$t0");
+    
+    // FIXED: Propagate type information for pointer assignments
+    if (varTypes.find(instr.operand1) != varTypes.end()) {
+        varTypes[instr.result] = varTypes[instr.operand1];
+    }
 }
 
 void CodeGenerator::generateLoad(const TACInstruction& instr) {
     // result = *op1 (pointer dereference)
     loadOperand(instr.operand1, "$t0");  // Get address
-    emit("lw $t0, 0($t0)");              // Load value at address
+    
+    // FIXED: Check if this is loading a float
+    if (varTypes.find(instr.operand1) != varTypes.end()) {
+        string ptrType = varTypes[instr.operand1];
+        // Count pointer levels (number of '*' characters)
+        int ptrLevel = 0;
+        for (char c : ptrType) {
+            if (c == '*') ptrLevel++;
+        }
+        
+        // If pointer level is 2 or more (e.g., char**, int**), we're loading a pointer (4 bytes)
+        if (ptrLevel >= 2) {
+            emit("lw $t0, 0($t0)");  // Load word for pointer-to-pointer
+            storeToVar(instr.result, "$t0");
+            // Result is one level less pointer (e.g., char** -> char*)
+            string resultType = ptrType.substr(0, ptrType.length() - 1);
+            varTypes[instr.result] = resultType;
+            return;
+        }
+        
+        // Single level pointer: check what it points to
+        // Remove the '*' to get base type (e.g., "float*" -> "float")
+        size_t starPos = ptrType.find('*');
+        if (starPos != string::npos) {
+            string baseType = ptrType.substr(0, starPos);
+            if (baseType == "float" || baseType == "double") {
+                // Load float
+                emit("lwc1 $f0, 0($t0)");  // Load word coprocessor 1
+                storeFloatToVar(instr.result, "$f0");
+                setVarType(instr.result, "float");
+                return;
+            } else if (baseType == "char") {
+                emit("lb $t0, 0($t0)");  // Load byte for char*
+                storeToVar(instr.result, "$t0");
+                return;
+            } else if (baseType == "short") {
+                emit("lh $t0, 0($t0)");  // Load halfword for short*
+                storeToVar(instr.result, "$t0");
+                return;
+            }
+        }
+    }
+    
+    // Fallback: Check if operand1 is a pointer symbol
+    string baseName = instr.operand1;
+    size_t hashPos = instr.operand1.find('#');
+    if (hashPos != string::npos) {
+        baseName = instr.operand1.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);
+    if (sym && sym->pointerDepth > 0) {
+        // It's a pointer - check what it points to
+        if (sym->type == "float") {
+            emit("lwc1 $f0, 0($t0)");
+            storeFloatToVar(instr.result, "$f0");
+            setVarType(instr.result, "float");
+            return;
+        } else if (sym->type == "char") {
+            emit("lb $t0, 0($t0)");  // Load byte for char*
+        } else if (sym->type == "short") {
+            emit("lh $t0, 0($t0)");  // Load halfword for short*
+        } else {
+            emit("lw $t0, 0($t0)");  // Load word for int*, pointers
+        }
+    } else {
+        // Default to word load
+        emit("lw $t0, 0($t0)");
+    }
+    
     storeToVar(instr.result, "$t0");
 }
 
 void CodeGenerator::generateStore(const TACInstruction& instr) {
     // *result = op1 (store through pointer)
+    
+    // FIXED: Check if storing a float
+    bool isFloatStore = false;
+    if (varTypes.find(instr.result) != varTypes.end()) {
+        string ptrType = varTypes[instr.result];
+        // Remove the '*' to get base type (e.g., "float*" -> "float")
+        size_t starPos = ptrType.find('*');
+        if (starPos != string::npos) {
+            string baseType = ptrType.substr(0, starPos);
+            if (baseType == "float" || baseType == "double") {
+                isFloatStore = true;
+            }
+        }
+    }
+    
+    if (isFloatStore || isFloatType(instr.operand1)) {
+        // Store float
+        loadFloatOperand(instr.operand1, "$f0");  // Get value
+        loadOperand(instr.result, "$t1");          // Get address
+        emit("swc1 $f0, 0($t1)");  // Store word coprocessor 1
+        return;
+    }
+    
     loadOperand(instr.operand1, "$t0");  // Get value
     loadOperand(instr.result, "$t1");    // Get address
     
-    // For now, always use sb (store byte) to avoid alignment issues with char arrays
-    // TODO: Use proper type information to decide between sb/sh/sw
-    emit("sb $t0, 0($t1)");  // Store byte (works for char, handles unaligned addresses)
+    // FIXED: Use proper type-aware store instruction
+    // First check varTypes map which tracks pointer types from ADDRESS and ADD operations
+    if (varTypes.find(instr.result) != varTypes.end()) {
+        string ptrType = varTypes[instr.result];
+        // Count pointer levels (number of '*' characters)
+        int ptrLevel = 0;
+        for (char c : ptrType) {
+            if (c == '*') ptrLevel++;
+        }
+        
+        // If pointer level is 2 or more (e.g., char**, int**), we're storing a pointer (4 bytes)
+        if (ptrLevel >= 2) {
+            emit("sw $t0, 0($t1)");  // Store word for pointer-to-pointer
+            return;
+        }
+        
+        // Single level pointer: check what it points to
+        size_t starPos = ptrType.find('*');
+        if (starPos != string::npos) {
+            string baseType = ptrType.substr(0, starPos);
+            if (baseType == "char") {
+                emit("sb $t0, 0($t1)");  // Store byte for char*
+                return;
+            } else if (baseType == "short") {
+                emit("sh $t0, 0($t1)");  // Store halfword for short*
+                return;
+            }
+        }
+    }
+    
+    // Fallback: Check if result is a pointer symbol
+    string baseName = instr.result;
+    size_t hashPos = instr.result.find('#');
+    if (hashPos != string::npos) {
+        baseName = instr.result.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);
+    if (sym && sym->pointerDepth > 0) {
+        // It's a pointer - check what it points to
+        // BUT: if it's an array-of-pointers, we're storing pointers (4 bytes), not base type elements
+        if (sym->isArray && sym->pointerDepth > 0) {
+            // Array-of-pointers: elements are pointers (4 bytes)
+            emit("sw $t0, 0($t1)");  // Store word for pointer
+        } else if (sym->type == "char") {
+            emit("sb $t0, 0($t1)");  // Store byte for char*
+        } else if (sym->type == "short") {
+            emit("sh $t0, 0($t1)");  // Store halfword for short*
+        } else {
+            emit("sw $t0, 0($t1)");  // Store word for int*, float*, pointers
+        }
+    } else {
+        // Default to word store
+        emit("sw $t0, 0($t1)");
+    }
 }
 
 void CodeGenerator::generateAddress(const TACInstruction& instr) {
     // result = &op1
-    int offset = getVarOffset(instr.operand1);
-    emit("addi $t0, $fp, " + to_string(offset));
-    storeToVar(instr.result, "$t0");
+    // FIXED: Check if operand is a global/static variable
+    if (staticVars.find(instr.operand1) != staticVars.end()) {
+        // Global variable - load its address
+        string label = staticVars[instr.operand1];
+        emit("la $t0, " + label);
+        storeToVar(instr.result, "$t0");
+    } else {
+        // Local variable - calculate stack address
+        int offset = getVarOffset(instr.operand1);
+        emit("addi $t0, $fp, " + to_string(offset));
+        storeToVar(instr.result, "$t0");
+    }
+    
+    // FIXED: Track type information for address operations
+    // result is now a pointer to operand1's type
+    string baseName = instr.operand1;
+    size_t hashPos = instr.operand1.find('#');
+    if (hashPos != string::npos) {
+        baseName = instr.operand1.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);
+    if (sym) {
+        // Store "type*" to indicate this is a pointer to that type
+        // For array-of-pointers (e.g., char* arr[3]), the element is already a pointer (char*),
+        // so taking the array's address gives us char** (pointer to char*)
+        if (sym->isArray && sym->pointerDepth > 0) {
+            // Array-of-pointers: element type is type* → address gives type**
+            string elemType = sym->type;
+            for (int i = 0; i < sym->pointerDepth + 1; i++) {
+                elemType += "*";
+            }
+            varTypes[instr.result] = elemType;
+        } else {
+            varTypes[instr.result] = sym->type + "*";
+        }
+    }
 }
 
 void CodeGenerator::generateArrayLoad(const TACInstruction& instr) {
@@ -988,10 +1815,46 @@ void CodeGenerator::generateArrayLoad(const TACInstruction& instr) {
     // operand1 = base address, operand2 = index
     loadOperand(instr.operand1, "$t0");  // Base address
     loadOperand(instr.operand2, "$t1");  // Index
-    emit("sll $t1, $t1, 2");             // Index * 4 (word size)
-    emit("add $t0, $t0, $t1");           // Address = base + offset
-    emit("lw $t0, 0($t0)");              // Load value
-    storeToVar(instr.result, "$t0");
+    
+    // FIXED: Check if this is a float array
+    string baseName = instr.operand1;
+    size_t hashPos = instr.operand1.find('#');
+    if (hashPos != string::npos) {
+        baseName = instr.operand1.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);
+    bool isFloatArray = (sym && sym->type == "float");
+    
+    // FIXED: Use proper element size scaling based on array type
+    TypeInfo typeInfo = getTypeInfo(instr.operand1);
+    int elementSize = typeInfo.size;
+    
+    if (elementSize == 1) {
+        // char array - no scaling needed
+        emit("add $t0, $t0, $t1");           // Address = base + index
+        emit(typeInfo.loadInstr + " $t0, 0($t0)");  // Load byte
+        storeToVar(instr.result, "$t0");
+    } else if (elementSize == 2) {
+        // short array - scale by 2
+        emit("sll $t1, $t1, 1");             // Index * 2
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        emit(typeInfo.loadInstr + " $t0, 0($t0)");  // Load halfword
+        storeToVar(instr.result, "$t0");
+    } else if (isFloatArray) {
+        // float array - scale by 4, use lwc1
+        emit("sll $t1, $t1, 2");             // Index * 4
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        emit("lwc1 $f0, 0($t0)");            // Load float
+        storeFloatToVar(instr.result, "$f0");
+        setVarType(instr.result, "float");
+    } else {
+        // int/pointer array - scale by 4
+        emit("sll $t1, $t1, 2");             // Index * 4 (word size)
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        emit(typeInfo.loadInstr + " $t0, 0($t0)");  // Load word
+        storeToVar(instr.result, "$t0");
+    }
 }
 
 void CodeGenerator::generateArrayStore(const TACInstruction& instr) {
@@ -999,10 +1862,45 @@ void CodeGenerator::generateArrayStore(const TACInstruction& instr) {
     // result = base address, operand1 = index, operand2 = value
     loadOperand(instr.result, "$t0");    // Base address
     loadOperand(instr.operand1, "$t1");  // Index
-    emit("sll $t1, $t1, 2");             // Index * 4
-    emit("add $t0, $t0, $t1");           // Address = base + offset
-    loadOperand(instr.operand2, "$t2");  // Value
-    emit("sw $t2, 0($t0)");              // Store value
+    
+    // FIXED: Check if this is a float array
+    string baseName = instr.result;
+    size_t hashPos = instr.result.find('#');
+    if (hashPos != string::npos) {
+        baseName = instr.result.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);
+    bool isFloatArray = (sym && sym->type == "float");
+    
+    // FIXED: Use proper element size scaling based on array type
+    TypeInfo typeInfo = getTypeInfo(instr.result);
+    int elementSize = typeInfo.size;
+    
+    if (elementSize == 1) {
+        // char array - no scaling needed
+        emit("add $t0, $t0, $t1");           // Address = base + index
+        loadOperand(instr.operand2, "$t2");  // Value
+        emit(typeInfo.storeInstr + " $t2, 0($t0)");  // Store byte
+    } else if (elementSize == 2) {
+        // short array - scale by 2
+        emit("sll $t1, $t1, 1");             // Index * 2
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        loadOperand(instr.operand2, "$t2");  // Value
+        emit(typeInfo.storeInstr + " $t2, 0($t0)");  // Store halfword
+    } else if (isFloatArray) {
+        // float array - scale by 4, use swc1
+        emit("sll $t1, $t1, 2");             // Index * 4
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        loadFloatOperand(instr.operand2, "$f0");  // Value
+        emit("swc1 $f0, 0($t0)");            // Store float
+    } else {
+        // int/pointer array - scale by 4
+        emit("sll $t1, $t1, 2");             // Index * 4
+        emit("add $t0, $t0, $t1");           // Address = base + offset
+        loadOperand(instr.operand2, "$t2");  // Value
+        emit(typeInfo.storeInstr + " $t2, 0($t0)");  // Store word
+    }
 }
 
 //============================================================================
@@ -1153,27 +2051,58 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                     // Handle format specifier
                     if (specPos + 1 < formatStr.length()) {
                         char spec = formatStr[specPos + 1];
-                        if (spec == 'd' && argIndex < paramQueue.size()) {
+                        // Check for precision specifier like %.1f
+                        size_t formatEnd = specPos + 2;
+                        if (specPos + 2 < formatStr.length() && formatStr[specPos + 1] == '.') {
+                            // Skip precision digits
+                            while (formatEnd < formatStr.length() && isdigit(formatStr[formatEnd])) {
+                                formatEnd++;
+                            }
+                            if (formatEnd < formatStr.length()) {
+                                spec = formatStr[formatEnd];
+                                formatEnd++;
+                            }
+                        }
+                        
+                        if (spec == 'd' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Print integer
                             loadOperand(paramQueue[argIndex], "$a0");
                             emit("li $v0, 1");       // print_int
                             emit("syscall");
                             argIndex++;
-                            pos = specPos + 2;
-                        } else if (spec == 's' && argIndex < paramQueue.size()) {
+                            pos = formatEnd;
+                        } else if ((spec == 'f' || spec == 'e' || spec == 'g') && argIndex < static_cast<int>(paramQueue.size())) {
+                            // Print float - load into $f12 and use syscall 2
+                            // NOTE: SPIM syscall 2 always prints with default precision (8 decimals)
+                            // and does not respect format specifiers like %.1f
+                            string floatArg = paramQueue[argIndex];
+                            if (isFloatType(floatArg)) {
+                                // Load float directly into $f12
+                                loadFloatOperand(floatArg, "$f12");
+                            } else {
+                                // Load as integer and convert
+                                loadOperand(floatArg, "$t0");
+                                emit("mtc1 $t0, $f12");       // Move to coprocessor 1 (FPU)
+                                emit("cvt.s.w $f12, $f12");   // Convert int to float
+                            }
+                            emit("li $v0, 2");            // print_float syscall
+                            emit("syscall");
+                            argIndex++;
+                            pos = formatEnd;
+                        } else if (spec == 's' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Print string
                             loadOperand(paramQueue[argIndex], "$a0");
                             emit("li $v0, 4");       // print_string
                             emit("syscall");
                             argIndex++;
-                            pos = specPos + 2;
-                        } else if (spec == 'c' && argIndex < paramQueue.size()) {
+                            pos = formatEnd;
+                        } else if (spec == 'c' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Print character
                             loadOperand(paramQueue[argIndex], "$a0");
                             emit("li $v0, 11");      // print_char
                             emit("syscall");
                             argIndex++;
-                            pos = specPos + 2;
+                            pos = formatEnd;
                         } else if (spec == '%') {
                             // Literal % - print it
                             string label = "_str_" + to_string(labelCounter++);
@@ -1181,10 +2110,10 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                             emit("la $a0, " + label);
                             emit("li $v0, 4");       // print_string
                             emit("syscall");
-                            pos = specPos + 2;
+                            pos = formatEnd;
                         } else {
                             // Unknown format specifier - skip it
-                            pos = specPos + 2;
+                            pos = formatEnd;
                         }
                     } else {
                         break;
@@ -1235,7 +2164,7 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                     // Handle format specifier
                     if (specPos + 1 < formatStr.length()) {
                         char spec = formatStr[specPos + 1];
-                        if (spec == 'd' && argIndex < paramQueue.size()) {
+                        if (spec == 'd' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Read integer
                             emit("li $v0, 5");       // read_int syscall
                             emit("syscall");
@@ -1244,7 +2173,7 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                             emit("sw $v0, 0($t0)");
                             argIndex++;
                             pos = specPos + 2;
-                        } else if (spec == 'f' && argIndex < paramQueue.size()) {
+                        } else if (spec == 'f' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Read float
                             emit("li $v0, 6");       // read_float syscall
                             emit("syscall");
@@ -1253,7 +2182,7 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                             emit("swc1 $f0, 0($t0)");
                             argIndex++;
                             pos = specPos + 2;
-                        } else if (spec == 's' && argIndex < paramQueue.size()) {
+                        } else if (spec == 's' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Read string
                             loadOperand(paramQueue[argIndex], "$a0");  // Buffer address
                             emit("li $a1, 256");     // Max length
@@ -1261,7 +2190,7 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                             emit("syscall");
                             argIndex++;
                             pos = specPos + 2;
-                        } else if (spec == 'c' && argIndex < paramQueue.size()) {
+                        } else if (spec == 'c' && argIndex < static_cast<int>(paramQueue.size())) {
                             // Read character (read_int and take low byte)
                             emit("li $v0, 12");      // read_char syscall
                             emit("syscall");
