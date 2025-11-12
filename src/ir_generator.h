@@ -116,9 +116,14 @@ struct TACInstruction {
     std::string operand1;
     std::string operand2;
     int paramCount;
+    std::string resultType;  // ADDED: Type of result (e.g., "int", "float", "char*")
+    std::string op1Type;     // ADDED: Type of operand1
+    std::string op2Type;     // ADDED: Type of operand2
+    
     TACInstruction(TACOp op, const std::string& res = "", 
                    const std::string& op1 = "", const std::string& op2 = "",int pCount = 0)
-        : opcode(op), result(res), operand1(op1), operand2(op2) , paramCount(pCount) {}
+        : opcode(op), result(res), operand1(op1), operand2(op2) , paramCount(pCount),
+          resultType(""), op1Type(""), op2Type("") {}
     
     void print(std::ostream& out = std::cout) const;
     std::string toString() const;
@@ -167,6 +172,9 @@ public:
     
     // Accessor for generated instructions (for code generation phase)
     const std::vector<TACInstruction>& getInstructions() const { return instructions; }
+    
+    // Accessor for string literals (for code generation phase)
+    const std::map<std::string, std::string>& getStringLiterals() const { return stringLiterals; }
     
 private:
     // String literal pooling: map label -> literal contents (raw)
