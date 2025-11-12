@@ -1553,7 +1553,8 @@ int main(int argc, char** argv) {
                     // ✅ NEW: MIPS Code Generation
                     cout << "\n=== GENERATING MIPS ASSEMBLY ===" << endl;
                     
-                    CodeGenerator codeGen(irGenerator.getInstructions(), &symTab);
+                    CodeGenerator codeGen(irGenerator.getInstructions(), &symTab, 
+                                         irGenerator.getStringLiterals());
                     codeGen.generate();
                     
                     // Write MIPS assembly to file
