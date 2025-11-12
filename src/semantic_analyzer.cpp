@@ -1193,8 +1193,13 @@ cout<<"VARRRTYPE"<<varType<<endl;
 
     checkStaticRedeclaration(varName, hasStatic);
                         // In processVariable - pass hasStatic to addSymbol
+// Detect if this is a struct/enum/union type
+bool isStructType = (varType.find("struct ") == 0);
+bool isEnumType = (varType.find("enum ") == 0);
+bool isUnionType = (varType.find("union ") == 0);
+
 if (!symbolTable.addSymbol(varName, varType, nodee, false, {}, isArray, 
-                          arrayDimensions, pointerDepth, false, false, false,
+                          arrayDimensions, pointerDepth, isStructType, isEnumType, isUnionType,
                           false, "", hasStatic, false)) {  // ✅ Pass static flag
     // Check if it's a conflict with a typedef
     Symbol* existing = symbolTable.lookupCurrentScope(varName);
@@ -6200,7 +6205,10 @@ bool SemanticAnalyzer::validateFormatString(const string& format,
                     if (isScanf) { expectedType = "char"; typeMatch = (argType == "char"); }
                     else {
                         expectedType = "char*";
-                        typeMatch = (argType == "char*" || (isPointerType(argTypes[argIndex]) && argType == "char"));
+                        // Accept char*, char arrays (char[N]), and pointers to char
+                        typeMatch = (argType == "char*" || 
+                                   (isPointerType(argTypes[argIndex]) && argType == "char") ||
+                                   (argType.find("char[") == 0)); // char array decays to char*
                     }
                     break;
                 }
