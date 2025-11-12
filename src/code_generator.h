@@ -11,7 +11,9 @@
 
 class CodeGenerator {
 public:
-    CodeGenerator(const std::vector<TACInstruction>& instructions, SymbolTable* symTab);
+    CodeGenerator(const std::vector<TACInstruction>& instructions, 
+                  SymbolTable* symTab,
+                  const std::map<std::string, std::string>& strLiterals = {});
     
     void generate();
     void writeToFile(const std::string& filename);
@@ -38,6 +40,22 @@ private:
         bool isAllocated(const std::string& var);
         std::string getReg(const std::string& var);
     } registers;
+    
+    // ADDED: Float register allocation for FPU
+    struct FloatRegisterPool {
+        std::set<std::string> tempRegs;      // $f0, $f2, $f4, ..., $f18 (even regs for single precision)
+        std::set<std::string> savedRegs;     // $f20, $f22, ..., $f30
+        std::map<std::string, std::string> varToReg;   // variable/temp -> FPU register
+        std::map<std::string, std::string> regToVar;   // FPU register -> variable/temp
+        
+        void init();
+        std::string allocateTemp(const std::string& var);
+        std::string allocateSaved(const std::string& var);
+        void freeReg(const std::string& reg);
+        void spillAll();
+        bool isAllocated(const std::string& var);
+        std::string getReg(const std::string& var);
+    } floatRegisters;
     
     // Memory layout
     int frameSize;
@@ -85,6 +103,23 @@ private:
     int getImmediate(const std::string& operand);
     std::string getOrCreateFloatLabel(const std::string& value);
     
+    // ADDED: Float type checking
+    bool isFloatType(const std::string& varName);
+    std::string getVarType(const std::string& varName);
+    void setVarType(const std::string& varName, const std::string& type);
+    
+    // ADDED: Float-aware load/store
+    void loadFloatOperand(const std::string& operand, const std::string& targetReg);
+    void storeFloatToVar(const std::string& var, const std::string& sourceReg);
+    
+    // FIXED: Type-aware load/store helper
+    struct TypeInfo {
+        int size;              // Size in bytes
+        std::string loadInstr; // "lb", "lh", "lw"
+        std::string storeInstr;// "sb", "sh", "sw"
+    };
+    TypeInfo getTypeInfo(const std::string& varName);
+    
     // Arithmetic operations
     void generateAdd(const TACInstruction& instr);
     void generateSub(const TACInstruction& instr);
@@ -92,6 +127,13 @@ private:
     void generateDiv(const TACInstruction& instr);
     void generateMod(const TACInstruction& instr);
     void generateNeg(const TACInstruction& instr);
+    
+    // ADDED: Float-specific arithmetic
+    void generateFloatAdd(const TACInstruction& instr);
+    void generateFloatSub(const TACInstruction& instr);
+    void generateFloatMul(const TACInstruction& instr);
+    void generateFloatDiv(const TACInstruction& instr);
+    void generateFloatNeg(const TACInstruction& instr);
     
     // Logical operations (short-circuit)
     void generateLogicalAnd(const TACInstruction& instr);
