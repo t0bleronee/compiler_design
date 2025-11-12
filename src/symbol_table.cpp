@@ -67,7 +67,7 @@ bool SymbolTable::addSymbol(const string& name, const string& type, Node* node,
     Symbol* symPtr = sym.get();
     
     // ✅ Store in permanent storage
-    allSymbols.push_back(move(sym));
+    allSymbols.push_back(std::move(sym));
     
     // ✅ Store pointer in current scope
     current[name] = symPtr;
