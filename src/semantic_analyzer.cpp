@@ -1440,14 +1440,22 @@ vector<string> SemanticAnalyzer::extractFunctionParameters(Node* funcDeclNode, s
                                         else fullType += "[" + to_string(arrayDims[i]) + "]";
                                     }
                                 } else {
-                                    // Non-reference parameter: arrays decay to pointers
-                                    fullType += "*";  // char argv[] → char*
+                                    // FIXED: Non-reference parameter: arrays decay to pointers
+                                    // For multi-dimensional arrays like int a[3][3]:
+                                    //   - First dimension decays: int[3][3] → int(*)[3]
+                                    //   - This is a "pointer to array of 3 ints"
                                     if (arrayDims.size() > 1) {
-                                        // Preserve remaining dimensions after decay of the first
+                                        // Multi-dimensional: becomes pointer-to-array
+                                        // int a[M][N] → int (*)[N] (pointer to array of N ints)
+                                        fullType += "(*)";  // Pointer-to-array syntax
                                         for (size_t i = 1; i < arrayDims.size(); i++) {
                                             if (arrayDims[i] == -1) fullType += "[]";
                                             else fullType += "[" + to_string(arrayDims[i]) + "]";
                                         }
+                                    } else {
+                                        // Single dimensional: simple pointer decay
+                                        // int a[N] → int* (char argv[] → char*)
+                                        fullType += "*";
                                     }
                                 }
                             }
@@ -1590,6 +1598,8 @@ void SemanticAnalyzer::addParametersToScope(Node* funcDeclNode) {
                                     vector<int> newDims(arrayDims.begin() + 1, arrayDims.end());
                                     arrayDims = newDims;
                                     isArray = true;
+                                    // Mark as reference so IR knows to use value, not address
+                                    isRefParam = true;
                                 } else {
                                     // Single dimension: becomes pure pointer
                                     isArray = false;
@@ -2550,7 +2560,9 @@ void SemanticAnalyzer::checkUnaryOperation(Node* node) {
     string operandType = getExpressionType(operandNode);
     
     if (opNode->name == "*") {  // Dereference operator
-        if (!isPointerType(operandType)) {
+        // ✅ Arrays decay to pointers, so can be dereferenced
+        bool isArray = (operandType.find('[') != string::npos);
+        if (!isPointerType(operandType) && !isArray) {
             addError("Invalid type argument of unary '*' (have '" + operandType + "')");
         }
     }
@@ -2660,6 +2672,7 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
         
         // For arrays, we need to return the full array type, not the decayed pointer type
         // This allows proper type checking in assignments
+        // HOWEVER: In expression contexts (pointer arithmetic), arrays will decay
         if (sym->isArray) {
             // Build the full array type: base_type[dim1][dim2]...
             // IMPORTANT: For arrays of pointers (e.g., int* arr[5]), we need to apply
@@ -2765,7 +2778,7 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
             
             if (originalArray && originalArray->name == "IDENTIFIER") {
                 Symbol* sym = symbolTable.lookup(originalArray->lexeme);
-                if (sym && sym->isArray) {
+                if (sym && (sym->isArray || sym->pointerDepth > 0)) {
                     // Count how many array access levels we have
                     int accessLevels = 1; // current ARRAY_ACCESS counts as 1
                     Node* current = node;
@@ -2777,26 +2790,75 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
                         }
                     }
                     
-                    // Calculate remaining dimensions after access
-                    int remainingDims = static_cast<int>(sym->arrayDimensions.size()) - accessLevels;
+                    // Handle different cases:
+                    // 1. Regular array: int arr[3][4]
+                    //    - pointerDepth=0, isArray=true, arrayDims=[3,4]
+                    //    - arr[i] should give int[4]
+                    //    - arr[i][j] should give int
+                    //
+                    // 2. Array of pointers: int* ptrs[3]
+                    //    - pointerDepth=1, isArray=true, arrayDims=[3]
+                    //    - ptrs[i] should give int*
+                    //
+                    // 3. Decayed 2D parameter: int a[3][3] decays to int(*)[3]
+                    //    - pointerDepth=1, isArray=true, arrayDims=[3]
+                    //    - a[i] should give int[3]
+                    //    - a[i][j] should give int
+                    //
+                    // The key distinction between case 2 and 3:
+                    // - Case 2: pointerDepth is part of ELEMENT type
+                    // - Case 3: pointerDepth is the pointer-to-array itself
+                    //
+                    // For case 3 (decayed parameter), we have both pointerDepth AND arrayDims
+                    // For case 2 (array of pointers), we also have both!
+                    // 
+                    // The distinction: in case 3, the FIRST access dereferences the pointer,
+                    // THEN accesses the array. In case 2, we just access the array.
+                    //
+                    // Actually, looking at how parameters are stored:
+                    // - int a[3][3] decays to: pointerDepth=1, arrayDims=[3] (second dimension)
+                    // - int* ptrs[3] is stored as: pointerDepth=1, arrayDims=[3]
+                    //
+                    // These are identical! We need to check: does pointerDepth apply to the
+                    // whole thing (pointer-to-array) or to elements (array-of-pointers)?
+                    //
+                    // Heuristic: If arrayDims.size() == 1 and pointerDepth == 1,
+                    // assume it's array-of-pointers unless we know it's a parameter.
+                    // But we can't easily tell if it's a parameter...
+                    //
+                    // Better approach: For pointerDepth>0 with arrayDims:
+                    // - First consume array accesses from arrayDims
+                    // - Then consume pointer dereferences from pointerDepth
                     
-                    if (remainingDims > 0) {
-                        // Still have array dimensions left - return array type
-                        // For arr[1] where arr is int[2][3]: result should be int[3] (array of 3 ints)
-                        // For arr[1][2] where arr is int[2][3][4]: result should be int[4] (array of 4 ints)
-                        string resultType = sym->type;
-                        for (int i = 0; i < remainingDims; i++) {
-                            resultType += "[" + to_string(sym->arrayDimensions[accessLevels + i]) + "]";
+                    string resultType = sym->type;
+                    int remainingArrayDims = static_cast<int>(sym->arrayDimensions.size()) - accessLevels;
+                    
+                    if (remainingArrayDims > 0) {
+                        // Still have array dimensions left
+                        // Add remaining array dimensions
+                        for (int i = accessLevels; i < static_cast<int>(sym->arrayDimensions.size()); i++) {
+                            resultType += "[" + to_string(sym->arrayDimensions[i]) + "]";
                         }
                         return resultType;
-                    } else {
-                        // All dimensions consumed - return element type
-                        // For arr1d[2] where arr1d is int[5]: result should be int
-                        string resultType = sym->type;
+                    } else if (remainingArrayDims == 0) {
+                        // All array dimensions consumed, return element type with pointers
                         for (int i = 0; i < sym->pointerDepth; i++) {
                             resultType += "*";
                         }
                         return resultType;
+                    } else {
+                        // Access beyond array dimensions - dereference pointers
+                        int pointerAccesses = accessLevels - static_cast<int>(sym->arrayDimensions.size());
+                        int remainingPointers = sym->pointerDepth - pointerAccesses;
+                        if (remainingPointers > 0) {
+                            for (int i = 0; i < remainingPointers; i++) {
+                                resultType += "*";
+                            }
+                            return resultType;
+                        } else {
+                            // All dereferenced
+                            return resultType;
+                        }
                     }
                 }
             }
@@ -2821,34 +2883,61 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
             string leftType = getExpressionType(node->children[0]);
             string rightType = getExpressionType(node->children[1]);
             
-            // ✅ CHECK: Void pointer arithmetic is forbidden in standard C
-            if (isPointerType(leftType) && isIntegerType(rightType)) {
+            // ✅ Check for array types
+            bool leftIsArray = (leftType.find('[') != string::npos);
+            bool rightIsArray = (rightType.find('[') != string::npos);
+            
+            // ✅ ARRAY + INTEGER: array decays to pointer, result is pointer
+            if ((leftIsArray || isPointerType(leftType)) && isIntegerType(rightType)) {
                 // Check if it's void*
-                string baseType = leftType.substr(0, leftType.length() - 1); // Remove trailing '*'
-                if (baseType == "void" || baseType.find("void*") == 0) {
-                    addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
-                    return leftType; // Return type anyway to continue analysis
+                if (isPointerType(leftType)) {
+                    string baseType = leftType.substr(0, leftType.length() - 1);
+                    if (baseType == "void" || baseType.find("void*") == 0) {
+                        addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
+                        return leftType;
+                    }
+                }
+                // For arrays, return decayed pointer type
+                if (leftIsArray) {
+                    // Extract base type before '[' and add '*'
+                    size_t pos = leftType.find('[');
+                    return leftType.substr(0, pos) + "*";
                 }
                 return leftType;
             }
-            // int + pointer = pointer
-            if (node->name == "ADD_EXPR" && isIntegerType(leftType) && isPointerType(rightType)) {
+            
+            // ✅ INTEGER + ARRAY/POINTER: result is pointer
+            if (node->name == "ADD_EXPR" && isIntegerType(leftType) && (rightIsArray || isPointerType(rightType))) {
                 // Check if it's void*
-                string baseType = rightType.substr(0, rightType.length() - 1); // Remove trailing '*'
-                if (baseType == "void" || baseType.find("void*") == 0) {
-                    addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
-                    return rightType; // Return type anyway to continue analysis
+                if (isPointerType(rightType)) {
+                    string baseType = rightType.substr(0, rightType.length() - 1);
+                    if (baseType == "void" || baseType.find("void*") == 0) {
+                        addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
+                        return rightType;
+                    }
+                }
+                // For arrays, return decayed pointer type
+                if (rightIsArray) {
+                    size_t pos = rightType.find('[');
+                    return rightType.substr(0, pos) + "*";
                 }
                 return rightType;
             }
+            
             // pointer - pointer = ptrdiff_t (treated as int)
-            if (node->name == "SUB_EXPR" && isPointerType(leftType) && isPointerType(rightType)) {
+            if (node->name == "SUB_EXPR" && (leftIsArray || isPointerType(leftType)) && (rightIsArray || isPointerType(rightType))) {
                 // Check if either is void*
-                string baseType1 = leftType.substr(0, leftType.length() - 1);
-                string baseType2 = rightType.substr(0, rightType.length() - 1);
-                if (baseType1 == "void" || baseType1.find("void*") == 0 || 
-                    baseType2 == "void" || baseType2.find("void*") == 0) {
-                    addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
+                if (isPointerType(leftType)) {
+                    string baseType1 = leftType.substr(0, leftType.length() - 1);
+                    if (baseType1 == "void" || baseType1.find("void*") == 0) {
+                        addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
+                    }
+                }
+                if (isPointerType(rightType)) {
+                    string baseType2 = rightType.substr(0, rightType.length() - 1);
+                    if (baseType2 == "void" || baseType2.find("void*") == 0) {
+                        addError("Pointer arithmetic on 'void*' is not allowed (void has no size)");
+                    }
                 }
                 return "int";
             }
@@ -3681,15 +3770,26 @@ bool SemanticAnalyzer::areTypesCompatible(const string& type1, const string& typ
         // Both numeric types - compatible
         if (isNumericType(type1) && isNumericType(type2)) return true;
         
-        // Pointer arithmetic: pointer +/- integer
+        // ✅ ARRAY-TO-POINTER DECAY for pointer arithmetic
+        // In expressions like `arr + i` or `i + arr`, arrays decay to pointers
+        bool type1IsArray = (type1.find('[') != string::npos);
+        bool type2IsArray = (type2.find('[') != string::npos);
+        
+        // Pointer arithmetic: pointer +/- integer (including arrays)
         if ((operation == "+" || operation == "-") &&
             ((isPointerType(type1) && isIntegerType(type2)) ||
-             (isIntegerType(type1) && isPointerType(type2)))) {
+             (isIntegerType(type1) && isPointerType(type2)) ||
+             (type1IsArray && isIntegerType(type2)) ||          // arr + i
+             (isIntegerType(type1) && type2IsArray))) {         // i + arr
             return true;
         }
         
-        // Pointer subtraction: pointer - pointer
-        if (operation == "-" && isPointerType(type1) && isPointerType(type2)) {
+        // Pointer subtraction: pointer - pointer (including arrays)
+        if (operation == "-" && 
+            ((isPointerType(type1) && isPointerType(type2)) ||
+             (type1IsArray && isPointerType(type2)) ||
+             (isPointerType(type1) && type2IsArray) ||
+             (type1IsArray && type2IsArray))) {
             return true;
         }
         
@@ -3837,6 +3937,36 @@ if ((isPointerType(type1) && isIntegerType(type2)) ||
     return false;
 
 }
+
+        // Multi-dimensional array decay to pointer-to-array
+        // Example: int[3][3] should be compatible with int(*)[3]
+        if (type1.find("(*)") != string::npos && type2.find('[') != string::npos) {
+            // type1 is pointer-to-array: int(*)[3]
+            // type2 is multi-dim array: int[3][3]
+            
+            // Extract base type and dimensions from type1: int(*)[3]
+            size_t ptrPos = type1.find("(*)");
+            string base1 = type1.substr(0, ptrPos);
+            string dims1 = type1.substr(ptrPos + 3); // Everything after (*)
+            
+            // Extract base type and dimensions from type2: int[3][3]
+            size_t arrayPos = type2.find('[');
+            string base2 = type2.substr(0, arrayPos);
+            string dims2 = type2.substr(arrayPos);
+            
+            // Remove first dimension from dims2: [3][3] -> [3]
+            size_t secondBracket = dims2.find('[', 1);
+            if (secondBracket != string::npos) {
+                string remainingDims = dims2.substr(secondBracket);
+                
+                // Check if base types match and remaining dimensions match
+                if (base1 == base2 && dims1 == remainingDims) {
+                    cout << "DEBUG: Multi-dim array decay compatible: " << type2 << " -> " << type1 << "\n";
+                    return true;
+                }
+            }
+        }
+        
         // Assigning integer to pointer (for null assignment)
         if (isPointerType(type1) && isIntegerType(type2)) {
             return true;
