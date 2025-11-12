@@ -136,6 +136,10 @@ private:
     int tempCounter;
     int labelCounter;
     
+    // Track types of temporary variables for proper pointer arithmetic
+    std::map<std::string, std::string> tempTypes;  // temp var -> type (e.g., "int*", "char**")
+    std::map<std::string, int> tempPointerDepth;    // temp var -> pointer depth
+    
     // Current function context
     std::string currentFunction;
     std::string currentFunctionReturnType;  // Track return type of current function
@@ -148,6 +152,8 @@ std::string currentContinueLabel;
     std::map<std::string, int> vaListIndices;
     // Unique naming for symbols to respect scope shadowing
     std::map<Symbol*, std::string> symbolUniqueNames;
+    // Map from variable name to SSA name within current function (for parameters)
+    std::map<std::string, std::string> functionLocalNames;
     int symbolNameCounter = 0;
 public:
     IRGenerator(SymbolTable& symTab);
@@ -266,6 +272,7 @@ int getSubArraySizeForDimension(Node* arrayNode, int dimIndex);
 
 // Add these after the existing helper function declarations
 bool isPointerType(Node* node);
+bool isTempPointer(const std::string& temp);  // Check if temp variable is a pointer
 int getPointerDepth(Node* node);
 int getPointedToSize(Node* ptrNode);
 std::string generatePointerArithmetic(Node* ptrNode, const std::string& ptrTemp,const std::string& offsetTemp, TACOp op);
