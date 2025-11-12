@@ -397,12 +397,28 @@ static std::vector<unsigned char> decodeCString(const std::string& rawWithQuotes
 std::string IRGenerator::getUniqueNameFor(Node* idNode, const std::string& fallback) {
     if (!idNode) return fallback;
     if (idNode->symbol) {
-        auto it = symbolUniqueNames.find(idNode->symbol);
-        if (it != symbolUniqueNames.end()) return it->second;
-        // Create a readable unique name: baseName#N
+        // First check function-local name map (for parameters that might have multiple Symbol* instances)
         std::string base = idNode->lexeme.empty() ? fallback : idNode->lexeme;
+        if (!currentFunction.empty()) {
+            auto localIt = functionLocalNames.find(base);
+            if (localIt != functionLocalNames.end()) {
+                return localIt->second;
+            }
+        }
+        
+        // Then check symbol-based map
+        auto it = symbolUniqueNames.find(idNode->symbol);
+        if (it != symbolUniqueNames.end()) {
+            return it->second;
+        }
+        // Create a readable unique name: baseName#N
         std::string unique = base + "#" + std::to_string(++symbolNameCounter);
         symbolUniqueNames[idNode->symbol] = unique;
+        
+        // Also add to function-local map if it's a local variable
+        if (!currentFunction.empty() && idNode->symbol->isLocal) {
+            functionLocalNames[base] = unique;
+        }
         return unique;
     }
     return fallback;
@@ -671,6 +687,8 @@ string IRGenerator::generateExpression(Node* node) {
         string arrayName = getUniqueNameFor(node, node->lexeme);
         string temp = createTemp();
         instructions.emplace_back(TACOp::ADDRESS, temp, arrayName);
+        // Mark temp as pointer to array element type
+        tempPointerDepth[temp] = 1;  // Pointer to element
         return temp;
     }
     // References hold addresses; reading a reference as rvalue
@@ -1248,8 +1266,8 @@ string IRGenerator::generateBinaryExpr(Node* node, TACOp op) {
         return boolResult;
     }
     // Check if this is pointer arithmetic
-    bool leftIsPointer = isPointerType(leftNode);
-    bool rightIsPointer = isPointerType(rightNode);
+    bool leftIsPointer = isPointerType(leftNode) || isTempPointer(leftTemp);
+    bool rightIsPointer = isPointerType(rightNode) || isTempPointer(rightTemp);
     
     // Pointer arithmetic: ptr + n or n + ptr
     if ((op == TACOp::ADD || op == TACOp::SUB) && (leftIsPointer || rightIsPointer)) {
@@ -1342,14 +1360,73 @@ string IRGenerator::generateAssignment(Node* node) {
     Node* rhs = node->children[2];
     
     if (lhs->name == "IDENTIFIER") {
+        // Check if this is a struct-to-struct assignment
+        if (lhs->symbol && lhs->symbol->isStruct && rhs->name == "IDENTIFIER" && rhs->symbol && rhs->symbol->isStruct) {
+            // Generate member-by-member copy for struct assignment
+            string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
+            string rhsName = getUniqueNameFor(rhs, rhs->lexeme);
+            
+            // Get struct type to find members (strip "struct " prefix)
+            string structTypeName = lhs->symbol->type;
+            if (structTypeName.find("struct ") == 0) {
+                structTypeName = structTypeName.substr(7); // Remove "struct " prefix
+            }
+            Symbol* structTypeSym = symbolTable.lookuph(structTypeName);
+            if (structTypeSym && structTypeSym->isStruct) {
+                // Copy each member in order
+                for (const string& memberName : structTypeSym->structMemberOrder) {
+                    auto it = structTypeSym->structMembers.find(memberName);
+                    if (it != structTypeSym->structMembers.end()) {
+                        // Get member offset
+                        int offset = 0;
+                        for (const string& m : structTypeSym->structMemberOrder) {
+                            if (m == memberName) break;
+                            // Simple offset calculation (4 bytes per member for now)
+                            offset += 4;
+                        }
+                        
+                        // Load from rhs.member: addr = &rhs + offset, value = *addr
+                        string rhsAddrTemp = createTemp();
+                        instructions.emplace_back(TACOp::ADDRESS, rhsAddrTemp, rhsName);
+                        string offsetTemp = createTemp();
+                        instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
+                        string rhsMemberAddrTemp = createTemp();
+                        instructions.emplace_back(TACOp::ADD, rhsMemberAddrTemp, rhsAddrTemp, offsetTemp);
+                        string valueTemp = createTemp();
+                        instructions.emplace_back(TACOp::LOAD, valueTemp, rhsMemberAddrTemp);
+                        
+                        // Store to lhs.member: addr = &lhs + offset, *addr = value
+                        string lhsAddrTemp = createTemp();
+                        instructions.emplace_back(TACOp::ADDRESS, lhsAddrTemp, lhsName);
+                        string lhsOffsetTemp = createTemp();
+                        instructions.emplace_back(TACOp::CONST, lhsOffsetTemp, to_string(offset));
+                        string lhsMemberAddrTemp = createTemp();
+                        instructions.emplace_back(TACOp::ADD, lhsMemberAddrTemp, lhsAddrTemp, lhsOffsetTemp);
+                        instructions.emplace_back(TACOp::STORE, lhsMemberAddrTemp, valueTemp);
+                    }
+                }
+                return lhsName;
+            }
+        }
+        
         string rhsTemp = generateExpression(rhs);
         string lhsName = getUniqueNameFor(lhs, lhs->lexeme);
+        
+        // Track pointer type propagation for LHS variable
+        if (lhs->symbol && lhs->symbol->pointerDepth > 0) {
+            tempPointerDepth[lhsName] = lhs->symbol->pointerDepth;
+        }
+        // Also propagate if RHS is a temp pointer
+        if (isTempPointer(rhsTemp)) {
+            tempPointerDepth[lhsName] = tempPointerDepth[rhsTemp];
+        }
+        
         // If LHS is a reference, store through its address
         if (lhs->symbol && lhs->symbol->isReference) {
             instructions.emplace_back(TACOp::STORE, lhsName, rhsTemp);
             return lhsName;
         }
-          string finalValue = handleImplicitConversion(rhsTemp, rhs, lhs);
+        string finalValue = handleImplicitConversion(rhsTemp, rhs, lhs);
         
         // Always use the temp from generateExpression for consistency
         instructions.emplace_back(TACOp::ASSIGN, lhsName, finalValue);
@@ -1503,12 +1580,15 @@ string IRGenerator::generateFunctionCall(Node* node) {
     // This ensures side effects happen in correct sequence
     vector<string> evaluatedArgs;
     
+    // Track actual parameter count (may be > argList size for structs passed by value)
+    int actualParamCount = 0;
+    
     if (node->children.size() > 1) {
         Node* argList = node->children[1];
         
         cout << "DEBUG: Evaluating " << argList->children.size() 
              << " arguments for " << debugName << " in left-to-right order" << endl;
-       
+        
         // Step 1+2 combined: For each argument, either compute address (for ref) or value
 for (size_t i = 0; i < argList->children.size(); i++) {
     Node* arg = argList->children[i];
@@ -1519,7 +1599,54 @@ for (size_t i = 0; i < argList->children.size(); i++) {
     } else {
         string argTemp = generateExpression(arg);
         
-        // ✅ NEW: Convert argument to parameter type if function info available
+        // Check if this argument is a struct being passed by value
+        bool isStructArg = false;
+        Symbol* argSym = nullptr;
+        if (arg->name == "IDENTIFIER" && arg->symbol && arg->symbol->isStruct) {
+            isStructArg = true;
+            argSym = arg->symbol;
+        }
+        
+        if (isStructArg && argSym) {
+            // Struct passed by value - pass each member as a separate parameter
+            string structName = argTemp;
+            
+            // Get struct type definition
+            string structTypeName = argSym->type;
+            if (structTypeName.find("struct ") == 0) {
+                structTypeName = structTypeName.substr(7);
+            }
+            Symbol* structTypeSym = symbolTable.lookuph(structTypeName);
+            
+            if (structTypeSym && structTypeSym->isStruct) {
+                cout << "DEBUG: Passing struct " << structName << " by value with " 
+                     << structTypeSym->structMemberOrder.size() << " members" << endl;
+                
+                // Pass each member as a separate parameter
+                for (const string& memberName : structTypeSym->structMemberOrder) {
+                    int offset = 0;
+                    for (const string& m : structTypeSym->structMemberOrder) {
+                        if (m == memberName) break;
+                        offset += 4;  // 4 bytes per member
+                    }
+                    
+                    // Load member: addr = &struct + offset, value = *addr
+                    string addrTemp = createTemp();
+                    instructions.emplace_back(TACOp::ADDRESS, addrTemp, structName);
+                    string offsetTemp = createTemp();
+                    instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
+                    string memberAddrTemp = createTemp();
+                    instructions.emplace_back(TACOp::ADD, memberAddrTemp, addrTemp, offsetTemp);
+                    string memberValueTemp = createTemp();
+                    instructions.emplace_back(TACOp::LOAD, memberValueTemp, memberAddrTemp);
+                    
+                                    // Emit param for this member
+                                    instructions.emplace_back(TACOp::PARAM, "", memberValueTemp);
+                                    actualParamCount++;
+                                }
+                                continue;  // Skip the normal param emission below
+                            }
+                        }        // ✅ NEW: Convert argument to parameter type if function info available
         if (funcNode->name == "IDENTIFIER" && funcNode->symbol && 
             funcNode->symbol->isFunction && i < funcNode->symbol->paramTypes.size()) {
             
@@ -1550,6 +1677,7 @@ for (size_t i = 0; i < argList->children.size(); i++) {
     }
     cout << "DEBUG: Emitting param " << i << ": " << toPass << endl;
     instructions.emplace_back(TACOp::PARAM, "", toPass);
+    actualParamCount++;
 }
     }
     
@@ -1558,12 +1686,8 @@ for (size_t i = 0; i < argList->children.size(); i++) {
    
 string callTarget = isIndirectCall ? ("*" + callOperand) : callOperand;
 
-// ✅ Count parameters
-int paramCount = 0;
-if (node->children.size() > 1) {
-    Node* argList = node->children[1];
-    paramCount = argList->children.size();
-}
+// ✅ Use actual parameter count (accounts for struct members passed individually)
+int paramCount = actualParamCount;
 
 // ✅ Emit CALL with param count
 instructions.emplace_back(TACOp::CALL, resultTemp, callTarget, "", paramCount);
@@ -2171,6 +2295,7 @@ void IRGenerator::generateFunction(Node* node) {
     }
     
     currentFunction = funcName;
+    functionLocalNames.clear();  // Clear function-local name map for new function
     string label = "func_" + funcName;
     instructions.emplace_back(TACOp::LABEL, label);
     
@@ -2230,24 +2355,93 @@ void IRGenerator::generateParameterHandling(Node* paramList) {
             for (auto param : child->children) {
                 if (param->name == "PARAM_DECL") {
                     string paramName = findParameterName(param);
-                    // Find the identifier node inside PARAM_DECL to seed unique naming
+                    // Find the identifier node for the parameter name (in DECLARATOR, not in type spec)
                     Node* idNode = nullptr;
-                    std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
-                        if (!n) return nullptr;
-                        if (n->name == "IDENTIFIER") return n;
-                        for (auto c : n->children) { auto r = findId(c); if (r) return r; }
-                        return nullptr;
-                    };
-                    idNode = findId(param);
+                    for (auto paramChild : param->children) {
+                        if (paramChild->name == "DECLARATOR") {
+                            std::function<Node*(Node*)> findId = [&](Node* n) -> Node*{
+                                if (!n) return nullptr;
+                                if (n->name == "IDENTIFIER") return n;
+                                for (auto c : n->children) { auto r = findId(c); if (r) return r; }
+                                return nullptr;
+                            };
+                            idNode = findId(paramChild);
+                            if (idNode) break;
+                        }
+                    }
+                    // For struct parameters, we need to use the same SSA name that will be used in the function body
+                    // The idNode approach doesn't work for struct params, so look up the symbol
+                    Symbol* paramSym = symbolTable.lookuph(paramName);
                     string targetName = paramName;
-                    if (idNode) targetName = getUniqueNameFor(idNode, paramName);
+                    if (paramSym) {
+                        // Force check: if this symbol already has a unique name, use it
+                        auto it = symbolUniqueNames.find(paramSym);
+                        if (it != symbolUniqueNames.end()) {
+                            targetName = it->second;
+                        } else {
+                            // Create unique name for this parameter
+                            targetName = paramName + "#" + to_string(++symbolNameCounter);
+                            symbolUniqueNames[paramSym] = targetName;
+                            functionLocalNames[paramName] = targetName;  // Also add to function-local map
+                        }
+                    }
+                    
+                    // Extract parameter type from PARAM_DECL
+                    string paramType = "";
+                    for (auto paramChild : param->children) {
+                        if (paramChild->name == "DECL_SPECIFIERS" || paramChild->name == "SPEC_QUAL_LIST") {
+                            paramType = extractTypeFromSpecQualList(paramChild);
+                            break;
+                        }
+                    }
+                    
+                    // Check if this parameter is a struct type
+                    bool isStructParam = (paramType.find("struct ") == 0);
+                    string structTypeName = "";
+                    if (isStructParam) {
+                        structTypeName = paramType.substr(7);  // Remove "struct " prefix
+                    }
+                    
                     if (!targetName.empty()) {
-                        cout << "DEBUG: Parameter " << paramIndex << ": " << targetName << endl;
-                        
-                        // Generate GET_PARAM instruction into the unique name
-                        instructions.emplace_back(TACOp::GET_PARAM, targetName, to_string(paramIndex));
-                        
-                        paramIndex++;
+                        if (isStructParam && !structTypeName.empty()) {
+                            // Struct parameter - receive each member as separate param
+                            Symbol* structTypeSym = symbolTable.lookuph(structTypeName);
+                            
+                            if (structTypeSym && structTypeSym->isStruct) {
+                                
+                                // Receive each member and store into struct
+                                for (const string& memberName : structTypeSym->structMemberOrder) {
+                                    int offset = 0;
+                                    for (const string& m : structTypeSym->structMemberOrder) {
+                                        if (m == memberName) break;
+                                        offset += 4;
+                                    }
+                                    
+                                    // Get parameter value
+                                    string memberTemp = createTemp();
+                                    instructions.emplace_back(TACOp::GET_PARAM, memberTemp, to_string(paramIndex));
+                                    
+                                    // Store into struct member: addr = &struct + offset, *addr = value
+                                    string addrTemp = createTemp();
+                                    instructions.emplace_back(TACOp::ADDRESS, addrTemp, targetName);
+                                    string offsetTemp = createTemp();
+                                    instructions.emplace_back(TACOp::CONST, offsetTemp, to_string(offset));
+                                    string memberAddrTemp = createTemp();
+                                    instructions.emplace_back(TACOp::ADD, memberAddrTemp, addrTemp, offsetTemp);
+                                    instructions.emplace_back(TACOp::STORE, memberAddrTemp, memberTemp);
+                                    
+                                    paramIndex++;
+                                }
+                            }
+                        } else {
+                            // Normal parameter
+                            cout << "DEBUG: Parameter " << paramIndex << ": " << targetName << endl;
+                            
+                            // Generate GET_PARAM instruction into the unique name
+                            instructions.emplace_back(TACOp::GET_PARAM, targetName, to_string(paramIndex));
+                            
+                            paramIndex++;
+                        }
                     }
                 }
             }
@@ -4857,6 +5051,14 @@ bool IRGenerator::isPointerType(Node* node) {
     return false;
 }
 
+// Overloaded version to check if a temp variable is a pointer
+bool IRGenerator::isTempPointer(const string& temp) {
+    if (tempPointerDepth.find(temp) != tempPointerDepth.end()) {
+        return tempPointerDepth[temp] > 0;
+    }
+    return false;
+}
+
 int IRGenerator::getPointerDepth(Node* node) {
     if (!node) return 0;
     
@@ -5085,6 +5287,17 @@ string IRGenerator::generatePointerArithmetic(Node* ptrNode, const string& ptrTe
     
     // Add or subtract scaled offset
     instructions.emplace_back(op, resultTemp, ptrTemp, scaledOffsetTemp);
+    
+    // Mark result as a pointer with same depth as input
+    int ptrDepth = 0;
+    if (ptrNode && isPointerType(ptrNode)) {
+        ptrDepth = getPointerDepth(ptrNode);
+    } else if (isTempPointer(ptrTemp)) {
+        ptrDepth = tempPointerDepth[ptrTemp];
+    }
+    if (ptrDepth > 0) {
+        tempPointerDepth[resultTemp] = ptrDepth;
+    }
     
     return resultTemp;
 }
@@ -5830,6 +6043,28 @@ string IRGenerator::extractTypeFromSpecQualList(Node* typeNode) {
                 typeName = n->lexeme;
             }
         }
+        else if (n->name == "STRUCT_OR_UNION_SPECIFIER") {
+            // Extract struct/union type
+            for (auto child : n->children) {
+                if (child->name == "STRUCT" || child->name == "struct") {
+                    // Find the struct name
+                    for (auto sibling : n->children) {
+                        if (sibling->name == "IDENTIFIER") {
+                            typeName = "struct " + sibling->lexeme;
+                            return;
+                        }
+                    }
+                } else if (child->name == "UNION" || child->name == "union") {
+                    // Find the union name
+                    for (auto sibling : n->children) {
+                        if (sibling->name == "IDENTIFIER") {
+                            typeName = "union " + sibling->lexeme;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         else if (n->name == "SIGNED") {
             isSigned = true;
         }
@@ -5852,3 +6087,4 @@ string IRGenerator::extractTypeFromSpecQualList(Node* typeNode) {
     
     return typeName;
 }
+
