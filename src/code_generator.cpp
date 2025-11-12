@@ -175,8 +175,27 @@ int CodeGenerator::getVarOffset(const string& varName) {
     if (varOffsets.find(varName) != varOffsets.end()) {
         return varOffsets[varName];
     }
-    // Allocate new offset
-    currentOffset -= 4;  // Assuming 4-byte integers
+    // Allocate new offset - check if it's an array
+    int varSize = 4;  // Default size for scalar variables
+    
+    // Strip SSA suffix (e.g., arr#2 -> arr) to look up in symbol table
+    string baseName = varName;
+    size_t hashPos = varName.find('#');
+    if (hashPos != string::npos) {
+        baseName = varName.substr(0, hashPos);
+    }
+    
+    Symbol* sym = symbolTable->lookuph(baseName);  // Use lookuph to search scope history
+    if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
+        // Calculate total array size
+        varSize = 4;  // Base element size (assuming int/float = 4 bytes)
+        for (int dim : sym->arrayDimensions) {
+            if (dim > 0) {
+                varSize *= dim;
+            }
+        }
+    }
+    currentOffset -= varSize;
     varOffsets[varName] = currentOffset;
     return currentOffset;
 }
@@ -203,7 +222,25 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
         // Check result operand (variables and temps that will be stored)
         if (!instr.result.empty() && !isImmediate(instr.result) && !isControlFlow) {
             if (tempOffsets.find(instr.result) == tempOffsets.end()) {
-                tempOffset -= 4;
+                // Check if this is an array variable and allocate proper space
+                int varSize = 4;  // Default size
+                // Strip SSA suffix to lookup in symbol table
+                string baseName = instr.result;
+                size_t hashPos = instr.result.find('#');
+                if (hashPos != string::npos) {
+                    baseName = instr.result.substr(0, hashPos);
+                }
+                Symbol* sym = symbolTable->lookuph(baseName);
+                if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
+                    // Calculate total array size
+                    varSize = 4;  // Base element size (assuming int/float = 4 bytes)
+                    for (int dim : sym->arrayDimensions) {
+                        if (dim > 0) {
+                            varSize *= dim;
+                        }
+                    }
+                }
+                tempOffset -= varSize;
                 tempOffsets[instr.result] = tempOffset;
                 if (tempOffset < minOffset) {
                     minOffset = tempOffset;
@@ -214,7 +251,25 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
         // Check operand1 (if it's a variable/temp that will be loaded)
         if (!instr.operand1.empty() && !isImmediate(instr.operand1) && !isControlFlow) {
             if (tempOffsets.find(instr.operand1) == tempOffsets.end()) {
-                tempOffset -= 4;
+                // Check if this is an array variable and allocate proper space
+                int varSize = 4;  // Default size
+                // Strip SSA suffix to lookup in symbol table
+                string baseName = instr.operand1;
+                size_t hashPos = instr.operand1.find('#');
+                if (hashPos != string::npos) {
+                    baseName = instr.operand1.substr(0, hashPos);
+                }
+                Symbol* sym = symbolTable->lookuph(baseName);
+                if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
+                    // Calculate total array size
+                    varSize = 4;  // Base element size
+                    for (int dim : sym->arrayDimensions) {
+                        if (dim > 0) {
+                            varSize *= dim;
+                        }
+                    }
+                }
+                tempOffset -= varSize;
                 tempOffsets[instr.operand1] = tempOffset;
                 if (tempOffset < minOffset) {
                     minOffset = tempOffset;
@@ -225,7 +280,25 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
         // Check operand2
         if (!instr.operand2.empty() && !isImmediate(instr.operand2)) {
             if (tempOffsets.find(instr.operand2) == tempOffsets.end()) {
-                tempOffset -= 4;
+                // Check if this is an array variable and allocate proper space
+                int varSize = 4;  // Default size
+                // Strip SSA suffix to lookup in symbol table
+                string baseName = instr.operand2;
+                size_t hashPos = instr.operand2.find('#');
+                if (hashPos != string::npos) {
+                    baseName = instr.operand2.substr(0, hashPos);
+                }
+                Symbol* sym = symbolTable->lookuph(baseName);
+                if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
+                    // Calculate total array size
+                    varSize = 4;  // Base element size
+                    for (int dim : sym->arrayDimensions) {
+                        if (dim > 0) {
+                            varSize *= dim;
+                        }
+                    }
+                }
+                tempOffset -= varSize;
                 tempOffsets[instr.operand2] = tempOffset;
                 if (tempOffset < minOffset) {
                     minOffset = tempOffset;
@@ -271,6 +344,11 @@ void CodeGenerator::loadOperand(const string& operand, const string& targetReg) 
             emit("move " + targetReg + ", " + srcReg);
         }
     }
+    else if (staticVars.find(operand) != staticVars.end()) {
+        // Load from global/static variable in data section
+        string label = staticVars[operand];
+        emit("lw " + targetReg + ", " + label);
+    }
     else {
         // Load from stack
         int offset = getVarOffset(operand);
@@ -284,6 +362,11 @@ void CodeGenerator::storeToVar(const string& var, const string& sourceReg) {
         if (destReg != sourceReg) {
             emit("move " + destReg + ", " + sourceReg);
         }
+    }
+    else if (staticVars.find(var) != staticVars.end()) {
+        // Store to global/static variable in data section
+        string label = staticVars[var];
+        emit("sw " + sourceReg + ", " + label);
     }
     else {
         // Store to stack
@@ -340,14 +423,75 @@ void CodeGenerator::generateDataSection() {
     dataSection.push_back("_char_fmt: .asciiz \"%c\"");
     
     // Collect string and float literals from TAC (first pass)
+    // Also collect global variable initializations (before any function)
+    // And function-local static variables (those with __inited guard)
+    std::map<std::string, int> globalInits;  // variable -> initial value
+    bool inGlobalScope = true;
+    std::string pendingConstValue = "";
+    std::string lastLabel = "";  // Track labels for detecting static init patterns
+    
     for (const auto& instr : tacInstructions) {
-        if (instr.opcode == TACOp::CONST && !instr.operand1.empty()) {
-            if (instr.operand1[0] == '"') {
-                // String literal
-                getStringLabel(instr.operand1);
-            } else if (isFloatLiteral(instr.operand1)) {
-                // Float literal
-                getOrCreateFloatLabel(instr.operand1);
+        // Check if we've entered a function
+        if (instr.opcode == TACOp::FUNC_BEGIN) {
+            inGlobalScope = false;
+        }
+        
+        // Track labels to detect static initialization guards
+        if (instr.opcode == TACOp::LABEL) {
+            lastLabel = instr.result;
+        }
+        
+        // Detect function-local static variables by their __inited guard pattern
+        if (instr.opcode == TACOp::IF_GOTO && instr.result.find("static_init_end") != std::string::npos) {
+            // This is a static init guard: if var__inited goto label
+            std::string initedVar = instr.operand1;
+            if (initedVar.find("__inited") != std::string::npos) {
+                // Extract the base variable name (remove __inited suffix)
+                std::string baseVar = initedVar.substr(0, initedVar.find("__inited"));
+                // Sanitize names for MIPS (replace # with _)
+                std::string baseLabel = baseVar;
+                std::string initedLabel = initedVar;
+                std::replace(baseLabel.begin(), baseLabel.end(), '#', '_');
+                std::replace(initedLabel.begin(), initedLabel.end(), '#', '_');
+                
+                // Add both the variable and its guard flag to static vars
+                staticVars[baseVar] = baseLabel;
+                staticVars[initedVar] = initedLabel;
+                globalInits[baseVar] = 0;  // Default to 0, will be updated if we find actual init
+                globalInits[initedVar] = 0;  // Guard flag starts at 0
+            }
+        }
+        
+        if (inGlobalScope) {
+            // Track global initializations: t1 = CONST 100, g#1 = t1
+            if (instr.opcode == TACOp::CONST && !instr.operand1.empty()) {
+                if (instr.operand1[0] == '"') {
+                    // String literal
+                    getStringLabel(instr.operand1);
+                } else if (isFloatLiteral(instr.operand1)) {
+                    // Float literal
+                    getOrCreateFloatLabel(instr.operand1);
+                } else {
+                    // Integer constant - might be for global init
+                    pendingConstValue = instr.operand1;
+                }
+            } else if (instr.opcode == TACOp::ASSIGN && !pendingConstValue.empty()) {
+                // This is a global initialization: variable = constant
+                try {
+                    int value = std::stoi(pendingConstValue);
+                    globalInits[instr.result] = value;
+                    staticVars[instr.result] = instr.result;  // Add to static vars
+                } catch (...) {}
+                pendingConstValue = "";
+            }
+        } else {
+            // In function scope - still collect string/float literals
+            if (instr.opcode == TACOp::CONST && !instr.operand1.empty()) {
+                if (instr.operand1[0] == '"') {
+                    getStringLabel(instr.operand1);
+                } else if (isFloatLiteral(instr.operand1)) {
+                    getOrCreateFloatLabel(instr.operand1);
+                }
             }
         }
     }
@@ -357,9 +501,21 @@ void CodeGenerator::generateDataSection() {
         asmCode.push_back("    " + line);
     }
     
-    // Global/static variables
+    // Global/static variables with their initial values
     for (const auto& entry : staticVars) {
-        asmCode.push_back("    " + entry.second + ": .word 0");
+        int initValue = 0;
+        auto it = globalInits.find(entry.first);
+        if (it != globalInits.end()) {
+            initValue = it->second;
+        }
+        // Sanitize label name (replace # with _)
+        string label = entry.second;
+        for (char& c : label) {
+            if (c == '#') c = '_';
+        }
+        asmCode.push_back("    " + label + ": .word " + std::to_string(initValue));
+        // Update the staticVars map with sanitized name
+        const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
     }
 }
 
@@ -399,8 +555,18 @@ void CodeGenerator::generateTextSection() {
     
     emitBlankLine();
     
-    // MAIN PASS: Generate code
+    // MAIN PASS: Generate code (skip global initialization instructions before first function)
+    bool inFunction = false;
     for (const auto& instr : tacInstructions) {
+        if (instr.opcode == TACOp::FUNC_BEGIN) {
+            inFunction = true;
+        }
+        
+        // Skip global-scope instructions (they're handled in data section)
+        if (!inFunction && instr.opcode != TACOp::FUNC_BEGIN) {
+            continue;
+        }
+        
         generateInstruction(instr);
     }
     
@@ -503,7 +669,7 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
         case TACOp::GET_PARAM:
             // result = param[index]
             // Parameters 0-3: in $a0-$a3
-            // Parameters 4+: on stack at 16($fp), 20($fp), 24($fp), ...
+            // Parameters 4+: on stack ABOVE the frame (caller's responsibility)
             {
                 int paramIdx = 0;
                 if (!instr.operand1.empty()) {
@@ -516,8 +682,9 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                     emit("move $t0, " + argReg);
                 } else {
                     // Parameter on stack (beyond first 4)
-                    // Stack args start at 16($fp): above saved $ra and $fp
-                    int offset = 16 + ((paramIdx - 4) * 4);
+                    // Stack args are ABOVE our frame: frameSize + (paramIdx-4)*4
+                    // The caller pushed them before calling us
+                    int offset = currentFunctionFrameSize + ((paramIdx - 4) * 4);
                     emit("lw $t0, " + to_string(offset) + "($fp)");
                 }
                 storeToVar(instr.result, "$t0");
@@ -803,7 +970,10 @@ void CodeGenerator::generateStore(const TACInstruction& instr) {
     // *result = op1 (store through pointer)
     loadOperand(instr.operand1, "$t0");  // Get value
     loadOperand(instr.result, "$t1");    // Get address
-    emit("sw $t0, 0($t1)");              // Store value at address
+    
+    // For now, always use sb (store byte) to avoid alignment issues with char arrays
+    // TODO: Use proper type information to decide between sb/sh/sw
+    emit("sb $t0, 0($t1)");  // Store byte (works for char, handles unaligned addresses)
 }
 
 void CodeGenerator::generateAddress(const TACInstruction& instr) {
@@ -840,6 +1010,13 @@ void CodeGenerator::generateArrayStore(const TACInstruction& instr) {
 //============================================================================
 
 void CodeGenerator::generateLabel(const TACInstruction& instr) {
+    // Skip function entry labels (func_XXX:) since FUNC_BEGIN handles them
+    if (instr.result.find("func_") == 0 && instr.result.find("_epilogue") == std::string::npos &&
+        instr.result.find("_start") == std::string::npos && instr.result.find("_end") == std::string::npos &&
+        instr.result.find("_cond") == std::string::npos && instr.result.find("_update") == std::string::npos) {
+        // This looks like a function entry label, skip it
+        return;
+    }
     emitLabel(instr.result);
 }
 
@@ -878,7 +1055,10 @@ void CodeGenerator::generateFuncBegin(const TACInstruction& instr) {
     }
     
     emitBlankLine();
-    emitLabel(instr.result);
+    // Add func_ prefix to avoid conflicts with MIPS instructions (add, sub, etc.)
+    // Exception: keep 'main' as-is since SPIM expects it
+    string funcLabel = (instr.result == "main") ? instr.result : "func_" + instr.result;
+    emitLabel(funcLabel);
     
     // Function prologue - CORRECT ORDER WITH PROPER FRAME SIZE
     // 1. Allocate FULL frame (includes locals, temporaries, saved regs, params)
@@ -899,7 +1079,8 @@ void CodeGenerator::generateFuncBegin(const TACInstruction& instr) {
 
 void CodeGenerator::generateFuncEnd(const TACInstruction& instr) {
     // Function epilogue - CORRECT ORDER WITH PROPER FRAME SIZE
-    emitLabel(instr.result + "_epilogue");
+    string funcLabel = (instr.result == "main") ? instr.result : "func_" + instr.result;
+    emitLabel(funcLabel + "_epilogue");
     
     // Use the same frame size as prologue
     int frameSpace = currentFunctionFrameSize;
@@ -979,6 +1160,20 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
                             emit("syscall");
                             argIndex++;
                             pos = specPos + 2;
+                        } else if (spec == 's' && argIndex < paramQueue.size()) {
+                            // Print string
+                            loadOperand(paramQueue[argIndex], "$a0");
+                            emit("li $v0, 4");       // print_string
+                            emit("syscall");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else if (spec == 'c' && argIndex < paramQueue.size()) {
+                            // Print character
+                            loadOperand(paramQueue[argIndex], "$a0");
+                            emit("li $v0, 11");      // print_char
+                            emit("syscall");
+                            argIndex++;
+                            pos = specPos + 2;
                         } else if (spec == '%') {
                             // Literal % - print it
                             string label = "_str_" + to_string(labelCounter++);
@@ -1015,11 +1210,103 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
         return;
     }
     
+    // Special handling for scanf - convert to SPIM syscalls
+    if (instr.operand1 == "scanf") {
+        if (paramQueue.size() >= 2) {
+            // Get format string
+            string formatParam = paramQueue[0];
+            string formatStr = "";
+            if (varToStringLiteral.find(formatParam) != varToStringLiteral.end()) {
+                formatStr = varToStringLiteral[formatParam];
+            }
+            
+            // Parse format string and read values
+            if (!formatStr.empty()) {
+                size_t pos = 0;
+                int argIndex = 1;
+                
+                while (pos < formatStr.length()) {
+                    size_t specPos = formatStr.find('%', pos);
+                    
+                    if (specPos == string::npos) {
+                        break;
+                    }
+                    
+                    // Handle format specifier
+                    if (specPos + 1 < formatStr.length()) {
+                        char spec = formatStr[specPos + 1];
+                        if (spec == 'd' && argIndex < paramQueue.size()) {
+                            // Read integer
+                            emit("li $v0, 5");       // read_int syscall
+                            emit("syscall");
+                            // Store to address in parameter (scanf uses pointers)
+                            loadOperand(paramQueue[argIndex], "$t0");
+                            emit("sw $v0, 0($t0)");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else if (spec == 'f' && argIndex < paramQueue.size()) {
+                            // Read float
+                            emit("li $v0, 6");       // read_float syscall
+                            emit("syscall");
+                            // Store to address
+                            loadOperand(paramQueue[argIndex], "$t0");
+                            emit("swc1 $f0, 0($t0)");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else if (spec == 's' && argIndex < paramQueue.size()) {
+                            // Read string
+                            loadOperand(paramQueue[argIndex], "$a0");  // Buffer address
+                            emit("li $a1, 256");     // Max length
+                            emit("li $v0, 8");       // read_string syscall
+                            emit("syscall");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else if (spec == 'c' && argIndex < paramQueue.size()) {
+                            // Read character (read_int and take low byte)
+                            emit("li $v0, 12");      // read_char syscall
+                            emit("syscall");
+                            loadOperand(paramQueue[argIndex], "$t0");
+                            emit("sb $v0, 0($t0)");
+                            argIndex++;
+                            pos = specPos + 2;
+                        } else {
+                            pos = specPos + 2;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // Fallback - just read one integer
+                emit("li $v0, 5");       // read_int
+                emit("syscall");
+                if (paramQueue.size() >= 2) {
+                    loadOperand(paramQueue[1], "$t0");
+                    emit("sw $v0, 0($t0)");
+                }
+            }
+        }
+        
+        paramQueue.clear();
+        return;
+    }
+    
     // MIPS calling convention for other functions:
     // First 4 params in $a0-$a3
     // Remaining params on stack ABOVE the return address
     
-    int numParams = paramQueue.size();
+    // Use the parameter count from the CALL instruction, not the queue size
+    // (The queue may have extra params from nested calls)
+    int numParams = instr.paramCount;
+    
+    // Sanity check: make sure we have enough params in queue
+    if (numParams > (int)paramQueue.size()) {
+        numParams = paramQueue.size();
+    }
+    
+    // Use the LAST numParams from the queue (for nested calls)
+    int startIdx = paramQueue.size() - numParams;
+    
     int stackParams = (numParams > 4) ? (numParams - 4) : 0;
     
     // 1. Reserve space for stack parameters (if any)
@@ -1028,22 +1315,24 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
         emit("addi $sp, $sp, -" + to_string(stackSpace));
     }
     
-    // 2. Pass parameters
+    // 2. Pass parameters (use only the last numParams from queue)
     for (int i = 0; i < numParams; i++) {
         if (i < 4) {
             // Use $a0-$a3 for first 4 parameters
             string argReg = "$a" + to_string(i);
-            loadOperand(paramQueue[i], argReg);
+            loadOperand(paramQueue[startIdx + i], argReg);
         } else {
             // Push to stack for parameters beyond 4
-            loadOperand(paramQueue[i], "$t0");
+            loadOperand(paramQueue[startIdx + i], "$t0");
             int offset = (i - 4) * 4;
             emit("sw $t0, " + to_string(offset) + "($sp)");
         }
     }
     
-    // 3. Call function
-    emit("jal " + instr.operand1);
+    // 3. Call function (add func_ prefix to avoid conflicts with MIPS instructions)
+    // Exception: keep 'main' as-is
+    string callTarget = (instr.operand1 == "main") ? instr.operand1 : "func_" + instr.operand1;
+    emit("jal " + callTarget);
     
     // 4. Clean up stack parameters (if any)
     if (stackParams > 0) {
@@ -1056,8 +1345,13 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
         storeToVar(instr.result, "$v0");
     }
     
-    // Clear parameter queue
-    paramQueue.clear();
+    // Remove only the parameters we used from the queue
+    // (Keep any params for outer function calls)
+    for (int i = 0; i < numParams; i++) {
+        if (!paramQueue.empty()) {
+            paramQueue.pop_back();
+        }
+    }
 }
 
 void CodeGenerator::generateReturn(const TACInstruction& instr) {
@@ -1065,7 +1359,8 @@ void CodeGenerator::generateReturn(const TACInstruction& instr) {
     if (!instr.operand1.empty()) {
         loadOperand(instr.operand1, "$v0");
     }
-    emit("j " + currentFunction + "_epilogue");
+    string funcLabel = (currentFunction == "main") ? currentFunction : "func_" + currentFunction;
+    emit("j " + funcLabel + "_epilogue");
 }
 
 //============================================================================
