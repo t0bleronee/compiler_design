@@ -8,8 +8,9 @@
 using namespace std;
 
 CodeGenerator::CodeGenerator(const vector<TACInstruction>& instructions, SymbolTable* symTab,
-                             const map<string, string>& strLiterals)
-    : tacInstructions(instructions), symbolTable(symTab), 
+                             const map<string, string>& strLiterals,
+                             const map<string, string>& tempTypeMap)
+    : tacInstructions(instructions), symbolTable(symTab), irTempTypes(tempTypeMap),
       frameSize(0), currentOffset(0), stringCounter(0), floatCounter(0),
       functionParamCount(0), currentFunctionFrameSize(0), inFunction(false), labelCounter(0) {
     registers.init();
@@ -322,17 +323,16 @@ CodeGenerator::TypeInfo CodeGenerator::getTypeInfo(const string& varName) {
 }
 
 int CodeGenerator::getVarOffset(const string& varName) {
-    // ✅ CRITICAL FIX: Strip SSA suffix FIRST before any lookups
-    // This ensures matrix2d#1 and matrix2d refer to the SAME stack location
+    // Check if already allocated (using FULL SSA name for shadowing support)
+    if (varOffsets.find(varName) != varOffsets.end()) {
+        return varOffsets[varName];
+    }
+    
+    // Extract base name for symbol table lookup and static variable checks
     string baseName = varName;
     size_t hashPos = varName.find('#');
     if (hashPos != string::npos) {
         baseName = varName.substr(0, hashPos);
-    }
-    
-    // Check if already allocated (using base name)
-    if (varOffsets.find(baseName) != varOffsets.end()) {
-        return varOffsets[baseName];
     }
     
     // FIXED: Check if this variable was already identified as a global during pre-scan
@@ -344,21 +344,63 @@ int CodeGenerator::getVarOffset(const string& varName) {
     // This is a local variable - allocate stack space for it
     Symbol* sym = symbolTable->lookuph(baseName);
     
-    // Allocate new offset for local variable - check if it's an array
+    // Allocate new offset for local variable - check size needed
     int varSize = 4;  // Default size for scalar variables
     
     if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
-        // Calculate total array size
+        // Calculate total array size (handles both regular and struct arrays)
         varSize = 4;  // Base element size (assuming int/float = 4 bytes)
+        
+        // Check if base type is struct
+        string baseType = sym->type;
+        size_t openBracket = baseType.find('[');
+        if (openBracket != string::npos) {
+            baseType = baseType.substr(0, openBracket);
+        }
+        // Remove "struct " prefix if present
+        if (baseType.find("struct ") == 0) {
+            baseType = baseType.substr(7);
+        }
+        Symbol* structSym = symbolTable->lookuph(baseType);
+        if (structSym && structSym->isStruct) {
+            varSize = structSym->structMemberOrder.size() * 4;
+        }
+        
         for (int dim : sym->arrayDimensions) {
             if (dim > 0) {
                 varSize *= dim;
             }
         }
+    } else if (sym && sym->isStruct) {
+        // Calculate struct size based on number of members
+        string structTypeName = sym->type;
+        if (structTypeName.find("struct ") == 0) {
+            structTypeName = structTypeName.substr(7);
+        }
+        
+        // Check if it's a typedef to a struct
+        Symbol* structTypeSym = symbolTable->lookuph(structTypeName);
+        if (!structTypeSym || !structTypeSym->isStruct) {
+            // Maybe it's a typedef
+            Symbol* typedefSym = symbolTable->lookuph(sym->type);
+            if (typedefSym && typedefSym->isTypedef && typedefSym->isStruct) {
+                structTypeName = typedefSym->type;
+                if (structTypeName.find("struct ") == 0) {
+                    structTypeName = structTypeName.substr(7);
+                }
+                structTypeSym = symbolTable->lookuph(structTypeName);
+            }
+        }
+        
+        if (structTypeSym && structTypeSym->isStruct) {
+            // Each member is 4 bytes
+            varSize = structTypeSym->structMemberOrder.size() * 4;
+        }
     }
     currentOffset -= varSize;
-    // ✅ Store using BASE NAME so all SSA versions map to same location
-    varOffsets[baseName] = currentOffset;
+    // ✅ Store using FULL SSA NAME so shadowed variables get separate stack locations
+    // This allows x#1 and x#2 to have different offsets
+    varOffsets[varName] = currentOffset;
     return currentOffset;
 }
 
@@ -396,6 +438,22 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
                 if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
                     // Calculate total array size
                     varSize = 4;  // Base element size (assuming int/float = 4 bytes)
+                    
+                    // Check if base type is struct
+                    string baseType = sym->type;
+                    size_t openBracket = baseType.find('[');
+                    if (openBracket != string::npos) {
+                        baseType = baseType.substr(0, openBracket);
+                    }
+                    // Remove "struct " prefix
+                    if (baseType.find("struct ") == 0) {
+                        baseType = baseType.substr(7);
+                    }
+                    Symbol* structSym = symbolTable->lookuph(baseType);
+                    if (structSym && structSym->isStruct) {
+                        varSize = structSym->structMemberOrder.size() * 4;
+                    }
+                    
                     for (int dim : sym->arrayDimensions) {
                         if (dim > 0) {
                             varSize *= dim;
@@ -425,6 +483,22 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
                 if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
                     // Calculate total array size
                     varSize = 4;  // Base element size
+                    
+                    // Check if base type is struct
+                    string baseType = sym->type;
+                    size_t openBracket = baseType.find('[');
+                    if (openBracket != string::npos) {
+                        baseType = baseType.substr(0, openBracket);
+                    }
+                    // Remove "struct " prefix
+                    if (baseType.find("struct ") == 0) {
+                        baseType = baseType.substr(7);
+                    }
+                    Symbol* structSym = symbolTable->lookuph(baseType);
+                    if (structSym && structSym->isStruct) {
+                        varSize = structSym->structMemberOrder.size() * 4;
+                    }
+                    
                     for (int dim : sym->arrayDimensions) {
                         if (dim > 0) {
                             varSize *= dim;
@@ -454,6 +528,22 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
                 if (sym && sym->isArray && !sym->arrayDimensions.empty()) {
                     // Calculate total array size
                     varSize = 4;  // Base element size
+                    
+                    // Check if base type is struct
+                    string baseType = sym->type;
+                    size_t openBracket = baseType.find('[');
+                    if (openBracket != string::npos) {
+                        baseType = baseType.substr(0, openBracket);
+                    }
+                    // Remove "struct " prefix
+                    if (baseType.find("struct ") == 0) {
+                        baseType = baseType.substr(7);
+                    }
+                    Symbol* structSym = symbolTable->lookuph(baseType);
+                    if (structSym && structSym->isStruct) {
+                        varSize = structSym->structMemberOrder.size() * 4;
+                    }
+                    
                     for (int dim : sym->arrayDimensions) {
                         if (dim > 0) {
                             varSize *= dim;
@@ -473,15 +563,14 @@ int CodeGenerator::calculateFrameSize(size_t funcStartIdx, size_t funcEndIdx) {
     int localsSpace = -minOffset;  // Convert negative offset to positive size
     int paramSpace = (functionParamCount > 4 ? 4 : functionParamCount) * 4;
     
-    // ✅ FIX: Add safety margin for temporaries created during code generation
-    // printf and complex expressions create many temporaries not visible in TAC
-    // Formula: 3x the calculated space to be safe (triples available stack)
-    int safetyMultiplier = 3;
+    // Add reasonable safety margin for runtime temporaries (printf, expressions)
+    // We add 64 bytes instead of multiplying to avoid excessive stack usage
+    int safetyMargin = 64;
     
-    int totalSpace = (localsSpace + 8 + paramSpace) * safetyMultiplier;
+    int totalSpace = localsSpace + 8 + paramSpace + safetyMargin;
     
     // Ensure minimum frame size and round up to 8-byte alignment for MIPS
-    if (totalSpace < 128) totalSpace = 128;  // Higher minimum for functions with loops/printf
+    if (totalSpace < 64) totalSpace = 64;  // Reasonable minimum
     if (totalSpace % 8 != 0) {
         totalSpace = ((totalSpace / 8) + 1) * 8;
     }
@@ -543,6 +632,10 @@ void CodeGenerator::loadFloatOperand(const string& operand, const string& target
         emit("cvt.s.w " + targetReg + ", " + targetReg);  // Convert int to float
     }
     else if (isTemp(operand) || isVariable(operand)) {
+        // Check if the operand is actually a float or needs conversion
+        string opType = getVarType(operand);
+        bool isFloat = (opType == "float" || opType == "double");
+        
         // Load from stack
         int offset = getVarOffset(operand);
         if (offset == -1) {
@@ -553,11 +646,25 @@ void CodeGenerator::loadFloatOperand(const string& operand, const string& target
                 baseName = operand.substr(0, hashPos);
             }
             if (staticVars.find(baseName) != staticVars.end()) {
-                emit("la $t9, " + staticVars[baseName]);
-                emit("lwc1 " + targetReg + ", 0($t9)");
+                if (isFloat) {
+                    emit("la $t9, " + staticVars[baseName]);
+                    emit("lwc1 " + targetReg + ", 0($t9)");
+                } else {
+                    // Integer global - load and convert
+                    emit("lw $t9, " + staticVars[baseName]);
+                    emit("mtc1 $t9, " + targetReg);
+                    emit("cvt.s.w " + targetReg + ", " + targetReg);
+                }
             }
         } else {
-            emit("lwc1 " + targetReg + ", " + to_string(offset) + "($fp)");
+            if (isFloat) {
+                emit("lwc1 " + targetReg + ", " + to_string(offset) + "($fp)");
+            } else {
+                // Integer/char/bool variable - load as int and convert to float
+                emit("lw $t9, " + to_string(offset) + "($fp)");
+                emit("mtc1 $t9, " + targetReg);
+                emit("cvt.s.w " + targetReg + ", " + targetReg);
+            }
         }
     }
 }
@@ -758,54 +865,16 @@ void CodeGenerator::generateDataSection() {
         }
     }
     
-    // PASS 2: Find scalar globals used directly (not via ADDRESS)
-    // These are globals that are read/written directly like: hanoi_moves = hanoi_moves + 1
-    for (const auto& instr : tacInstructions) {
-        auto checkScalarGlobal = [&](const string& varName) {
-            if (varName.empty() || varName[0] == 't' || varName[0] == '"' || 
-                isdigit(varName[0]) || varName.find('.') != string::npos) {
-                return;
-            }
-            
-            // Already detected in PASS 1?
-            if (staticVars.find(varName) != staticVars.end()) {
-                return;
-            }
-            
-            string baseName = varName;
-            size_t hashPos = baseName.find('#');
-            if (hashPos != string::npos) {
-                baseName = baseName.substr(0, hashPos);
-            }
-            
-            // Skip parameters
-            if (parameterNames.find(baseName) != parameterNames.end()) {
-                return;
-            }
-            
-            // Check symbol table: must be global (not local, not static, not function)
-            Symbol* sym = symbolTable->lookuph(baseName);
-            if (sym && !sym->isLocal && !sym->isStatic && !sym->isFunction) {
-                string sanitizedName = varName;
-                std::replace(sanitizedName.begin(), sanitizedName.end(), '#', '_');
-                staticVars[varName] = sanitizedName;
-                if (globalInits.find(varName) == globalInits.end()) {
-                    globalInits[varName] = 0;
-                }
-            }
-        };
-        
-        // Check operands and results for potential scalar globals
-        checkScalarGlobal(instr.operand1);
-        checkScalarGlobal(instr.operand2);
-        checkScalarGlobal(instr.result);
-    }
+    // PASS 2: Disabled - only detect globals from explicit initialization in global scope
+    // This avoids false positives from labels, keywords, and function names
+    // Globals are now detected only from CONST assignments below
     
     // Collect string and float literals from TAC
     // Also collect global variable initializations (before any function)
     // And function-local static variables (those with __inited guard)
     bool inGlobalScope = true;
     std::string pendingConstValue = "";
+    std::string pendingAddressOf = "";
     std::string lastLabel = "";  // Track labels for detecting static init patterns
     
     for (const auto& instr : tacInstructions) {
@@ -901,26 +970,103 @@ void CodeGenerator::generateDataSection() {
         }
         
         if (inGlobalScope) {
-            // Track global initializations: t1 = CONST 100, g#1 = t1
-            if (instr.opcode == TACOp::CONST && !instr.operand1.empty()) {
-                if (instr.operand1[0] == '"') {
-                    // String literal
-                    getStringLabel(instr.operand1);
-                } else if (isFloatLiteral(instr.operand1)) {
-                    // Float literal
-                    getOrCreateFloatLabel(instr.operand1);
-                } else {
-                    // Integer constant - might be for global init
-                    pendingConstValue = instr.operand1;
+            // Track global initializations - ONLY detect globals from actual initialization
+            // Pattern 1: global_var = CONST 42 (direct, NEW: no # suffix)
+            // Pattern 2: global#1 = CONST 101 (direct, OLD: with # suffix)  
+            // Pattern 3: t1 = CONST 100; global = t1 (indirect)
+            if (instr.opcode == TACOp::CONST) {
+                // Check if assigning directly to a variable (global or temp)
+                // Filter out temps like t1, t2, t100 but NOT variables like test_count
+                bool isTemp = (!instr.result.empty() && instr.result[0] == 't' && 
+                               instr.result.length() > 1 && isdigit(instr.result[1]));
+                
+                if (!instr.result.empty() && !isTemp && 
+                    !isdigit(instr.result[0]) && instr.result.find('.') == string::npos) {
+                    // Direct assignment to non-temp variable - this is likely a global
+                    // Verify it's not a keyword or function name
+                    bool isValidGlobal = true;
+                    
+                    // Skip if it matches C/C++ keywords or operators
+                    static const set<string> keywords = {
+                        "if", "else", "while", "for", "do", "switch", "case", "default",
+                        "return", "break", "continue", "goto", "void", "int", "float", 
+                        "double", "char", "bool", "struct", "union", "enum", "typedef",
+                        "const", "static", "extern", "auto", "register", "volatile",
+                        "sizeof", "long", "short", "signed", "unsigned"
+                    };
+                    
+                    string baseName = instr.result;
+                    if (baseName.find('#') != string::npos) {
+                        baseName = baseName.substr(0, baseName.find('#'));
+                    }
+                    
+                    if (keywords.find(baseName) != keywords.end()) {
+                        isValidGlobal = false;
+                    }
+                    
+                    // Check if it's a function
+                    Symbol* sym = symbolTable->lookuph(baseName);
+                    if (sym && sym->isFunction) {
+                        isValidGlobal = false;
+                    }
+                    
+                    if (isValidGlobal) {
+                        try {
+                            int value = std::stoi(instr.operand1);
+                            globalInits[instr.result] = value;
+                            // Mark as global - use name as-is (no sanitization for new style)
+                            if (instr.result.find('#') == string::npos) {
+                                staticVars[instr.result] = instr.result;
+                            } else {
+                                // Old style with #, sanitize it
+                                string sanitized = instr.result;
+                                std::replace(sanitized.begin(), sanitized.end(), '#', '_');
+                                staticVars[instr.result] = sanitized;
+                            }
+                        } catch (...) {}
+                    }
+                } else if (instr.result.find('#') != string::npos) {
+                    // OLD: Direct with # suffix: global#1 = CONST 101
+                    try {
+                        int value = std::stoi(instr.operand1);
+                        globalInits[instr.result] = value;
+                        string sanitized = instr.result;
+                        std::replace(sanitized.begin(), sanitized.end(), '#', '_');
+                        staticVars[instr.result] = sanitized;
+                    } catch (...) {}
+                } else if (!instr.operand1.empty()) {
+                    // Indirect: t1 = CONST 100 (store for next ASSIGN)
+                    if (instr.operand1[0] == '"') {
+                        getStringLabel(instr.operand1);
+                    } else if (isFloatLiteral(instr.operand1)) {
+                        getOrCreateFloatLabel(instr.operand1);
+                    } else {
+                        pendingConstValue = instr.operand1;
+                    }
                 }
-            } else if (instr.opcode == TACOp::ASSIGN && !pendingConstValue.empty()) {
-                // This is a global initialization: variable = constant
-                try {
-                    int value = std::stoi(pendingConstValue);
-                    globalInits[instr.result] = value;
-                    staticVars[instr.result] = instr.result;  // Add to static vars
-                } catch (...) {}
-                pendingConstValue = "";
+            } else if (instr.opcode == TACOp::ADDRESS) {
+                // Track address operation for pointer initialization
+                // t1 = &global_var#1
+                pendingAddressOf = instr.operand1;  // Store the variable being addressed
+            } else if (instr.opcode == TACOp::ASSIGN) {
+                if (!pendingAddressOf.empty() && instr.result.find('#') != string::npos) {
+                    // Pattern: t1 = &var; global_ptr = t1
+                    // Need runtime initialization - defer to global init section
+                    globalPointerInits[instr.result] = pendingAddressOf;
+                    staticVars[instr.result] = instr.result;
+                    pendingAddressOf = "";
+                } else if (!pendingConstValue.empty()) {
+                    // Indirect: global = t1 (where t1 = CONST 100)
+                    try {
+                        int value = std::stoi(pendingConstValue);
+                        globalInits[instr.result] = value;
+                        // Mark as global if no # suffix
+                        if (instr.result.find('#') == string::npos) {
+                            staticVars[instr.result] = instr.result;
+                        }
+                    } catch (...) {}
+                    pendingConstValue = "";
+                }
             }
         } else {
             // In function scope - still collect string/float literals
@@ -960,10 +1106,46 @@ void CodeGenerator::generateDataSection() {
                 hasInitializedGlobals = true;
             }
             
+            // Check if this is a struct - needs space allocation, not .word
+            if (sym && sym->isStruct) {
+                string label = entry.second;
+                for (char& c : label) {
+                    if (c == '#') c = '_';
+                }
+                
+                // For now, allocate fixed 32 bytes for global structs
+                // TODO: Look up actual struct size from symbol table
+                int structSize = 32;
+                
+                asmCode.push_back("    .align 2");
+                asmCode.push_back(label + ": .space " + std::to_string(structSize));
+                const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
+                continue;
+            }
+            
             int initValue = 0;
             auto it = globalInits.find(entry.first);
             if (it != globalInits.end()) {
                 initValue = it->second;
+            }
+            
+            // Check if this is a pointer with address initialization
+            auto ptrIt = globalPointerInits.find(entry.first);
+            if (ptrIt != globalPointerInits.end()) {
+                // This pointer should be initialized with an address
+                // We can do this statically in the data section
+                string label = entry.second;
+                for (char& c : label) {
+                    if (c == '#') c = '_';
+                }
+                
+                // Get the target label
+                string targetLabel = staticVars[ptrIt->second];
+                
+                asmCode.push_back("    .align 2");
+                asmCode.push_back(label + ": .word " + targetLabel);
+                const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
+                continue;  // Skip normal initialization
             }
             
             string label = entry.second;
@@ -972,7 +1154,7 @@ void CodeGenerator::generateDataSection() {
             }
             
             asmCode.push_back("    .align 2");
-            asmCode.push_back("    " + label + ": .word " + std::to_string(initValue));
+            asmCode.push_back(label + ": .word " + std::to_string(initValue));
             
             // Update the staticVars map with sanitized name
             const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
@@ -1010,7 +1192,7 @@ void CodeGenerator::generateDataSection() {
             }
             
             asmCode.push_back("    .align 2");
-            asmCode.push_back("    " + label + ": .space " + std::to_string(totalSize));
+            asmCode.push_back(label + ": .space " + std::to_string(totalSize));
             
             // Update the staticVars map with sanitized name
             const_cast<std::map<std::string, std::string>&>(staticVars)[entry.first] = label;
@@ -1053,6 +1235,42 @@ void CodeGenerator::generateTextSection() {
     }
     
     emitBlankLine();
+    
+    // NOTE: Global pointer initialization is now done statically in data section
+    // But global array initialization still needs runtime code
+    
+    // Collect global initialization instructions (before first FUNC_BEGIN)
+    std::vector<TACInstruction> globalInitInstructions;
+    for (const auto& instr : tacInstructions) {
+        if (instr.opcode == TACOp::FUNC_BEGIN) {
+            break;  // Stop at first function
+        }
+        if (instr.opcode != TACOp::COMMENT && instr.opcode != TACOp::NOP) {
+            globalInitInstructions.push_back(instr);
+        }
+    }
+    
+    // Generate __init function for global initialization if needed
+    if (!globalInitInstructions.empty()) {
+        emitComment("Global initialization function");
+        emitLabel("__init");
+        emit("addi $sp, $sp, -64");
+        emit("sw $ra, 60($sp)");
+        emit("sw $fp, 56($sp)");
+        emit("move $fp, $sp");
+        
+        inFunction = true;  // Enable code generation
+        for (const auto& instr : globalInitInstructions) {
+            generateInstruction(instr);
+        }
+        
+        emit("lw $fp, 56($sp)");
+        emit("lw $ra, 60($sp)");
+        emit("addi $sp, $sp, 64");
+        emit("jr $ra");
+        emitBlankLine();
+        inFunction = false;
+    }
     
     // MAIN PASS: Generate code (skip global initialization instructions before first function)
     bool inFunction = false;
@@ -1170,7 +1388,21 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                 storeFloatToVar(instr.result, "$f0");
                 // Mark as float type
                 setVarType(instr.result, "float");
-            } else {
+            } 
+            // FIXED: Handle bool literals (true/false/TRUE/FALSE)
+            else if (instr.operand1 == "true" || instr.operand1 == "TRUE") {
+                emit("li $t0, 1");
+                storeToVar(instr.result, "$t0");
+                // Mark as bool type
+                varTypes[instr.result] = "bool";
+            }
+            else if (instr.operand1 == "false" || instr.operand1 == "FALSE") {
+                emit("li $t0, 0");
+                storeToVar(instr.result, "$t0");
+                // Mark as bool type
+                varTypes[instr.result] = "bool";
+            }
+            else {
                 // Integer constant
                 emit("li $t0, " + instr.operand1);
                 storeToVar(instr.result, "$t0");
@@ -1179,7 +1411,7 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
         
         case TACOp::GET_PARAM:
             // result = param[index]
-            // Parameters 0-3: in $a0-$a3
+            // Parameters 0-3: in $a0-$a3 (int) or $f12/$f14/$f16/$f18 (float)
             // Parameters 4+: on stack ABOVE the frame (caller's responsibility)
             {
                 int paramIdx = 0;
@@ -1187,18 +1419,56 @@ void CodeGenerator::generateInstruction(const TACInstruction& instr) {
                     paramIdx = stoi(instr.operand1);
                 }
                 
+                // Determine parameter type by looking up current function's signature
+                bool isFloatParam = false;
+                if (currentFunction != "") {
+                    Symbol* funcSym = symbolTable->lookuph(currentFunction);
+                    if (funcSym && funcSym->isFunction && paramIdx < funcSym->paramTypes.size()) {
+                        string paramType = funcSym->paramTypes[paramIdx];
+                        isFloatParam = (paramType == "float");
+                    }
+                }
+                
+                // Also need to track the actual parameter type from symbol table
+                string actualParamType = "int";  // default
+                if (currentFunction != "") {
+                    Symbol* funcSym = symbolTable->lookuph(currentFunction);
+                    if (funcSym && funcSym->isFunction && paramIdx < funcSym->paramTypes.size()) {
+                        actualParamType = funcSym->paramTypes[paramIdx];
+                    }
+                }
+                
                 if (paramIdx < 4) {
-                    // Parameter is in register $a0-$a3
-                    string argReg = "$a" + to_string(paramIdx);
-                    emit("move $t0, " + argReg);
+                    if (isFloatParam) {
+                        // Float parameter is in $f12, $f14, $f16, or $f18
+                        string floatReg = "$f" + to_string(12 + paramIdx * 2);
+                        storeFloatToVar(instr.result, floatReg);
+                        // Mark as float type
+                        varTypes[instr.result] = "float";
+                    } else {
+                        // Integer parameter is in $a0-$a3
+                        string argReg = "$a" + to_string(paramIdx);
+                        emit("move $t0, " + argReg);
+                        storeToVar(instr.result, "$t0");
+                        // Mark the actual parameter type
+                        varTypes[instr.result] = actualParamType;
+                    }
                 } else {
                     // Parameter on stack (beyond first 4)
                     // Stack args are ABOVE our frame: frameSize + (paramIdx-4)*4
                     // The caller pushed them before calling us
                     int offset = currentFunctionFrameSize + ((paramIdx - 4) * 4);
-                    emit("lw $t0, " + to_string(offset) + "($fp)");
+                    if (isFloatParam) {
+                        emit("lwc1 $f0, " + to_string(offset) + "($fp)");
+                        storeFloatToVar(instr.result, "$f0");
+                        varTypes[instr.result] = "float";
+                    } else {
+                        emit("lw $t0, " + to_string(offset) + "($fp)");
+                        storeToVar(instr.result, "$t0");
+                        // Mark the actual parameter type
+                        varTypes[instr.result] = actualParamType;
+                    }
                 }
-                storeToVar(instr.result, "$t0");
                 
                 // Track parameter type in varTypes
                 string baseName = instr.result;
@@ -1612,7 +1882,7 @@ void CodeGenerator::generateLoad(const TACInstruction& instr) {
     // result = *op1 (pointer dereference)
     loadOperand(instr.operand1, "$t0");  // Get address
     
-    // FIXED: Check if this is loading a float
+    // PRIORITY 1: Check varTypes for multi-level pointers (char**, float**, int**, etc.)
     if (varTypes.find(instr.operand1) != varTypes.end()) {
         string ptrType = varTypes[instr.operand1];
         // Count pointer levels (number of '*' characters)
@@ -1642,8 +1912,8 @@ void CodeGenerator::generateLoad(const TACInstruction& instr) {
                 storeFloatToVar(instr.result, "$f0");
                 setVarType(instr.result, "float");
                 return;
-            } else if (baseType == "char") {
-                emit("lb $t0, 0($t0)");  // Load byte for char*
+            } else if (baseType == "char" || baseType == "bool") {
+                emit("lb $t0, 0($t0)");  // Load byte for char* or bool*
                 storeToVar(instr.result, "$t0");
                 return;
             } else if (baseType == "short") {
@@ -1651,6 +1921,18 @@ void CodeGenerator::generateLoad(const TACInstruction& instr) {
                 storeToVar(instr.result, "$t0");
                 return;
             }
+        }
+    }
+    
+    // PRIORITY 2: Check IR generator's type info (for union/struct members)
+    if (irTempTypes.find(instr.operand1) != irTempTypes.end()) {
+        string ptrType = irTempTypes.at(instr.operand1);
+        if (ptrType == "float*") {
+            // Load float from this address
+            emit("lwc1 $f0, 0($t0)");
+            storeFloatToVar(instr.result, "$f0");
+            setVarType(instr.result, "float");
+            return;
         }
     }
     
@@ -1669,8 +1951,8 @@ void CodeGenerator::generateLoad(const TACInstruction& instr) {
             storeFloatToVar(instr.result, "$f0");
             setVarType(instr.result, "float");
             return;
-        } else if (sym->type == "char") {
-            emit("lb $t0, 0($t0)");  // Load byte for char*
+        } else if (sym->type == "char" || sym->type == "bool") {
+            emit("lb $t0, 0($t0)");  // Load byte for char* or bool*
         } else if (sym->type == "short") {
             emit("lh $t0, 0($t0)");  // Load halfword for short*
         } else {
@@ -1687,25 +1969,50 @@ void CodeGenerator::generateLoad(const TACInstruction& instr) {
 void CodeGenerator::generateStore(const TACInstruction& instr) {
     // *result = op1 (store through pointer)
     
-    // FIXED: Check if storing a float
+    // FIXED: Check if storing a float or char - check varTypes FIRST for temporaries
+    string storeType = "";
     bool isFloatStore = false;
+    bool isCharStore = false;
+    
     if (varTypes.find(instr.result) != varTypes.end()) {
         string ptrType = varTypes[instr.result];
-        // Remove the '*' to get base type (e.g., "float*" -> "float")
-        size_t starPos = ptrType.find('*');
-        if (starPos != string::npos) {
+        // Count pointer levels (number of '*' characters)
+        int ptrLevel = 0;
+        for (char c : ptrType) {
+            if (c == '*') ptrLevel++;
+        }
+        
+        // Remove the last '*' to get what we're storing to
+        size_t starPos = ptrType.rfind('*');
+        if (starPos != string::npos && ptrLevel == 1) {
             string baseType = ptrType.substr(0, starPos);
+            storeType = baseType;
             if (baseType == "float" || baseType == "double") {
                 isFloatStore = true;
+            } else if (baseType == "char" || baseType == "bool") {
+                isCharStore = true;
             }
         }
     }
     
-    if (isFloatStore || isFloatType(instr.operand1)) {
+    // Also check if operand1 is a float constant/variable
+    if (!isFloatStore && isFloatType(instr.operand1)) {
+        isFloatStore = true;
+    }
+    
+    if (isFloatStore) {
         // Store float
         loadFloatOperand(instr.operand1, "$f0");  // Get value
         loadOperand(instr.result, "$t1");          // Get address
         emit("swc1 $f0, 0($t1)");  // Store word coprocessor 1
+        return;
+    }
+    
+    if (isCharStore) {
+        // Store char/byte
+        loadOperand(instr.operand1, "$t0");  // Get value
+        loadOperand(instr.result, "$t1");    // Get address
+        emit("sb $t0, 0($t1)");  // Store byte
         return;
     }
     
@@ -1732,8 +2039,8 @@ void CodeGenerator::generateStore(const TACInstruction& instr) {
         size_t starPos = ptrType.find('*');
         if (starPos != string::npos) {
             string baseType = ptrType.substr(0, starPos);
-            if (baseType == "char") {
-                emit("sb $t0, 0($t1)");  // Store byte for char*
+            if (baseType == "char" || baseType == "bool") {
+                emit("sb $t0, 0($t1)");  // Store byte for char* or bool*
                 return;
             } else if (baseType == "short") {
                 emit("sh $t0, 0($t1)");  // Store halfword for short*
@@ -1756,8 +2063,8 @@ void CodeGenerator::generateStore(const TACInstruction& instr) {
         if (sym->isArray && sym->pointerDepth > 0) {
             // Array-of-pointers: elements are pointers (4 bytes)
             emit("sw $t0, 0($t1)");  // Store word for pointer
-        } else if (sym->type == "char") {
-            emit("sb $t0, 0($t1)");  // Store byte for char*
+        } else if (sym->type == "char" || sym->type == "bool") {
+            emit("sb $t0, 0($t1)");  // Store byte for char* or bool*
         } else if (sym->type == "short") {
             emit("sh $t0, 0($t1)");  // Store halfword for short*
         } else {
@@ -1794,6 +2101,12 @@ void CodeGenerator::generateAddress(const TACInstruction& instr) {
     
     Symbol* sym = symbolTable->lookuph(baseName);
     if (sym) {
+        // Build the full type string including pointer depth
+        string fullType = sym->type;
+        for (int i = 0; i < sym->pointerDepth; i++) {
+            fullType += "*";
+        }
+        
         // Store "type*" to indicate this is a pointer to that type
         // For array-of-pointers (e.g., char* arr[3]), the element is already a pointer (char*),
         // so taking the array's address gives us char** (pointer to char*)
@@ -1805,7 +2118,8 @@ void CodeGenerator::generateAddress(const TACInstruction& instr) {
             }
             varTypes[instr.result] = elemType;
         } else {
-            varTypes[instr.result] = sym->type + "*";
+            // Regular variable or pointer: add one more *
+            varTypes[instr.result] = fullType + "*";
         }
     }
 }
@@ -1968,6 +2282,12 @@ void CodeGenerator::generateFuncBegin(const TACInstruction& instr) {
     
     // 3. Set new frame pointer
     emit("move $fp, $sp");
+    
+    // If this is main, call __init for global initialization
+    if (instr.result == "main") {
+        emitComment("Initialize globals");
+        emit("jal __init");
+    }
     
     // NOTE: We do NOT save $a0-$a3 here automatically.
     // They will be accessed directly when needed via GET_PARAM.
@@ -2245,16 +2565,42 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
     }
     
     // 2. Pass parameters (use only the last numParams from queue)
+    // Look up function signature to determine parameter types
+    Symbol* funcSym = symbolTable->lookuph(instr.operand1);
+    
     for (int i = 0; i < numParams; i++) {
+        string param = paramQueue[startIdx + i];
+        
+        // Determine if this parameter position expects a float by checking function signature
+        bool isFloatParam = false;
+        if (funcSym && funcSym->isFunction && i < funcSym->paramTypes.size()) {
+            string paramType = funcSym->paramTypes[i];
+            isFloatParam = (paramType == "float");
+        }
+        
         if (i < 4) {
-            // Use $a0-$a3 for first 4 parameters
-            string argReg = "$a" + to_string(i);
-            loadOperand(paramQueue[startIdx + i], argReg);
+            if (isFloatParam) {
+                // Float parameters: use $f12, $f14, $f16, $f18
+                string floatReg = "$f" + to_string(12 + i * 2);
+                loadFloatOperand(param, floatReg);
+                // MIPS convention: also need to copy to $a register for compatibility
+                emit("mfc1 $a" + to_string(i) + ", " + floatReg);
+            } else {
+                // Integer parameters: use $a0-$a3
+                string argReg = "$a" + to_string(i);
+                loadOperand(param, argReg);
+            }
         } else {
             // Push to stack for parameters beyond 4
-            loadOperand(paramQueue[startIdx + i], "$t0");
-            int offset = (i - 4) * 4;
-            emit("sw $t0, " + to_string(offset) + "($sp)");
+            if (isFloatParam) {
+                loadFloatOperand(param, "$f0");
+                int offset = (i - 4) * 4;
+                emit("swc1 $f0, " + to_string(offset) + "($sp)");
+            } else {
+                loadOperand(param, "$t0");
+                int offset = (i - 4) * 4;
+                emit("sw $t0, " + to_string(offset) + "($sp)");
+            }
         }
     }
     
@@ -2271,7 +2617,21 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
     
     // 5. Get return value
     if (!instr.result.empty()) {
-        storeToVar(instr.result, "$v0");
+        // Check if the called function returns a float (funcSym already looked up above)
+        bool isFloatReturn = false;
+        
+        if (funcSym && (funcSym->type == "float" || funcSym->type == "double")) {
+            isFloatReturn = true;
+        }
+        
+        if (isFloatReturn) {
+            // Float return - get from $f0
+            storeFloatToVar(instr.result, "$f0");
+            setVarType(instr.result, "float");
+        } else {
+            // Integer return - get from $v0
+            storeToVar(instr.result, "$v0");
+        }
     }
     
     // Remove only the parameters we used from the queue
@@ -2286,7 +2646,14 @@ void CodeGenerator::generateCall(const TACInstruction& instr) {
 void CodeGenerator::generateReturn(const TACInstruction& instr) {
     // Return value is in operand1, not result!
     if (!instr.operand1.empty()) {
-        loadOperand(instr.operand1, "$v0");
+        // Check if return value is float
+        if (isFloatType(instr.operand1)) {
+            // Float return - use $f0
+            loadFloatOperand(instr.operand1, "$f0");
+        } else {
+            // Integer/bool/char return - use $v0
+            loadOperand(instr.operand1, "$v0");
+        }
     }
     string funcLabel = (currentFunction == "main") ? currentFunction : "func_" + currentFunction;
     emit("j " + funcLabel + "_epilogue");
@@ -2297,7 +2664,91 @@ void CodeGenerator::generateReturn(const TACInstruction& instr) {
 //============================================================================
 
 void CodeGenerator::generateCast(const TACInstruction& instr) {
-    // Simple cast: just copy value (more complex casts could be added)
+    // Cast operation: result = (targetType)operand1
+    // operand2 contains the target type name
+    string sourceType = getVarType(instr.operand1);
+    string targetType = instr.operand2;
+    
+    // Track type information for the result
+    if (!targetType.empty()) {
+        varTypes[instr.result] = targetType;
+    }
+    
+    // Normalize type names
+    if (sourceType == "double") sourceType = "float";
+    if (targetType == "double") targetType = "float";
+    
+    // If source and target are the same, just copy
+    if (sourceType == targetType) {
+        if (isFloatType(instr.operand1)) {
+            loadFloatOperand(instr.operand1, "$f0");
+            storeFloatToVar(instr.result, "$f0");
+        } else {
+            loadOperand(instr.operand1, "$t0");
+            storeToVar(instr.result, "$t0");
+        }
+        return;
+    }
+    
+    // Float/double to int conversion
+    if ((sourceType == "float") && (targetType == "int" || targetType == "bool" || targetType == "char")) {
+        emitComment("Convert float to " + targetType);
+        loadFloatOperand(instr.operand1, "$f0");
+        // cvt.w.s: convert float to word (int)
+        emit("cvt.w.s $f0, $f0");
+        // Move from FPU to integer register
+        emit("mfc1 $t0, $f0");
+        storeToVar(instr.result, "$t0");
+        return;
+    }
+    
+    // Int/bool/char to float/double conversion
+    if ((sourceType == "int" || sourceType == "bool" || sourceType == "char") && targetType == "float") {
+        emitComment("Convert " + sourceType + " to float");
+        loadOperand(instr.operand1, "$t0");
+        // Move integer to FPU
+        emit("mtc1 $t0, $f0");
+        // cvt.s.w: convert word (int) to float
+        emit("cvt.s.w $f0, $f0");
+        storeFloatToVar(instr.result, "$f0");
+        return;
+    }
+    
+    // Bool to int/char conversion (just copy)
+    if (sourceType == "bool" && (targetType == "int" || targetType == "char")) {
+        loadOperand(instr.operand1, "$t0");
+        storeToVar(instr.result, "$t0");
+        return;
+    }
+    
+    // Int/char to bool conversion (anything non-zero is true)
+    if ((sourceType == "int" || sourceType == "char") && targetType == "bool") {
+        loadOperand(instr.operand1, "$t0");
+        // Set to 1 if non-zero, 0 if zero
+        emit("sltu $t0, $zero, $t0");  // Set if t0 != 0
+        storeToVar(instr.result, "$t0");
+        return;
+    }
+    
+    // Char to int conversion (sign extend byte to word)
+    if (sourceType == "char" && targetType == "int") {
+        loadOperand(instr.operand1, "$t0");
+        // Sign extend byte to word (MIPS doesn't have direct instruction, already loaded as word)
+        storeToVar(instr.result, "$t0");
+        return;
+    }
+    
+    // Int to char conversion (truncate to byte)
+    if (sourceType == "int" && targetType == "char") {
+        loadOperand(instr.operand1, "$t0");
+        // Mask to get only lower byte
+        emit("andi $t0, $t0, 0xFF");
+        storeToVar(instr.result, "$t0");
+        return;
+    }
+    
+    // Default: just copy the value
+    emitComment("Cast " + sourceType + " to " + targetType + " (simple copy)");
     loadOperand(instr.operand1, "$t0");
     storeToVar(instr.result, "$t0");
 }
