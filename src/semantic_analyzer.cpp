@@ -185,6 +185,12 @@ void SemanticAnalyzer::traverseAST(Node* node) {
     if (!isStructOrEnumDef && !isStructMember) {
         processVariable(node);
     }
+    
+    // ✅ IMPORTANT: Recursively analyze all children to check expressions in initializers
+    // This ensures DIV_EXPR, MOD_EXPR, etc. get checked for semantic errors
+    for (auto child : node->children) {
+        traverseAST(child);
+    }
 }
 
     // Check identifier usage (not declarations)
@@ -667,20 +673,40 @@ string SemanticAnalyzer::extractTypeFromDeclSpecifiers(Node* declSpecifiersNode)
     }
 
     // Original first pass: handle typedef/type names and struct/union/enum early
+    // Use a recursive function to search for TYPE_NAME in nested DECL_SPECIFIERS
+    function<string(Node*)> findTypeName = [&](Node* n) -> string {
+        if (!n) return "";
+        for (auto child : n->children) {
+            if (child->name == "STORAGE_CLASS_SPECIFIER") {
+                continue; // ignore storage in type composition
+            }
+            if (child->name == "TYPE_NAME") {
+                string type = child->lexeme;
+                cout << "  DEBUG extractType: Found TYPE_NAME = '" << type << "'\n";
+                if (!type.empty()) {
+                    string resolvedType = resolveTypedef(type);
+                    cout << "  DEBUG extractType: Resolved '" << type << "' to '" << resolvedType << "'\n";
+                    return resolvedType;
+                }
+            }
+            else if (child->name == "DECL_SPECIFIERS") {
+                // Recurse into nested DECL_SPECIFIERS
+                string result = findTypeName(child);
+                if (!result.empty()) return result;
+            }
+        }
+        return "";
+    };
+    
+    string typedefResult = findTypeName(declSpecifiersNode);
+    if (!typedefResult.empty()) return typedefResult;
+    
+    // Also check for struct/union/enum
     for (auto child : declSpecifiersNode->children) {
         if (child->name == "STORAGE_CLASS_SPECIFIER") {
             continue; // ignore storage in type composition
         }
-        if (child->name == "TYPE_NAME") {
-            string type = child->lexeme;
-            cout << "  DEBUG extractType: Found TYPE_NAME = '" << type << "'\n";
-            if (!type.empty()) {
-                string resolvedType = resolveTypedef(type);
-                cout << "  DEBUG extractType: Resolved '" << type << "' to '" << resolvedType << "'\n";
-                return resolvedType;
-            }
-        }
-        else if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
+        if (child->name == "STRUCT_OR_UNION_SPECIFIER") {
             bool isUnion = false;
             string typeName;
             for (auto structChild : child->children) {
@@ -1071,7 +1097,12 @@ cout<<"VARRRTYPE"<<varType<<endl;
                                 if (rhs && rhs->name == "INIT_LIST") {
                                     // Check array initializers
                                     if (!arrayDimensions.empty()) {
-                                        checkArrayInitializerSize(rhs, arrayDimensions, varName, 0);
+                                        // Build full type string including pointer depth
+                                        string fullType = varType;
+                                        for (int i = 0; i < pointerDepth; i++) {
+                                            fullType += "*";
+                                        }
+                                        checkArrayInitializerSize(rhs, arrayDimensions, varName, fullType, 0);
                                     }
                                     // Check struct initializers
                                     else if (varType.find("struct") == 0 || varType.find("union") == 0) {
@@ -1234,7 +1265,12 @@ if (!symbolTable.addSymbol(varName, varType, nodee, false, {}, isArray,
         if (rhs && rhs->name == "INIT_LIST") {
             // Check array initializers
             if (isArray && !arrayDimensions.empty()) {
-                checkArrayInitializerSize(rhs, arrayDimensions, varName, 0);
+                // Build full type string including pointer depth
+                string fullType = varType;
+                for (int i = 0; i < pointerDepth; i++) {
+                    fullType += "*";
+                }
+                checkArrayInitializerSize(rhs, arrayDimensions, varName, fullType, 0);
             }
             // Check struct/union initializers
             else if (varType.find("struct") == 0 || varType.find("union") == 0) {
@@ -2488,14 +2524,20 @@ void SemanticAnalyzer::checkArrayAccess(Node* node) {
             return;
         }
 
-        // Simulate stepwise indexing: consume array dimensions first, then pointer levels
+        // ✅ Simulate stepwise indexing: consume array dimensions first, then pointer levels, then pointee array dimensions
         int remainingArrayDims = sym->isArray ? static_cast<int>(sym->arrayDimensions.size()) : 0;
         int remainingPtrDepth = sym->pointerDepth;
+        int remainingPointeeArrayDims = static_cast<int>(sym->pointeeArrayDimensions.size());
+        
         for (int i = 0; i < accessedDimensions; ++i) {
             if (remainingArrayDims > 0) {
                 remainingArrayDims--;  // consume an array dimension
             } else if (remainingPtrDepth > 0) {
-                remainingPtrDepth--;   // consume a pointer level (arr of pointers case)
+                remainingPtrDepth--;   // consume a pointer level (dereference)
+                // After dereferencing the first pointer level, we can access pointee array dimensions
+                // No need to do anything special here, just continue
+            } else if (remainingPointeeArrayDims > 0) {
+                remainingPointeeArrayDims--;  // consume pointee array dimension (e.g., int (*p)[4], p[0] is valid)
             } else {
                 addError("Too many array subscripts for '" + arrayName + 
                          "' (no remaining array dimensions or pointer levels to index)");
@@ -2769,6 +2811,26 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
             // For multidimensional arrays, we need to check how many dimensions are being accessed
             Node* baseNode = node->children[0];
             
+            // ✅ FIX: If base is ARRAY_ACCESS, use simple recursion (don't traverse to identifier)
+            if (baseNode && baseNode->name == "ARRAY_ACCESS") {
+                // Handle array type string: int[4] → int, int[3][4] → int[3]
+                if (isArrayType(baseType)) {
+                    // Strip the rightmost array dimension
+                    size_t lb = baseType.rfind('[');
+                    size_t rb = baseType.rfind(']');
+                    if (lb != string::npos && rb != string::npos && rb > lb) {
+                        return baseType.substr(0, lb);
+                    }
+                }
+                
+                // Handle pointer types: remove one level of pointer
+                if (!baseType.empty() && baseType.back() == '*') {
+                    return baseType.substr(0, baseType.length() - 1);
+                }
+                
+                return baseType;
+            }
+            
             // Find the original array identifier by traversing up the ARRAY_ACCESS chain
             Node* originalArray = node;
             while (originalArray && originalArray->name == "ARRAY_ACCESS") {
@@ -2790,77 +2852,103 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
                         }
                     }
                     
-                    // Handle different cases:
+                    // ✅ Handle different cases including pointer-to-array
                     // 1. Regular array: int arr[3][4]
-                    //    - pointerDepth=0, isArray=true, arrayDims=[3,4]
+                    //    - pointerDepth=0, isArray=true, arrayDims=[3,4], pointeeArrayDims=[]
                     //    - arr[i] should give int[4]
                     //    - arr[i][j] should give int
                     //
                     // 2. Array of pointers: int* ptrs[3]
-                    //    - pointerDepth=1, isArray=true, arrayDims=[3]
+                    //    - pointerDepth=1, isArray=true, arrayDims=[3], pointeeArrayDims=[]
                     //    - ptrs[i] should give int*
                     //
-                    // 3. Decayed 2D parameter: int a[3][3] decays to int(*)[3]
-                    //    - pointerDepth=1, isArray=true, arrayDims=[3]
-                    //    - a[i] should give int[3]
-                    //    - a[i][j] should give int
+                    // 3. Pointer to array: int (*p)[4]
+                    //    - pointerDepth=1, isArray=false, arrayDims=[], pointeeArrayDims=[4]
+                    //    - p[0] should give int[4] (dereference pointer, get array)
+                    //    - p[0][1] should give int
                     //
-                    // The key distinction between case 2 and 3:
-                    // - Case 2: pointerDepth is part of ELEMENT type
-                    // - Case 3: pointerDepth is the pointer-to-array itself
-                    //
-                    // For case 3 (decayed parameter), we have both pointerDepth AND arrayDims
-                    // For case 2 (array of pointers), we also have both!
-                    // 
-                    // The distinction: in case 3, the FIRST access dereferences the pointer,
-                    // THEN accesses the array. In case 2, we just access the array.
-                    //
-                    // Actually, looking at how parameters are stored:
-                    // - int a[3][3] decays to: pointerDepth=1, arrayDims=[3] (second dimension)
-                    // - int* ptrs[3] is stored as: pointerDepth=1, arrayDims=[3]
-                    //
-                    // These are identical! We need to check: does pointerDepth apply to the
-                    // whole thing (pointer-to-array) or to elements (array-of-pointers)?
-                    //
-                    // Heuristic: If arrayDims.size() == 1 and pointerDepth == 1,
-                    // assume it's array-of-pointers unless we know it's a parameter.
-                    // But we can't easily tell if it's a parameter...
-                    //
-                    // Better approach: For pointerDepth>0 with arrayDims:
-                    // - First consume array accesses from arrayDims
-                    // - Then consume pointer dereferences from pointerDepth
+                    // 4. Pointer to 2D array: int (*p)[3][4]
+                    //    - pointerDepth=1, isArray=false, arrayDims=[], pointeeArrayDims=[3,4]
+                    //    - p[0] should give int[3][4]
+                    //    - p[0][1] should give int[4]
+                    //    - p[0][1][2] should give int
                     
                     string resultType = sym->type;
-                    int remainingArrayDims = static_cast<int>(sym->arrayDimensions.size()) - accessLevels;
                     
-                    if (remainingArrayDims > 0) {
-                        // Still have array dimensions left
-                        // Add remaining array dimensions
-                        for (int i = accessLevels; i < static_cast<int>(sym->arrayDimensions.size()); i++) {
+                    // Strategy: consume array dimensions, then pointer levels, then pointee array dimensions
+                    int consumedArrayDims = 0;
+                    int consumedPointers = 0;
+                    int consumedPointeeDims = 0;
+                    int remaining = accessLevels;
+                    
+                    // First, consume regular array dimensions (if isArray)
+                    if (sym->isArray && remaining > 0) {
+                        int canConsume = min(remaining, static_cast<int>(sym->arrayDimensions.size()));
+                        consumedArrayDims = canConsume;
+                        remaining -= canConsume;
+                    }
+                    
+                    // Next, consume pointer levels (each [] on a pointer dereferences it)
+                    if (remaining > 0 && sym->pointerDepth > 0) {
+                        int canConsume = min(remaining, sym->pointerDepth);
+                        consumedPointers = canConsume;
+                        remaining -= canConsume;
+                    }
+                    
+                    // Finally, consume pointee array dimensions
+                    if (remaining > 0 && !sym->pointeeArrayDimensions.empty()) {
+                        int canConsume = min(remaining, static_cast<int>(sym->pointeeArrayDimensions.size()));
+                        consumedPointeeDims = canConsume;
+                        remaining -= canConsume;
+                    }
+                    
+                    // Build result type
+                    // 1. Add remaining regular array dimensions
+                    if (consumedArrayDims < static_cast<int>(sym->arrayDimensions.size())) {
+                        for (size_t i = consumedArrayDims; i < sym->arrayDimensions.size(); i++) {
                             resultType += "[" + to_string(sym->arrayDimensions[i]) + "]";
                         }
                         return resultType;
-                    } else if (remainingArrayDims == 0) {
-                        // All array dimensions consumed, return element type with pointers
-                        for (int i = 0; i < sym->pointerDepth; i++) {
-                            resultType += "*";
-                        }
-                        return resultType;
-                    } else {
-                        // Access beyond array dimensions - dereference pointers
-                        int pointerAccesses = accessLevels - static_cast<int>(sym->arrayDimensions.size());
-                        int remainingPointers = sym->pointerDepth - pointerAccesses;
-                        if (remainingPointers > 0) {
-                            for (int i = 0; i < remainingPointers; i++) {
-                                resultType += "*";
-                            }
-                            return resultType;
-                        } else {
-                            // All dereferenced
-                            return resultType;
+                    }
+                    
+                    // 2. Add remaining pointers (if any)
+                    int remainingPointers = sym->pointerDepth - consumedPointers;
+                    for (int i = 0; i < remainingPointers; i++) {
+                        resultType += "*";
+                    }
+                    
+                    // 3. Add remaining pointee array dimensions (if pointer was fully consumed)
+                    if (consumedPointers > 0 && consumedPointeeDims < static_cast<int>(sym->pointeeArrayDimensions.size())) {
+                        for (size_t i = consumedPointeeDims; i < sym->pointeeArrayDimensions.size(); i++) {
+                            resultType += "[" + to_string(sym->pointeeArrayDimensions[i]) + "]";
                         }
                     }
+                    
+                    return resultType;
                 }
+            }
+            
+            // ✅ FIX: Handle non-identifier bases (e.g., (*p)[0] where base is UNARY_OP)
+            // Get the type of the base expression and process it
+            if (!originalArray || originalArray->name != "IDENTIFIER") {
+                string baseType = getExpressionType(baseNode);
+                
+                // Handle array type string: int[4] → int, int[3][4] → int[3]
+                if (isArrayType(baseType)) {
+                    // Strip the rightmost array dimension
+                    size_t lb = baseType.rfind('[');
+                    size_t rb = baseType.rfind(']');
+                    if (lb != string::npos && rb != string::npos && rb > lb) {
+                        return baseType.substr(0, lb);
+                    }
+                }
+                
+                // Handle pointer types: remove one level of pointer
+                if (!baseType.empty() && baseType.back() == '*') {
+                    return baseType.substr(0, baseType.length() - 1);
+                }
+                
+                return baseType;
             }
             
             // Handle pointer types: remove one level of pointer
@@ -2979,6 +3067,19 @@ string SemanticAnalyzer::getExpressionType(Node* node) {
                 operandNode = operandNode->children[0];
             }
             string operandType = getExpressionType(operandNode);
+            
+            // ✅ FIX: Handle pointer-to-array dereference: int(*)[4] → int[4]
+            // Pattern: base(*)[dims]
+            size_t ptrArrayPos = operandType.find("(*)");
+            if (ptrArrayPos != string::npos) {
+                // Found pointer-to-array pattern
+                string baseType = operandType.substr(0, ptrArrayPos);
+                string arrayDims = operandType.substr(ptrArrayPos + 3); // skip "(*)"
+                // Result is baseType + arrayDims
+                return baseType + arrayDims;
+            }
+            
+            // Regular pointer dereference: int* → int
             if (operandType.length() > 0 && operandType.back() == '*') {
                 return operandType.substr(0, operandType.length() - 1);
             }
@@ -3682,13 +3783,58 @@ int SemanticAnalyzer::countInitializerElements(Node* node) {
 }
 
 void SemanticAnalyzer::checkArrayInitializerSize(Node* initList, const vector<int>& dimensions, 
-                                                   const string& arrayName, size_t dimIndex) {
+                                                   const string& arrayName, const string& baseType, size_t dimIndex) {
     if (!initList || dimIndex >= dimensions.size()) return;
     
     int declaredSize = dimensions[dimIndex];
     if (declaredSize <= 0) return; // Skip if dimension is unknown
     
     int numInitializers = initList->children.size();
+    
+    // Special check: Multi-dimensional char arrays (not char*) cannot be initialized with string literals
+    // char* arrays CAN be initialized with string literals (e.g., char* arr[2] = {"hello", "world"})
+    bool isCharPointerArray = (baseType.find("char*") != string::npos || baseType.find("char *") != string::npos);
+    if (dimensions.size() >= 2 && dimIndex == 0 && baseType == "char" && !isCharPointerArray) {
+        for (Node* child : initList->children) {
+            if (child && child->name == "STRING_LITERAL") {
+                addError("Cannot initialize multi-dimensional char array '" + arrayName + 
+                        "' with string literals. Use nested initializer lists with individual characters instead.");
+                return;
+            }
+        }
+    }
+    
+    // Type checking: Validate initializer types match array element type
+    // Check if baseType is a pointer (contains '*')
+    bool isPointerType = (baseType.find('*') != string::npos);
+    
+    bool isIntegerType = (baseType == "int" || baseType == "long" || baseType == "short" || 
+                          baseType == "char" || baseType == "bool");
+    bool isFloatingType = (baseType == "float" || baseType == "double");
+    bool isNumericType = isIntegerType || isFloatingType;
+    
+    if (dimIndex == dimensions.size() - 1) {
+        // At innermost level, check each initializer value
+        for (Node* child : initList->children) {
+            // String literals are valid for char* and other pointer types
+            if (child && child->name == "STRING_LITERAL" && isNumericType && !isPointerType) {
+                addError("Cannot initialize " + baseType + " array '" + arrayName + 
+                        "' with string literal. Expected " + baseType + " value.");
+            } else if (child && child->name == "INIT_LIST" && isNumericType) {
+                // Nested initializer at leaf level is wrong
+                addError("Too many dimensions in initializer for array '" + arrayName + "'.");
+            } else if (child && child->name == "FLOAT_CONSTANT" && isIntegerType) {
+                // Float constant in integer array - should warn/error about implicit conversion
+                addError("Cannot initialize " + baseType + " array '" + arrayName + 
+                        "' with floating-point literal. Implicit conversion from float to " + 
+                        baseType + " may lose precision.");
+            } else if (child && child->name == "CHAR_LITERAL" && 
+                      (baseType == "float" || baseType == "double")) {
+                // Char in float array - technically allowed but unusual
+                // Note: This is a warning case, not an error in C
+            }
+        }
+    }
     
     // Check if we have too many initializers at this level
     if (numInitializers > declaredSize) {
@@ -3703,7 +3849,15 @@ void SemanticAnalyzer::checkArrayInitializerSize(Node* initList, const vector<in
     if (dimIndex + 1 < dimensions.size()) {
         for (Node* child : initList->children) {
             if (child && child->name == "INIT_LIST") {
-                checkArrayInitializerSize(child, dimensions, arrayName, dimIndex + 1);
+                checkArrayInitializerSize(child, dimensions, arrayName, baseType, dimIndex + 1);
+            } else if (child && child->name == "STRING_LITERAL" && isNumericType) {
+                // String literal at non-leaf level for numeric array
+                addError("Cannot initialize " + baseType + " array '" + arrayName + 
+                        "' with string literal. Expected nested initializer list.");
+            } else if (child && child->name == "FLOAT_CONSTANT" && isIntegerType) {
+                // Float constant at non-leaf level for integer array
+                addError("Cannot initialize " + baseType + " array '" + arrayName + 
+                        "' with floating-point literal. Expected nested initializer list.");
             }
         }
     }
@@ -4026,6 +4180,16 @@ void SemanticAnalyzer::checkArithmeticOperation(Node* node) {
         if (!isIntegerType(rightType)) {
             addError("Invalid right operand type '" + rightType + "' for modulo operation (requires integer type)");
         }
+        
+        // Check for modulo by zero with constant
+        Node* rightOperand = node->children[1];
+        if (rightOperand && (rightOperand->name == "INTEGER_CONSTANT" || rightOperand->name == "CONSTANT")) {
+            int divisor = std::stoi(rightOperand->lexeme);
+            if (divisor == 0) {
+                addError("Modulo by zero detected in constant expression");
+            }
+        }
+        
         return;
     }
     
@@ -4045,6 +4209,23 @@ void SemanticAnalyzer::checkArithmeticOperation(Node* node) {
         if (!isNumericType(rightType) && !isPointerType(rightType)) {
             addError("Invalid right operand type '" + rightType + "' for arithmetic operation '" + operation + "'");
         }
+        
+        // Check for division/modulo by zero with constant
+        if (node->name == "DIV_EXPR" || node->name == "MOD_EXPR") {
+            Node* rightOperand = node->children[1];
+            if (rightOperand && (rightOperand->name == "INTEGER_CONSTANT" || rightOperand->name == "CONSTANT")) {
+                int divisor = std::stoi(rightOperand->lexeme);
+                if (divisor == 0) {
+                    addError("Division by zero detected in constant expression");
+                }
+            } else if (rightOperand && rightOperand->name == "FLOAT_CONSTANT") {
+                double divisor = std::stod(rightOperand->lexeme);
+                if (divisor == 0.0) {
+                    addError("Division by zero detected in constant expression");
+                }
+            }
+        }
+        
         return;
     }
     
@@ -6295,7 +6476,11 @@ bool SemanticAnalyzer::validateFormatString(const string& format,
                     } else {
                         if (lengthMod == "l") { expectedType = "long"; typeMatch = (argType == "long"); }
                         else if (lengthMod == "ll") { expectedType = "long long"; typeMatch = (argType == "long long"); }
-                        else { expectedType = "int"; typeMatch = matchOneOf({"int","short","char"}); /* default promotions */ }
+                        else { 
+                            expectedType = "int"; 
+                            // Accept int, short, char, bool, and enum types (enums are integers in C)
+                            typeMatch = matchOneOf({"int","short","char","bool"}) || argType.find("enum ") == 0;
+                        }
                     }
                     break;
                 }
