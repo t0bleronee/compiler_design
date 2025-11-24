@@ -176,6 +176,9 @@ public:
     // Accessor for string literals (for code generation phase)
     const std::map<std::string, std::string>& getStringLiterals() const { return stringLiterals; }
     
+    // Accessor for temp types (for code generation phase)
+    const std::map<std::string, std::string>& getTempTypes() const { return tempTypes; }
+    
 private:
     // String literal pooling: map label -> literal contents (raw)
     int stringLiteralCounter = 0;
@@ -214,6 +217,7 @@ private:
     std::string generateAssignment(Node* node);
     std::string generateFunctionCall(Node* node);
     std::string generateArrayAccess(Node* node);
+    std::string generateArrayAddressOnly(Node* node);  // Get address without loading value
     
     // Control flow generators
     void generateIfStatement(Node* node);
@@ -276,6 +280,9 @@ std::vector<int> getArrayDimensions(Symbol* arraySym);
 
 int getDimensionIndex(Node* arrayAccessNode);
 int getSubArraySizeForDimension(Node* arrayNode, int dimIndex);
+
+// Optimization passes
+void optimizeTAC();
 
 
 // Add these after the existing helper function declarations
