@@ -13,7 +13,8 @@ class CodeGenerator {
 public:
     CodeGenerator(const std::vector<TACInstruction>& instructions, 
                   SymbolTable* symTab,
-                  const std::map<std::string, std::string>& strLiterals = {});
+                  const std::map<std::string, std::string>& strLiterals = {},
+                  const std::map<std::string, std::string>& tempTypeMap = {});
     
     void generate();
     void writeToFile(const std::string& filename);
@@ -22,6 +23,7 @@ public:
 private:
     const std::vector<TACInstruction>& tacInstructions;
     SymbolTable* symbolTable;
+    const std::map<std::string, std::string>& irTempTypes;  // Type info from IR generator
     std::vector<std::string> asmCode;
     std::vector<std::string> dataSection;
     
@@ -63,6 +65,7 @@ private:
     std::map<std::string, int> varOffsets;        // variable -> stack offset from $fp
     std::map<std::string, std::string> staticVars; // static var -> label
     std::map<std::string, int> globalVars;        // global var -> address
+    std::map<std::string, std::string> globalPointerInits;  // pointer_var -> address_of_var (for runtime init)
     
     // String literals
     int stringCounter;
